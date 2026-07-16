@@ -26,7 +26,7 @@ $operationLock = $null
 
 function Get-LegacyCanonicalState {
     $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
-    $output = @(& $powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'Get-CpaStackState.ps1') -ControlRoot $ControlRoot 2>&1)
+    $output = @(& $powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'Get-CpaStackState.ps1') -ControlRoot $ControlRoot 2>&1)
     $json = (@($output | ForEach-Object { [string]$_ }) -join [Environment]::NewLine).Trim()
     if ([string]::IsNullOrWhiteSpace($json)) { throw 'Legacy canonical status returned no structured result.' }
     try {
@@ -65,6 +65,8 @@ function Assert-LegacyCanonicalLayout {
     }
     Assert-CpaStackPath -Path $expected.managerData
     Assert-CpaStackPath -Path $expected.auth
+    Assert-CpaStackLegacyCpaSource -Runtime $expected.cpaRuntime -ConfigPath $expected.cpaConfig
+    Assert-CpaStackLegacyManagerSource -Runtime $expected.managerRuntime -Data $expected.managerData
     [void](Get-CpaStackTreeItemsNoReparse -Root $expected.auth)
     if (Test-Path -LiteralPath $expected.plugins) {
         Assert-CpaStackPath -Path $expected.plugins
@@ -156,16 +158,17 @@ try {
         }
     }
 
-    foreach ($directory in @($ControlRoot, (Join-Path $ControlRoot 'config'), (Join-Path $ControlRoot 'ops'), $stateDir, (Join-Path $ControlRoot 'runtime'), (Join-Path $ControlRoot 'runtime\cli-proxy-api'), (Join-Path $ControlRoot 'runtime\manager-plus'), (Join-Path $ControlRoot 'data'), $layout.managerData)) {
+    foreach ($directory in @($ControlRoot, (Join-Path $ControlRoot 'config'), (Join-Path $ControlRoot 'ops'), $stateDir, (Join-Path $ControlRoot 'runtime'), (Join-Path $ControlRoot 'runtime\cli-proxy-api'), (Join-Path $ControlRoot 'runtime\manager-plus'), (Join-Path $ControlRoot 'data'))) {
         Protect-CpaStackPrivateDirectory -Path $directory
     }
-    foreach ($file in @($layout.cpaExe, $layout.cpaConfig, $layout.managerExe, $layout.managerDb, $layout.managerKey, $layout.stackConfig, $layout.secrets, $layout.launcher, $currentPath)) {
+    foreach ($file in @($layout.cpaExe, $layout.cpaConfig, $layout.managerExe, $layout.stackConfig, $layout.secrets, $layout.launcher, $currentPath)) {
         Protect-CpaStackSecretFile -Path $file
     }
     Protect-CpaStackPrivateTree -Root $layout.auth
     if (Test-Path -LiteralPath $layout.plugins) {
         Protect-CpaStackPrivateTree -Root $layout.plugins
     }
+    Protect-CpaStackPrivateTree -Root $layout.managerData
     $result.changed = $true
     $layout = Assert-LegacyCanonicalLayout -Current $current -Journal $journal
 
@@ -206,7 +209,10 @@ try {
     if ([string]$marker.instanceId -ne $instanceId) { throw 'Adopted instance marker validation failed.' }
 
     $status = Get-LegacyCanonicalState
-    if (-not [bool]$status.Cpa.Healthy -or -not [bool]$status.Manager.Healthy -or -not [bool]$status.Security.RootAcl.Protected -or -not [bool]$status.Security.Integrity.Ready) {
+    if (-not [bool]$status.Cpa.Healthy -or -not [bool]$status.Manager.Healthy -or
+        -not [bool]$status.Security.RootAcl.Protected -or
+        -not [bool]$status.Security.ManagerDataTree.Protected -or
+        -not [bool]$status.Security.Integrity.Ready) {
         throw 'Adopted canonical services, ACL, or integrity did not pass the trusted health contract.'
     }
 

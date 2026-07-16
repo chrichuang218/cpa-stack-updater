@@ -364,25 +364,51 @@ try {
     [void]((& $recoveryInstall -CodexHome $recoveryHome -StackRoot $recoveryRoot) | ConvertFrom-Json)
     $recoveryPrevious = Join-Path $recoveryHome 'skills\cpa-safe-upgrade.previous'
     [System.IO.File]::AppendAllText((Join-Path $recoveryInstalled 'SKILL.md'), "`r`n# synthetic second generation`r`n", [System.Text.UTF8Encoding]::new($false))
-    $expectedInstalledHash = Get-CpaStackFileHash -Path (Join-Path $recoveryInstalled 'SKILL.md')
-    $expectedPreviousHash = Get-CpaStackFileHash -Path (Join-Path $recoveryPrevious 'SKILL.md')
+    $expectedInstalledManifest = Get-CpaStackTreeManifest -Root $recoveryInstalled
+    $expectedPreviousManifest = Get-CpaStackTreeManifest -Root $recoveryPrevious
     $failureNeedle = '    Move-SkillDirectoryWithRetry -SourcePath $staging -SourceKind Staging -DestinationPath $installed -DestinationKind Installed'
     $failureInstallerText = [System.IO.File]::ReadAllText($recoveryInstall, [System.Text.UTF8Encoding]::new($false, $true))
-    Assert-Equal 1 ([regex]::Matches($failureInstallerText, [regex]::Escape($failureNeedle)).Count) 'Failure injection targets exactly one pre-core-commit seam'
-    $failureReplacement = "    if (`$env:CPA_STACK_TEST_FAIL_BEFORE_CORE_COMMIT -ceq '1') { throw 'synthetic pre-core-commit failure' }`r`n$failureNeedle"
+    Assert-Equal 1 ([regex]::Matches($failureInstallerText, [regex]::Escape($failureNeedle)).Count) 'Failure injection targets exactly one post-slot-rotation seam'
+    # Slot truth: injected installed=missing, previous=active, retained=rollback; recovered installed=active, previous=rollback, transient=missing.
+    $failureProbe = @'
+    if ($env:CPA_STACK_TEST_FAIL_AFTER_SLOT_ROTATION -ceq '1') {
+        $slotTruth = [ordered]@{
+            installedExists = Test-Path -LiteralPath $installed
+            previousManifest = if (Test-Path -LiteralPath $previous -PathType Container) { [string](Get-CpaStackTreeManifest -Root $previous).sha256 } else { $null }
+            retainedManifest = if (Test-Path -LiteralPath $retained -PathType Container) { [string](Get-CpaStackTreeManifest -Root $retained).sha256 } else { $null }
+            retiringExists = Test-Path -LiteralPath $retiring
+            stagingOwned = Test-OwnedSkillDirectory -Root $staging
+        }
+        if ([bool]$slotTruth.installedExists -or
+            [string]$slotTruth.previousManifest -cne [string]$env:CPA_STACK_TEST_EXPECT_ACTIVE_MANIFEST -or
+            [string]$slotTruth.retainedManifest -cne [string]$env:CPA_STACK_TEST_EXPECT_ROLLBACK_MANIFEST -or
+            [bool]$slotTruth.retiringExists -or
+            -not [bool]$slotTruth.stagingOwned) {
+            throw ('synthetic post-slot-rotation truth mismatch: ' + ($slotTruth | ConvertTo-Json -Compress))
+        }
+        throw 'synthetic failure after slot rotation'
+    }
+'@
+    $failureReplacement = $failureProbe.TrimEnd() + [Environment]::NewLine + $failureNeedle
     $failureInstallerText = $failureInstallerText.Replace($failureNeedle, $failureReplacement)
     [System.IO.File]::WriteAllText($recoveryInstall, $failureInstallerText, [System.Text.UTF8Encoding]::new($false))
-    $previousFailurePoint = [Environment]::GetEnvironmentVariable('CPA_STACK_TEST_FAIL_BEFORE_CORE_COMMIT', 'Process')
+    $previousFailurePoint = [Environment]::GetEnvironmentVariable('CPA_STACK_TEST_FAIL_AFTER_SLOT_ROTATION', 'Process')
+    $previousExpectedActiveManifest = [Environment]::GetEnvironmentVariable('CPA_STACK_TEST_EXPECT_ACTIVE_MANIFEST', 'Process')
+    $previousExpectedRollbackManifest = [Environment]::GetEnvironmentVariable('CPA_STACK_TEST_EXPECT_ROLLBACK_MANIFEST', 'Process')
     try {
-        [Environment]::SetEnvironmentVariable('CPA_STACK_TEST_FAIL_BEFORE_CORE_COMMIT', '1', 'Process')
+        [Environment]::SetEnvironmentVariable('CPA_STACK_TEST_FAIL_AFTER_SLOT_ROTATION', '1', 'Process')
+        [Environment]::SetEnvironmentVariable('CPA_STACK_TEST_EXPECT_ACTIVE_MANIFEST', [string]$expectedInstalledManifest.sha256, 'Process')
+        [Environment]::SetEnvironmentVariable('CPA_STACK_TEST_EXPECT_ROLLBACK_MANIFEST', [string]$expectedPreviousManifest.sha256, 'Process')
         Assert-ThrowsMatch {
             & $recoveryInstall -CodexHome $recoveryHome -StackRoot $recoveryRoot
-        } 'synthetic pre-core-commit failure' 'Failure injection reaches the installed/previous/retained recovery branch'
+        } 'synthetic failure after slot rotation' 'Failure injection proves installed/previous/retained changed before recovery'
     } finally {
-        [Environment]::SetEnvironmentVariable('CPA_STACK_TEST_FAIL_BEFORE_CORE_COMMIT', $previousFailurePoint, 'Process')
+        [Environment]::SetEnvironmentVariable('CPA_STACK_TEST_FAIL_AFTER_SLOT_ROTATION', $previousFailurePoint, 'Process')
+        [Environment]::SetEnvironmentVariable('CPA_STACK_TEST_EXPECT_ACTIVE_MANIFEST', $previousExpectedActiveManifest, 'Process')
+        [Environment]::SetEnvironmentVariable('CPA_STACK_TEST_EXPECT_ROLLBACK_MANIFEST', $previousExpectedRollbackManifest, 'Process')
     }
-    Assert-Equal $expectedInstalledHash (Get-CpaStackFileHash -Path (Join-Path $recoveryInstalled 'SKILL.md')) 'Recovery restores the previously active installed slot byte-for-byte'
-    Assert-Equal $expectedPreviousHash (Get-CpaStackFileHash -Path (Join-Path $recoveryPrevious 'SKILL.md')) 'Recovery restores the previous rollback slot byte-for-byte'
+    Assert-Equal ([string]$expectedInstalledManifest.sha256) ([string](Get-CpaStackTreeManifest -Root $recoveryInstalled).sha256) 'Recovery restores the previously active installed tree byte-for-byte'
+    Assert-Equal ([string]$expectedPreviousManifest.sha256) ([string](Get-CpaStackTreeManifest -Root $recoveryPrevious).sha256) 'Recovery restores the previous rollback tree byte-for-byte'
     $recoveryTransactionSlots = @(Get-ChildItem -LiteralPath (Join-Path $recoveryHome 'skills') -Directory -Force | Where-Object { $_.Name -match '^cpa-safe-upgrade\.(?:staging|retained|retiring)-' })
     Assert-Equal 0 $recoveryTransactionSlots.Count 'Successful recovery leaves no transaction directories'
 

@@ -82,21 +82,17 @@ try {
 } finally {
     $cleanupErrors = New-Object 'System.Collections.Generic.List[string]'
     try {
-        Stop-CpaStackPort -Port $Port -ExpectedPath $candidateExe
+        Stop-CpaStackPort -Port $Port -ExpectedPath $candidateExe -ExpectedProcess $process -RequireExecutableWriteAccess
     } catch {
         [void]$cleanupErrors.Add($_.Exception.Message)
     }
     if ($process) {
         try {
-            $process.Refresh()
-            if (-not $process.HasExited) {
-                Stop-Process -Id $process.Id -Force -ErrorAction Stop
-            }
-            if (-not $process.WaitForExit(10000)) {
-                throw 'Candidate process did not exit within 10 seconds.'
-            }
+            Stop-CpaStackStartedProcess -Process $process -ExpectedPath $candidateExe
         } catch {
             [void]$cleanupErrors.Add($_.Exception.Message)
+        } finally {
+            if ($process -is [System.IDisposable]) { $process.Dispose() }
         }
     }
     if ($cleanupErrors.Count -gt 0) {

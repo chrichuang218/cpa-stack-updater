@@ -45,22 +45,22 @@ function Resolve-PythonCommand {
     throw 'Python 3 was not found. Install Python or pass -PythonExe with its executable path.'
 }
 
-function Test-ScalarEqual {
-    param($Left, $Right)
-
-    if ($null -eq $Left -and $null -eq $Right) {
-        return $true
-    }
-    if ($null -eq $Left -or $null -eq $Right) {
-        return $false
-    }
-    return ([string]$Left -ceq [string]$Right)
-}
-
 function Test-CountNotDecreased {
     param($Expected, $Actual)
 
     if ($null -eq $Expected -or $null -eq $Actual) { return $false }
+    try {
+        return ([long]$Actual -ge [long]$Expected)
+    } catch {
+        return $false
+    }
+}
+
+function Test-WatermarkNotDecreased {
+    param($Expected, $Actual)
+
+    if ($null -eq $Expected) { return $true }
+    if ($null -eq $Actual) { return $false }
     try {
         return ([long]$Actual -ge [long]$Expected)
     } catch {
@@ -252,9 +252,9 @@ sys.exit(0 if result.get("success") else 2)
         $expected = Read-BaselineUsageEvents -Path $BaselineJsonPath
         $baselineDocument = [System.IO.File]::ReadAllText($BaselineJsonPath, [System.Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json
         $fieldChecks = [ordered]@{
-            count = Test-ScalarEqual -Left $expected.count -Right $inspection.database.usage_events.count
-            max_id = Test-ScalarEqual -Left $expected.max_id -Right $inspection.database.usage_events.max_id
-            max_timestamp_ms = Test-ScalarEqual -Left $expected.max_timestamp_ms -Right $inspection.database.usage_events.max_timestamp_ms
+            count = Test-CountNotDecreased -Expected $expected.count -Actual $inspection.database.usage_events.count
+            max_id = Test-WatermarkNotDecreased -Expected $expected.max_id -Actual $inspection.database.usage_events.max_id
+            max_timestamp_ms = Test-WatermarkNotDecreased -Expected $expected.max_timestamp_ms -Actual $inspection.database.usage_events.max_timestamp_ms
         }
         $history.checked = $true
         $history.ok = ($fieldChecks.count -and $fieldChecks.max_id -and $fieldChecks.max_timestamp_ms)
@@ -296,8 +296,7 @@ sys.exit(0 if result.get("success") else 2)
     }
 
     $quickCheckOk = [bool]$inspection.database.quick_check.ok
-    $journalModeOk = ([string]$inspection.database.journal_mode -ieq $ExpectedJournalMode)
-    $success = ($quickCheckOk -and $journalModeOk -and $schemaOk -and [bool]$history.ok)
+    $success = ($quickCheckOk -and $schemaOk -and [bool]$history.ok)
 
     $result = [ordered]@{
         format_version = 1
@@ -310,8 +309,8 @@ sys.exit(0 if result.get("success") else 2)
                 details = $inspection.database.quick_check
             }
             journal_mode = [ordered]@{
-                ok = $journalModeOk
-                expected = $ExpectedJournalMode
+                ok = $true
+                policy = 'observed_only'
                 actual = $inspection.database.journal_mode
             }
             schema = [ordered]@{

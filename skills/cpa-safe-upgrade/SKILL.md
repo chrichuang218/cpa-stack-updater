@@ -54,6 +54,8 @@ $skillRoot = Split-Path -Parent ((Resolve-Path -LiteralPath '<本次实际读取
 
 如果 `status` 表明需要首次迁移，且发现了仍指向 legacy launcher 的 CPA 桌面快捷方式，执行前必须向用户说明：默认不会修改该快捷方式；迁移后再次使用它可能重新启动旧 runtime/data。只有用户明确授权更新快捷方式后，才在上述升级命令的 `-Json` 前加入 `-UpdateDesktopShortcut`。
 
+获准刷新的 canonical 快捷方式必须由 updater 生成并通过 `powershell.exe -NonInteractive -WindowStyle Hidden` 启动；不要手工拼接或降级为可见 PowerShell 窗口。手工运行 CLI 时保留调用方终端输出；bundled PowerShell 必须复用同一控制台，不要另开可见窗口，也不要给直接 CLI 添加隐藏参数。
+
 如果用户不授权，不得添加该开关；迁移完成后必须明确要求用户停用旧快捷方式，并统一使用下文“恢复和启动”中的 canonical `start` 命令。
 
 统一入口会完成：
@@ -125,13 +127,17 @@ Secrets input 必须分别包含三个非空字段：
 
 - 要求专用本地 NTFS/ReFS 根目录；拒绝 UNC、盘符根、Windows/Program Files 子树、用户主目录本身、Git worktree 和 reparse traversal。默认的 LocalAppData 专用子目录仍受支持。
 - managed root 只允许当前用户、SYSTEM 和本地 Administrators。
-- CPA `auth` 与可选 `plugins` 代码树递归拒绝 reparse point，并对每个文件和子目录加固、校验 owner 与 ACL。
+- 在停止正式服务或禁用 Manager collector 前，必须让统一入口按 Windows PowerShell 5.1 的目录 247 字符、文件 259 字符预算检查投影树和事务后缀；不要绕过超限阻断。
+- CPA `auth`、可选 `plugins` 和整个 Manager data tree（含 WAL/SHM）递归拒绝 reparse point，并校验 owner 与 ACL；runtime/data 直接父目录也属于信任边界。
 - 首次迁移允许 legacy 源保留普通只读权限，但拒绝非受信主体修改或替换 runtime/config/auth/plugins；候选退出后用递归 manifest、config hash 与 host 绑定正式 target，不再从在线 legacy 源二次复制。
+- Manager online backup 必须可生成、可重新打开并通过 `quick_check`。非原地回滚保留 exe 与 `data.key` hash 校验，并要求必需业务表存在、`usage_events` 的 count/max-id/max-timestamp 水位不低于回滚基线；不要求 SQLite 文件 SHA256、大小、页布局、WAL/SHM、checkpoint 或 rollup 绝对一致。
 - marker、current 与所有 pending journal 必须绑定同一个 instanceId；缺失或冲突时停止恢复。
 - 迁移时以正式监听进程作为最强来源证据。
 - 即使三个 key 当前相同，也必须保持三个变量和用途分离。
 - 未经明确授权，不删除旧安装、日志、仓库或备份。
-- 只有端口 owner 的路径与当前事务预期一致时才允许停止进程。
+- 只有端口 owner 的路径与当前事务预期一致时才允许固定其 `Process`；停服时必须使用该固定进程，即使 listener 提前消失也不能改按现场 PID 猜测。
+- updater 启动但未监听的游离候选必须按其固定 `Process` 清理；停止后必须等待同一进程完全退出、端口释放且 executable 可替换，新 owner 抢占时保持停止且不得误杀。
+- 长驻 CPA/Manager 必须以无控制台窗口方式启动，只能继承指向 `NUL` 的显式标准句柄，不能继承调用 Skill 的 PowerShell 管道或文件句柄。
 - 不以网页版本号或页面文字判断程序版本。
 - 对话中禁止输出 secret、auth 内容、完整配置、数据库、长日志和完整 HTML。
 

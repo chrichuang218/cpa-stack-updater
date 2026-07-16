@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import sqlite3
 import subprocess
@@ -15,14 +14,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 BACKUP_SCRIPT = (
     REPO_ROOT / "skills" / "cpa-safe-upgrade" / "scripts" / "backup_sqlite.py"
 )
-
-
-def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 class BackupSqliteTests(unittest.TestCase):
@@ -82,7 +73,6 @@ class BackupSqliteTests(unittest.TestCase):
                 self.assertEqual(
                     2000, result["snapshot"]["usage_events"]["max_timestamp_ms"]
                 )
-                self.assertEqual(file_sha256(destination), result["snapshot"]["sha256"])
                 self.assertEqual(0, result["snapshot"]["wal_size_bytes"])
                 self.assertEqual(0, result["snapshot"]["shm_size_bytes"])
                 self.assertFalse(Path(str(destination) + "-wal").exists())

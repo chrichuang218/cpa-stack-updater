@@ -8,6 +8,8 @@ CLI 返回 `TargetDriveNotFound` 时，选择真实存在的本地 NTFS/ReFS 盘
 
 使用专用目录，例如 `E:\CPA-Stack`。不要使用盘符根、UNC、Git worktree、Windows/Program Files 子树或用户主目录本身。LocalAppData 下的专用子目录允许使用。
 
+若错误指出 Windows PowerShell 5.1 路径预算，缩短 managed root 或来源树中的深层名称：目录必须不超过 247 字符，文件必须不超过 259 字符，且事务临时后缀也计入预算。该检查发生在正式停服或禁用 collector 前；不要通过手工停服绕过。
+
 ## 找不到旧安装
 
 先让旧 CPA 与 Manager Plus 正常运行，使 8317/18317 暴露 executable path。若仍不能唯一获得 config、data 与 key，显式传 `Source*` 参数和受保护的 `SecretsInputPath`。
@@ -18,7 +20,7 @@ CLI 返回 `TargetDriveNotFound` 时，选择真实存在的本地 NTFS/ReFS 盘
 
 ## 缺少 Python
 
-安装 Python 3.10+，并确保 `python` 或 `py -3` 可用。无法创建一致 SQLite 快照时，工具会在正式停机前退出。
+安装 Python 3.10+，并确保 `python` 或 `py -3` 可用。无法生成并重新打开通过 `quick_check` 的 SQLite online backup 时，工具会在正式停机前退出。
 
 ## 更新 Skill 时目录被占用
 
@@ -26,7 +28,7 @@ CLI 返回 `TargetDriveNotFound` 时，选择真实存在的本地 NTFS/ReFS 盘
 
 ## 报告 pending transaction
 
-不要删除 journal 或手工覆盖 runtime。针对同一 root 再运行 `cpa-stack.ps1 upgrade -Json`，让恢复流程验证 instanceId、路径、hash、服务与 Manager baseline。
+不要删除 journal 或手工覆盖 runtime。针对同一 root 再运行 `cpa-stack.ps1 upgrade -Json`，让恢复流程验证 instanceId、路径、exe/`data.key` hash、Manager 数据水位与服务状态。若验证失败，保留 journal 和结构化错误，再处理明确的路径、进程或数据问题。
 
 ## 无法证明版本单调
 
@@ -36,8 +38,18 @@ CLI 返回 `TargetDriveNotFound` 时，选择真实存在的本地 NTFS/ReFS 盘
 
 正式服务应保持不变。只查看结构化错误和 managed root 中的小型 state 结果；GitHub Issue 中不要上传数据库、key、auth、完整配置或日志。
 
+候选即使未成功监听，也应由 updater 按已启动的固定 `Process` 清理。不要因候选端口已经消失就假定进程已退出，也不要使用递归结束进程的命令；让事务等待原进程和 executable 文件锁释放。
+
 如果网络必须经过代理，不要把账号口令写进 `HTTP_PROXY`/`HTTPS_PROXY` URL；安全进程环境会丢弃带 userinfo、query 或 fragment 的代理值。改用 Windows/企业无内嵌口令代理配置后重试。
 
 ## 正式切换发生回滚
 
 确认 8317/18317 健康状态和 last-known-good 路径。自动回滚成功属于受控升级失败，不等于数据丢失。只报告版本、exe hash、检查项和脱敏错误。
+
+## 升级已经完成但命令长时间不返回
+
+不要并发启动第二个升级，也不要使用递归结束进程的命令。先确认正式端口仍由记录的 executable 占用，再检查 operation lock、pending journal 和 `last-upgrade` 的结构化状态。`v0.1.1` 可能因长驻服务继承输出管道而表现为假卡死；更新到 `v0.1.2` 或更高版本后重试。只有在无 pending、操作锁已释放且正式服务仍健康时，才可单独结束无工作的外层 `cpa-stack.ps1` 进程；不得连带结束正式 CPA 或 Manager。
+
+## 双击快捷方式仍弹出 PowerShell 窗口
+
+这通常表示仍在使用 legacy 快捷方式，或快捷方式未由最新版 updater 刷新。不要手工修改目标字符串；确认用户授权后，用最新版执行带 `-UpdateDesktopShortcut` 的升级。canonical `.lnk` 的目标应为 `powershell.exe`，参数契约包含 `-NonInteractive -WindowStyle Hidden`。如果未授权更新，请停用旧快捷方式并通过 canonical CLI 启动。直接 CLI 应保留当前终端，内部 PowerShell 复用同一控制台；不要再用可见的 `Start-Process powershell.exe` 包装它。

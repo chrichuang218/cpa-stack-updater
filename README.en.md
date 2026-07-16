@@ -33,7 +33,13 @@ The existing installation can live on C:, D:, E:, a path with spaces, or a non-E
 - A per-Windows-account, cross-session lock prevents concurrent upgrades, installs, and uninstalls.
 - Secret-free journals bind to an instance ID and recover interrupted transactions.
 - Candidate hashes are checked again immediately before switching.
+- Long-lived services start without a console window and inherit only explicit `NUL` standard handles, so they cannot keep an upgrade command's output pipe open.
+- The updater fixes the verified listener's `Process` before stopping it. Even if the listener disappears first, it waits for that same process and executable lock; candidates started by the updater are also cleaned up by their fixed process when they never bind.
 - The managed root is restricted to the current user, SYSTEM, and Administrators.
+- Direct runtime parents and the full Manager data tree, including WAL/SHM, are checked for trusted owners, ACLs, and reparse points.
+- Before executing an old Manager during a non-in-place rollback, the updater revalidates the executable, `data.key`, required business tables, and the `usage_events` count/max-id/max-timestamp watermarks. Pre-existing settings and model-price data must not decrease.
+- SQLite validation protects business-data semantics; it does not require identical database SHA256, file size, page layout, WAL/SHM, checkpoint, or rollup bytes.
+- All switch paths are preflighted against the Windows PowerShell 5.1 budgets of 247 characters for directories and 259 for files, before any production stop.
 - Unknown port owners are never killed.
 - Legacy directories are never deleted without a separate explicit request.
 
@@ -43,7 +49,7 @@ See [docs/safety-model.md](docs/safety-model.md) for the complete trust and tran
 
 - Windows 10 or Windows 11, x64
 - Windows PowerShell 5.1 or PowerShell 7
-- Python 3.10 or newer for consistent SQLite backups
+- Python 3.10 or newer for SQLite online backups that can be generated, reopened, and checked
 - Local NTFS or ReFS destination
 - Existing CLIProxyAPI and CPA Manager Plus when performing a migration
 
@@ -83,6 +89,8 @@ Migrate an existing healthy installation when necessary, then upgrade both servi
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli upgrade -Root 'E:\CPA-Stack' -UpdateDesktopShortcut -Json
 ```
+
+  The refreshed `.lnk` starts the canonical launcher through `powershell.exe -NonInteractive -WindowStyle Hidden`, so double-clicking it does not show a PowerShell window. Direct CLI commands remain visible, and bundled PowerShell scripts reuse the caller's console instead of opening another window.
 
 - If you do not authorize a shortcut change, run the upgrade without that switch. Do not use the old shortcut afterward; always start the managed stack through the canonical CLI:
 

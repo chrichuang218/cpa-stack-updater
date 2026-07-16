@@ -55,6 +55,8 @@ $initialize = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts\Initialize
 Assert-False ($initialize -match 'legacyStartScriptSha256\s*=\s*Get-CpaStackFileHash\s+-Path\s+\$LegacyStartScript') 'Legacy start script hash is not computed unconditionally'
 Assert-True ($initialize -match 'legacyStartScriptSha256\s*=\s*if\s*\(\[string\]::IsNullOrWhiteSpace\(\$LegacyStartScript\)\)') 'Legacy start script hash is guarded for an empty path'
 Assert-True ([regex]::Matches($initialize, 'Assert-CpaStackLegacyCpaSource').Count -ge 3) 'Initialization gates the legacy source before journaling, copying, and recovery'
+Assert-True ([regex]::Matches($initialize, 'Assert-CpaStackLegacyManagerSource').Count -ge 3) 'Initialization gates the legacy Manager runtime and data before copying or recovery'
+Assert-True ($initialize -match 'managerRecoveryBlocked') 'Initialization refuses an outer legacy Manager restart after untrusted component recovery'
 Assert-True ($initialize -match '\$cpaCandidate\s*=\s*Invoke-InProcessPowerShellJson') 'Initialization captures the completed CPA candidate result'
 Assert-True ($initialize -match 'targetCpaRuntimeManifestSha256\s*=\s*\[string\]\$cpaCandidate\.runtimeManifestSha256') 'Initialization journals the post-candidate runtime digest'
 Assert-True ($initialize -match 'Set-InitializeJournalPhase[\s\S]+Protect-CpaStackSecretFile\s+-Path\s+\$initializeJournalPath') 'Initialization re-protects the journal after every candidate binding update'
@@ -69,11 +71,19 @@ Assert-True ($start -match 'LocalAddresses\s*=\s*\$addresses') 'Canonical start 
 Assert-True ($start.IndexOf('Assert-TrustedListener -Listener $listener', [System.StringComparison]::Ordinal) -lt $start.IndexOf('$lastProbe = Get-CpaHealth', [System.StringComparison]::Ordinal)) 'Canonical start validates the CPA listener before sending its API key'
 Assert-True ($start -match 'function Start-ManagedProcess') 'Canonical services start with a controlled environment'
 Assert-False ($start -match 'Start-Process\s+-FilePath\s+\$Settings\.(?:Cpa|Manager)\.Executable') 'Canonical services do not inherit the full parent environment'
+Assert-True ($start -match 'PROC_THREAD_ATTRIBUTE_HANDLE_LIST|ProcThreadAttributeHandleList') 'Canonical services restrict inherited handles to isolated standard streams'
+Assert-True ($start -match '\[CpaStack\.NativeProcessV1\]::Start') 'Canonical services use the native isolated process launcher'
 
 $cli = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\cpa-stack.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
 Assert-True ($cli -match 'trustedStartScript\s*=\s*Join-Path\s+\$PSScriptRoot\s+''Start-CPA-Stack\.ps1''') 'Public start executes the bundled trusted launcher'
 
 $common = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\CpaStack.Common.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
+$commonNativeStart = $common.IndexOf('using System;', $common.IndexOf("Add-Type -TypeDefinition @'", [System.StringComparison]::Ordinal), [System.StringComparison]::Ordinal)
+$commonNativeEnd = $common.IndexOf("`n'@", $commonNativeStart, [System.StringComparison]::Ordinal)
+$startNativeStart = $start.IndexOf('using System;', $start.IndexOf("Add-Type -TypeDefinition @'", [System.StringComparison]::Ordinal), [System.StringComparison]::Ordinal)
+$startNativeEnd = $start.IndexOf("`n'@", $startNativeStart, [System.StringComparison]::Ordinal)
+Assert-True ($commonNativeStart -ge 0 -and $commonNativeEnd -gt $commonNativeStart -and $startNativeStart -ge 0 -and $startNativeEnd -gt $startNativeStart) 'Both managed-process native launcher sources are present'
+Assert-True ($common.Substring($commonNativeStart, $commonNativeEnd - $commonNativeStart) -ceq $start.Substring($startNativeStart, $startNativeEnd - $startNativeStart)) 'Common and standalone native process launchers remain byte-identical'
 Assert-True ($common -match '&\s+\$gh\.Source\s+api\s+--hostname\s+github\.com') 'GitHub CLI release queries are pinned to github.com'
 Assert-True ($common -match 'maximumReleaseJsonBytes\s*=\s*4194304') 'GitHub release JSON has a 4 MiB safety limit'
 Assert-True ($common.Contains('Invoke-CpaStackSecureDownload -Uri "https://api.github.com/repos/$Repository/releases/latest" -Destination $temp -MaximumBytes $maximumReleaseJsonBytes')) 'Direct GitHub release JSON downloads enforce the streaming limit'
@@ -89,20 +99,42 @@ Assert-False ($downloadSource -match 'Invoke-WebRequest|curl\.exe') 'Secure down
 Assert-True ($common -match 'function Read-CpaStackSecretJson') 'Secrets use a dedicated fixed-error JSON reader'
 Assert-True ($common -match 'function Wait-CpaStackTrustedListener') 'Credentialed probes have a trusted-listener gate'
 Assert-True ($common -match 'function Sync-CpaStackCanonicalLauncher') 'Updater refreshes the canonical desktop launcher target'
+Assert-True ($common -match 'function Get-CpaStackCanonicalShortcutContract') 'Canonical shortcut arguments come from one shared contract'
+Assert-True ($common -match 'function Set-CpaStackCanonicalShortcut') 'Canonical shortcut writes use the shared contract'
+Assert-True ($common -match 'Arguments\s*=\s*''-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File') 'Canonical shortcut starts PowerShell with a hidden non-interactive window'
+Assert-True ($common -match '\$link\.WindowStyle\s*=\s*\[int\]\$contract\.WindowStyle') 'Canonical shortcut minimizes its shell bootstrap'
+Assert-True ($initialize -match 'Set-CpaStackCanonicalShortcut\s+-ShortcutPath\s+\$DesktopShortcut') 'Migration updates the authorized desktop shortcut through the hidden-window contract'
+Assert-True ($initialize -match 'Assert-CpaStackCanonicalShortcutContract\s+-Shortcut\s+\$shortcut') 'Committed migration recovery revalidates the hidden-window shortcut contract'
 Assert-True ($common -match '\[switch\]\$MinimalEnvironment') 'Candidate process launcher supports a minimal environment'
+Assert-True ($common -match 'PROC_THREAD_ATTRIBUTE_HANDLE_LIST|ProcThreadAttributeHandleList') 'Managed processes inherit only the explicit null-device handle list'
+Assert-True ($common -match 'function Test-CpaStackFileReadyForReplacement') 'Port shutdown verifies that the executable can be replaced'
+Assert-True ($common -match '\$ownedProcess\.HasExited') 'Port shutdown waits for the exact process after the listener disappears'
 Assert-True ($common -match 'function Get-CpaStackWindowsPowerShellModulePath') 'Windows PowerShell child processes use deterministic compatible module paths'
 Assert-True ($common -match '\$proxyUri\.UserInfo') 'Managed process proxy URLs reject embedded credentials'
 Assert-True ($common -match 'function Protect-CpaStackPrivateTree') 'CPA auth trees receive recursive ACL and reparse protection'
 Assert-True ($common -match 'function Assert-CpaStackPrivateTree') 'Executable plugin trees receive recursive owner and ACL validation'
 Assert-True ($common -match 'function Copy-CpaStackPluginTree') 'Plugin copies use a fail-closed protected-tree helper'
 Assert-True ($common -match 'function Assert-CpaStackLegacyCpaSource') 'Legacy sensitive trees have a read-compatible mutable-access gate'
+Assert-True ($common -match 'function Assert-CpaStackLegacyManagerSource') 'Legacy Manager runtime and data have a recursive mutable-access gate'
+Assert-True ($common -match 'function Assert-CpaStackManagerRecoverySource') 'Legacy Manager recovery verifies executable, data key, and SQLite state before execution'
 Assert-True ($common -match 'function Assert-CpaStackLegacyAncestorAcl') 'Legacy source ancestors are checked for subtree replacement rights'
 Assert-True ($common -match 'function Get-CpaStackTreeManifest') 'Candidate runtimes have a recursive content manifest'
+Assert-True ($common -match 'function Assert-CpaStackPathBudget') 'Windows PowerShell path limits have a shared preflight gate'
+Assert-True ($common -match 'function Assert-CpaStackProjectedTreePathBudget') 'Tree copies validate every projected destination path'
+Assert-True ($common.IndexOf('Assert-CpaStackJsonWritePathBudget -Paths @($Path)', [System.StringComparison]::Ordinal) -lt $common.IndexOf('$temp = $Path + ".tmp-"', [System.StringComparison]::Ordinal)) 'Atomic JSON suffixes are budgeted before temp creation'
+
+$state = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\Get-CpaStackState.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
+Assert-True ($state -match 'PowerShellWindowHidden') 'Discovery reports whether a CPA shortcut already hides PowerShell'
+Assert-True ($state -match '-WindowStyle\\s\+Hidden') 'Shortcut discovery recognizes the hidden PowerShell argument without exposing raw arguments'
 
 $stateScript = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\Get-CpaStackState.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
 Assert-True ([regex]::Matches($stateScript, 'LocalAddresses\s*=\s*@\(\$_\.LocalAddresses\)').Count -ge 2) 'Status preserves CPA and Manager listener addresses'
 Assert-True ($stateScript -match '\$listenerTrusted\s*=\s*\(\$pathMatches\s+-and\s+\$addressMatches\s+-and\s+\$hashMatches\)') 'Canonical status listener trust includes path, address, and current hash'
 Assert-True ($stateScript -match 'SecretsState\.Safe\.Ready\s+-and\s+\$listenerTrusted') 'Canonical status validates listener trust before credentialed probes'
+foreach ($criticalParent in @('runtime\cli-proxy-api', 'runtime\manager-plus', 'data\manager-plus')) {
+    Assert-True ($stateScript.Contains($criticalParent)) "Canonical status checks critical parent path $criticalParent"
+}
+Assert-True ($stateScript -match 'ManagerDataTree') 'Canonical status reports the recursive Manager data-tree trust state'
 Assert-True ($stateScript -match "migrationStatus\s+-in\s+@\('ready', 'migrated'\)") 'Status accepts the latest Manager completed-migration state'
 Assert-True ($stateScript -match "runtime\\cli-proxy-api\\plugins") 'Status recursively includes the optional CPA plugins tree in root security'
 Assert-True ($stateScript -match '\$privateTreePaths\s+-icontains\s+\$path') 'Status rejects inherited ACLs inside auth and plugins trees'
@@ -128,10 +160,18 @@ Assert-True ([regex]::Matches($switchCpa, 'Get-CpaStackTreeManifest\s+-Root\s+\$
 Assert-False ($switchCpa -match 'Copy-Item\s+-LiteralPath\s+\$SourceConfig\s+-Destination\s+\$targetConfig') 'Non-in-place switching never recopies the untested legacy config'
 Assert-False ($switchCpa -match 'Copy-CpaStackAuthTree\s+-Source\s+\(Join-Path\s+\$SourceRuntime') 'Non-in-place switching never recopies live legacy auth'
 Assert-False ($switchCpa -match 'Copy-CpaStackPluginTree\s+-Source\s+\$sourcePlugins') 'Non-in-place switching never recopies live legacy plugins'
+Assert-True ([regex]::Matches($switchCpa, 'Protect-CpaStackSecretFile\s+-Path\s+\$(?:targetExe|sourceExe)').Count -ge 2) 'CPA switch and rollback restore the executable owner and ACL before restart'
+Assert-True ($switchCpa.IndexOf('Assert-CpaStackJsonWritePathBudget', [System.StringComparison]::Ordinal) -lt $switchCpa.IndexOf('Stop-CpaStackPort -Port $Port', [System.StringComparison]::Ordinal)) 'CPA switch path budget fails before stopping the source service'
 
 $switchManager = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\Switch-ManagerRuntime.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
 Assert-True ($switchManager.IndexOf('Wait-CpaStackTrustedListener -Port $ManagerPort', [System.StringComparison]::Ordinal) -lt $switchManager.IndexOf('Invoke-CpaStackHttpJson -Uri "http://127.0.0.1:$ManagerPort/usage-service/info"', [System.StringComparison]::Ordinal)) 'Formal Manager listener is trusted before switch validation sends secrets'
 Assert-True ($switchManager -match 'Start-CpaStackProcess.+-MinimalEnvironment') 'Formal Manager does not inherit unrelated parent secrets'
+Assert-True ([regex]::Matches($switchManager, 'Protect-CpaStackSecretFile\s+-Path\s+\$(?:targetExe|sourceExe)').Count -ge 2) 'Manager switch and rollback restore the executable owner and ACL before restart'
+Assert-True ([regex]::Matches($switchManager, 'Protect-CpaStackPrivateTree\s+-Root\s+\$(?:TargetData|SourceData)').Count -ge 2) 'Manager switch and rollback protect the full data tree including WAL and SHM'
+Assert-True ([regex]::Matches($switchManager, 'Assert-CpaStackManagerRecoverySource').Count -ge 2) 'Non-in-place Manager rollback verifies the legacy source before and after ACL hardening'
+Assert-True ([regex]::Matches($switchManager, 'Stop-CpaStackStartedProcess\s+-Process\s+\$(?:targetProcess|sourceProcess)').Count -ge 2) 'Manager recovery stops started processes by their fixed process object even when no listener exists'
+Assert-False ($switchManager -match 'Protect-CpaStackSecretFile\s+-Path\s+\$(?:targetDb|targetDataKey|sourceDb|sourceDataKey)') 'Manager ACL repair is not limited to database and data-key leaves'
+Assert-True ($switchManager.IndexOf('Assert-CpaStackJsonWritePathBudget', [System.StringComparison]::Ordinal) -lt $switchManager.IndexOf('$collectorDisabled = $true', [System.StringComparison]::Ordinal)) 'Manager switch path budget fails before disabling the collector'
 
 $upgrade = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\Invoke-CpaStackUpgrade.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
 Assert-True ($upgrade -match 'DeferFinalCommit') 'Upgrade defers switch journal cleanup until current state is committed'
@@ -141,6 +181,10 @@ Assert-True ($upgrade -match 'Immediate switch recovery failed') 'Outer switch f
 Assert-True ($upgrade -match 'Copy-CpaStackPluginTree\s+-Source\s+\$plugins') 'CPA candidate preparation copies plugins through the protected-tree helper'
 Assert-True ($upgrade -match 'Assert-CpaStackPrivateTree\s+-Root\s+\$activePlugins') 'Top-level upgrade fails closed on an unsafe preserved plugins tree'
 Assert-False ($upgrade -match 'Protect-CpaStackPrivateTree\s+-Root\s+\$activePlugins') 'Top-level upgrade does not erase evidence of an unsafe plugins ACL'
+Assert-True ($upgrade -match 'Repair-CpaStackRecordedExecutableAcl') 'Upgrade repairs only hash-bound active executable ACL drift before trusted preflight'
+Assert-True ($upgrade.IndexOf('Repair-CpaStackRecordedExecutableAcl', [System.StringComparison]::Ordinal) -lt $upgrade.IndexOf('$preflight = Invoke-ChildPowerShellJson', [System.StringComparison]::Ordinal)) 'Hash-bound executable ACL repair occurs before canonical preflight'
+Assert-True ($upgrade.IndexOf('Assert-UpgradeSwitchPathBudget', $upgrade.IndexOf('try {', [System.StringComparison]::Ordinal), [System.StringComparison]::Ordinal) -lt $upgrade.IndexOf('Set-UpgradeJournalPhase -Phase "switching-cpa"', [System.StringComparison]::Ordinal)) 'Upgrade budgets both components before the first formal switch'
+Assert-True ($initialize.IndexOf('Assert-InitializationSwitchPathBudget', $initialize.IndexOf('try {', [System.StringComparison]::Ordinal), [System.StringComparison]::Ordinal) -lt $initialize.IndexOf('Set-InitializeJournalPhase -Phase "switching"', [System.StringComparison]::Ordinal)) 'Initialization budgets both components before the first formal switch'
 Assert-True ($upgrade.LastIndexOf('$result | ConvertTo-Json', [System.StringComparison]::Ordinal) -lt $upgrade.LastIndexOf('if (-not $result.success)', [System.StringComparison]::Ordinal)) 'Upgrade emits its structured result before a non-zero exit'
 foreach ($journalScript in @('Adopt-CpaStackLegacyCanonical.ps1', 'Initialize-CpaStack.ps1', 'Invoke-CpaStackUpgrade.ps1', 'Switch-CpaRuntime.ps1', 'Switch-ManagerRuntime.ps1')) {
     $journalText = [System.IO.File]::ReadAllText((Join-Path $skillRoot ('scripts\' + $journalScript)), [System.Text.UTF8Encoding]::new($false, $true))
@@ -151,6 +195,7 @@ Assert-True ($adoption -match 'adopt\.pending\.json') 'Legacy canonical adoption
 Assert-True ($adoption -match 'Assert-LegacyCanonicalLayout') 'Legacy canonical adoption validates fixed paths and hashes'
 Assert-True ($adoption -match 'Protect-CpaStackPrivateTree\s+-Root\s+\$layout\.auth') 'Legacy canonical adoption hardens the full CPA auth tree'
 Assert-True ($adoption -match 'Protect-CpaStackPrivateTree\s+-Root\s+\$layout\.plugins') 'Legacy canonical adoption hardens the optional CPA plugins tree'
+Assert-True ($adoption -match 'Protect-CpaStackPrivateTree\s+-Root\s+\$layout\.managerData') 'Legacy canonical adoption hardens the entire Manager data tree'
 Assert-True ($adoption.LastIndexOf('$result | ConvertTo-Json', [System.StringComparison]::Ordinal) -lt $adoption.LastIndexOf('if (-not $result.success)', [System.StringComparison]::Ordinal)) 'Adoption emits its structured result before a non-zero exit'
 
 $agent = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'agents\openai.yaml'), [System.Text.UTF8Encoding]::new($false, $true))

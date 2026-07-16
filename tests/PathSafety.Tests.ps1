@@ -4,6 +4,7 @@ $ErrorActionPreference = 'Stop'
 $sourceRepo = Split-Path -Parent $PSScriptRoot
 $temp = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('cpa-stack-tests-' + [guid]::NewGuid().ToString('N'))
 $pluginRootJunction = $null
+$managerDataJunction = $null
 try {
     New-Item -ItemType Directory -Force -Path $temp | Out-Null
     $fixture = New-CpaStackUpdaterTestFixture `
@@ -83,6 +84,63 @@ try {
         Copy-CpaStackPluginTree -Source $pluginRootJunction -Destination $rejectedPluginCopy
     } 'reparse point' 'A plugins root junction is rejected before copying executable code'
     Assert-False (Test-Path -LiteralPath $rejectedPluginCopy) 'A rejected plugins junction does not create a destination tree'
+
+    $managerData = Join-Path $temp 'manager-data'
+    Protect-CpaStackPrivateDirectory -Path $managerData
+    foreach ($name in @('usage.sqlite', 'data.key', 'usage.sqlite-wal', 'usage.sqlite-shm')) {
+        Set-Content -LiteralPath (Join-Path $managerData $name) -Value 'manager data fixture' -Encoding ASCII
+    }
+    $walAcl = Get-Acl -LiteralPath (Join-Path $managerData 'usage.sqlite-wal')
+    Assert-False $walAcl.AreAccessRulesProtected 'Manager WAL inherits the protected data-root ACL'
+    Assert-CpaStackPrivateTree -Root $managerData -Description 'Manager data fixture' -AllowInheritedDescendants
+    Assert-ThrowsMatch {
+        Assert-CpaStackPrivateTree -Root $managerData -Description 'Manager data fixture'
+    } 'ACL inheritance is enabled' 'Strict private-tree checks still reject inherited descendants by default'
+
+    [void]$walAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+        $untrustedSid,
+        [System.Security.AccessControl.FileSystemRights]::Write,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    ))
+    Set-Acl -LiteralPath (Join-Path $managerData 'usage.sqlite-wal') -AclObject $walAcl
+    Assert-ThrowsMatch {
+        Assert-CpaStackPrivateTree -Root $managerData -Description 'Manager data fixture' -AllowInheritedDescendants
+    } 'unexpected identity' 'Manager WAL rejects an explicit untrusted write ACE'
+    Protect-CpaStackPrivateTree -Root $managerData
+
+    $managerJunctionTarget = Join-Path $temp 'manager-junction-target'
+    $managerDataJunction = Join-Path $managerData 'external-data'
+    New-Item -ItemType Directory -Force -Path $managerJunctionTarget | Out-Null
+    New-Item -ItemType Junction -Path $managerDataJunction -Target $managerJunctionTarget | Out-Null
+    Assert-ThrowsMatch {
+        Assert-CpaStackPrivateTree -Root $managerData -Description 'Manager data fixture' -AllowInheritedDescendants
+    } 'reparse point' 'Manager data rejects a nested junction'
+    [System.IO.Directory]::Delete($managerDataJunction)
+    $managerDataJunction = $null
+
+    $legacyManagerParent = Join-Path $temp 'legacy-manager-parent'
+    Protect-CpaStackPrivateDirectory -Path $legacyManagerParent
+    $legacyManagerRuntime = Join-Path $legacyManagerParent 'runtime'
+    $legacyManagerData = Join-Path $legacyManagerParent 'data'
+    New-Item -ItemType Directory -Force -Path $legacyManagerRuntime, $legacyManagerData | Out-Null
+    Set-Content -LiteralPath (Join-Path $legacyManagerRuntime 'cpa-manager-plus.exe') -Value 'legacy manager executable' -Encoding ASCII
+    foreach ($name in @('usage.sqlite', 'data.key', 'usage.sqlite-wal', 'usage.sqlite-shm')) {
+        Set-Content -LiteralPath (Join-Path $legacyManagerData $name) -Value 'legacy manager data' -Encoding ASCII
+    }
+    Protect-CpaStackPrivateTree -Root $legacyManagerRuntime
+    Protect-CpaStackPrivateTree -Root $legacyManagerData
+    Assert-CpaStackLegacyManagerSource -Runtime $legacyManagerRuntime -Data $legacyManagerData
+    $legacyManagerParentAcl = Get-Acl -LiteralPath $legacyManagerParent
+    [void]$legacyManagerParentAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+        $untrustedSid,
+        [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    ))
+    Set-Acl -LiteralPath $legacyManagerParent -AclObject $legacyManagerParentAcl
+    Assert-ThrowsMatch {
+        Assert-CpaStackLegacyManagerSource -Runtime $legacyManagerRuntime -Data $legacyManagerData
+    } 'replace descendants' 'Legacy Manager rejects DELETE_CHILD on the runtime/data parent'
+    Protect-CpaStackPrivateDirectory -Path $legacyManagerParent
 
     $legacyGrandparent = Join-Path $temp 'legacy-grandparent'
     New-Item -ItemType Directory -Force -Path $legacyGrandparent | Out-Null
@@ -198,6 +256,21 @@ try {
         Exit-CpaStackOperationLock -Mutex $lock
     }
 
+    $pathPrefix = ([System.IO.Path]::GetFullPath($temp).TrimEnd('\') + '\')
+    $containerAtLimit = $pathPrefix + ('d' * (247 - $pathPrefix.Length))
+    $leafAtLimit = $pathPrefix + ('f' * (259 - $pathPrefix.Length))
+    Assert-CpaStackPathBudget -Paths @($containerAtLimit) -PathType Container
+    Assert-CpaStackPathBudget -Paths @($leafAtLimit) -PathType Leaf
+    Assert-ThrowsMatch { Assert-CpaStackPathBudget -Paths @($containerAtLimit + 'x') -PathType Container } '247' 'Directory path budget rejects 248 characters'
+    Assert-ThrowsMatch { Assert-CpaStackPathBudget -Paths @($leafAtLimit + 'x') -PathType Leaf } '259' 'File path budget rejects 260 characters'
+
+    $jsonAtLimit = $pathPrefix + ('j' * (222 - $pathPrefix.Length))
+    Assert-CpaStackJsonWritePathBudget -Paths @($jsonAtLimit)
+    Assert-ThrowsMatch { Assert-CpaStackJsonWritePathBudget -Paths @($jsonAtLimit + 'x') } '259' 'Atomic JSON temp suffix is included in the preflight budget'
+    $slotAtLimit = $pathPrefix + ('s' * (205 - $pathPrefix.Length))
+    Assert-CpaStackPathBudget -Paths @($slotAtLimit + '.previous-' + ('0' * 32)) -PathType Container
+    Assert-ThrowsMatch { Assert-CpaStackPathBudget -Paths @(($slotAtLimit + 'x') + '.previous-' + ('0' * 32)) -PathType Container } '247' 'Directory-slot previous suffix is included in the preflight budget'
+
     Add-Type -AssemblyName System.IO.Compression
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $badZip = Join-Path $temp 'bad.zip'
@@ -212,6 +285,9 @@ try {
     } finally { $stream.Dispose() }
     Assert-Throws { Expand-CpaStackSafeArchive -ArchivePath $badZip -DestinationPath (Join-Path $temp 'bad-out') } 'ZIP traversal is rejected'
 } finally {
+    if ($managerDataJunction -and (Test-Path -LiteralPath $managerDataJunction)) {
+        [System.IO.Directory]::Delete($managerDataJunction)
+    }
     if ($pluginRootJunction -and (Test-Path -LiteralPath $pluginRootJunction)) {
         [System.IO.Directory]::Delete($pluginRootJunction)
     }

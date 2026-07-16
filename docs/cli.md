@@ -53,7 +53,7 @@ Secrets 文件必须分别包含 `cpaClientApiKey`、`cpaManagementKey` 和 `man
 
 ## 可选行为
 
-- `-UpdateDesktopShortcut`：允许更新显式传入或发现到的 CPA 桌面快捷方式。
+- `-UpdateDesktopShortcut`：允许更新显式传入或发现到的 CPA 桌面快捷方式。更新后的 `.lnk` 固定使用 `powershell.exe -NonInteractive -WindowStyle Hidden` 启动 canonical launcher；手工 CLI 仍在当前终端显示输出。
 - `-ExposeToLan`：允许正式服务保留或使用非 loopback 绑定；候选服务仍只允许 loopback。
 - `-NoBrowser`：`start` 时不打开 Manager 页面。
 - `-AllowUnknownVersionReplacement`：明确允许替换无法证明版本单调的旧二进制；不得默认添加。

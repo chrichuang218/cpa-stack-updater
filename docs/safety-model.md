@@ -8,11 +8,13 @@
 
 目标必须是专用的本地 NTFS/ReFS 目录。拒绝 UNC、盘符根、Windows/Program Files 子树、用户主目录本身、Git worktree 和 reparse traversal；LocalAppData 下的专用子目录允许使用。
 
-实例 marker、`current.json`、旧 canonical 接管 journal、初始化 journal、升级 journal 和切换 journal 必须拥有同一个 `instanceId`。普通非空目录不会被重新“认领”；只有固定 canonical 布局、正式进程、记录 hash 和无其他 pending 全部匹配时，才允许通过可恢复的 adoption journal 接管早期版本根目录。根目录 owner 必须是当前用户，ACL 只允许当前用户、SYSTEM 和本地 Administrators；关键配置、状态、启动脚本和可执行文件也会检查 owner、ACL 与 reparse 属性。CPA `auth` 与可选 `plugins` 代码树会递归拒绝 reparse point，并对每个文件和子目录加固、校验 owner 与 ACL。
+实例 marker、`current.json`、旧 canonical 接管 journal、初始化 journal、升级 journal 和切换 journal 必须拥有同一个 `instanceId`。普通非空目录不会被重新“认领”；只有固定 canonical 布局、正式进程、记录 hash 和无其他 pending 全部匹配时，才允许通过可恢复的 adoption journal 接管早期版本根目录。根目录 owner 必须是当前用户，ACL 只允许当前用户、SYSTEM 和本地 Administrators；关键配置、状态、启动脚本、可执行文件及其直接 runtime/data 父目录也会检查 owner、ACL 与 reparse 属性。CPA `auth`、可选 `plugins` 代码树和整个 Manager data tree 会递归拒绝 reparse point，并校验每个文件和子目录的 owner 与 ACL。Manager 运行期新建的 WAL/SHM 可以安全继承已保护 data root 的 ACL；其 owner 仍只能是当前用户、SYSTEM 或本地 Administrators。
 
-首次迁移允许 legacy 源对普通用户保留只读/执行 ACL，但 source runtime、config、auth、plugins 及其父链不得向非受信主体授予写入、修改、删除子项、改 ACL 或取得所有权的能力。CPA 候选 PID 完全退出后，工具用相对路径、类型、长度和 SHA256 生成 target runtime manifest，并把 digest、config hash 与 host 写入受保护 journal。正式切换复用这一已测试 target 快照，停服前和启动前各核对一次，不再从在线 legacy 源二次复制 config、auth 或 plugins。
+首次迁移允许 legacy 源对普通用户保留只读/执行 ACL，但 CPA 与 Manager 的 source runtime/data、config、auth、plugins 及其父链不得向非受信主体授予写入、修改、删除子项、改 ACL 或取得所有权的能力。CPA 候选 PID 完全退出后，工具用相对路径、类型、长度和 SHA256 生成 target runtime manifest，并把 digest、config hash 与 host 写入受保护 journal。正式切换复用这一已测试 target 快照，停服前和启动前各核对一次，不再从在线 legacy 源二次复制 config、auth 或 plugins。
 
 写操作只允许进入固定槽位，例如 `runtime/cli-proxy-api`、`runtime/manager-plus`、`data/manager-plus`、`work/current` 和 `rollback/last-known-good`。
+
+所有投影目录、文件、JSON 临时后缀和目录交换后缀都必须满足 Windows PowerShell 5.1 的兼容预算：目录不超过 247 字符，文件不超过 259 字符。初始化和升级会在停止第一个正式服务或禁用 Manager collector 前完成预检；超限时不进入停机窗口。
 
 ## Release 信任
 
@@ -34,15 +36,19 @@ Release 元数据与资产只从硬编码的官方 GitHub 仓库通过 HTTPS 获
 
 候选验证期间正式服务保持运行。只有 package、key、path、磁盘、Python、SQLite 快照和候选行为全部通过后，才进入正式停机窗口。
 
+停止候选或正式服务前，工具先从已验证 listener 固定 `Process` 对象和 OS handle。即使 listener 在停服函数进入前或等待期间消失，仍只终止并等待该固定进程；updater 已启动但从未绑定端口的游离候选也按其 `Process` 对象清理。完成条件是固定进程退出、端口释放且 executable 可独占打开；若端口被新 PID/path 抢占则立即停止，绝不终止新 owner。切换或恢复复制关键文件后，会在重新启动前恢复 runtime 父目录、关键文件和 Manager data tree 的 owner 与 ACL。
+
 ## Manager 数据
 
-SQLite online backup 生成 WAL 一致快照。快照关闭全部连接后清理新生成的空 `-wal`/`-shm`；非空 WAL 不会被删除。候选兼容性要求 authoritative usage-event watermark 不变，settings 与 model-price 数量不得减少。空的合法数据库同样支持；`hasHistoricalData=false` 本身不是失败。
+SQLite online backup 必须成功生成、重新打开并通过 `quick_check`。候选兼容性和回滚只保护必需业务表，以及 `usage_events` 的 count/max-id/max-timestamp 水位；升级前存在的 settings 与 model-price 数据不得减少。exe 与 `data.key` 继续使用 hash 校验。数据库文件 SHA256、大小、页布局、WAL/SHM、checkpoint 和可重建 rollup 不要求绝对一致。空的合法数据库同样支持；`hasHistoricalData=false` 本身不是失败。
 
 ## 网络
 
 候选必须只绑定 `127.0.0.1`，并检查同一端口的全部 listener，不能因第一条 listener 是 loopback 就忽略其他 LAN listener。正式服务默认 loopback；LAN 暴露必须由用户显式决定。
 
 候选与正式服务进程使用最小环境变量白名单，只保留 Windows 运行必需项和不含 userinfo/query/fragment 的代理 URL、TLS 路径；带内嵌账号口令的代理变量会被丢弃，也不会继承其他无关会话变量。loopback 只限制入站监听；经官方 release 与 hash 验证的二进制仍可通过当前网络或安全代理出站，它不是 AppContainer 或防火墙沙箱。
+
+长驻进程通过 Windows handle-list 白名单以无控制台窗口方式启动，只继承三个指向 `NUL` 的 stdin/stdout/stderr；父 PowerShell 的管道、文件和 secret 句柄不会传入服务。canonical 桌面快捷方式使用隐藏 PowerShell；直接 CLI 保留调用方终端，bundled PowerShell 复用同一控制台，不另创建可见窗口。这样 CLI 的结构化结果可以在事务结束时立即返回，而不依赖长驻服务退出。
 
 ## 不在范围内
 

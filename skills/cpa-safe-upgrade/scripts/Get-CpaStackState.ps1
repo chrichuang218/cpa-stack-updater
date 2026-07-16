@@ -383,6 +383,9 @@ function Get-RootSecurityState {
         (Join-Path $StackRoot 'state'),
         (Join-Path $StackRoot 'runtime'),
         (Join-Path $StackRoot 'data'),
+        (Join-Path $StackRoot 'runtime\cli-proxy-api'),
+        (Join-Path $StackRoot 'runtime\manager-plus'),
+        (Join-Path $StackRoot 'data\manager-plus'),
         (Join-Path $StackRoot '.cpa-stack-instance.json'),
         (Join-Path $StackRoot 'config\secrets.local.json'),
         (Join-Path $StackRoot 'ops\Start-CPA-Stack.ps1'),
@@ -455,6 +458,25 @@ function Get-RootSecurityState {
             }
         } catch {
             $issues += "ACL inspection failed for ${path}: $($_.Exception.Message)"
+        }
+    }
+    return [pscustomobject]@{
+        Protected = ($issues.Count -eq 0)
+        Issues = @($issues)
+    }
+}
+
+function Get-ManagerDataSecurityState {
+    param([string]$DataRoot)
+
+    $issues = @()
+    if (-not (Test-Path -LiteralPath $DataRoot -PathType Container)) {
+        $issues += 'Manager data directory is missing.'
+    } else {
+        try {
+            Assert-CpaStackPrivateTree -Root $DataRoot -Description 'Manager data tree' -AllowInheritedDescendants
+        } catch {
+            $issues += $_.Exception.Message
         }
     }
     return [pscustomobject]@{
@@ -912,6 +934,10 @@ function Get-LegacyState {
             ScriptPath = $null
             WorkingDirectory = $link.WorkingDirectory
             IconLocation = $link.IconLocation
+            PowerShellWindowHidden = (
+                [System.IO.Path]::GetFileName([string]$link.TargetPath) -ieq 'powershell.exe' -and
+                [string]$link.Arguments -match '(?i)(?:^|\s)-WindowStyle\s+Hidden(?:\s|$)'
+            )
         }
         if ($link.Arguments -match '(?i)-File\s+["''](?<path>.*?)["'']') {
             $startScript = $matches['path']
@@ -1036,8 +1062,9 @@ try {
     $pendingState = Get-PendingOperationState -StackRoot $settings.StackRoot
     $pendingOperations = @($pendingState.Paths)
     $rootSecurity = Get-RootSecurityState -StackRoot $settings.StackRoot
+    $managerDataSecurity = Get-ManagerDataSecurityState -DataRoot $settings.Manager.DataDirectory
     $integrity = Get-CurrentIntegrityState -StackRoot $settings.StackRoot
-    $trustStateReady = [bool]($rootSecurity.Protected -and $integrity.Ready)
+    $trustStateReady = [bool]($rootSecurity.Protected -and $managerDataSecurity.Protected -and $integrity.Ready)
     $secretsState = Get-SecretsState -Path $SecretsPath
     $currentForProbe = $null
     try { $currentForProbe = Read-CpaStackJson -Path (Join-Path $settings.StackRoot 'state\current.json') } catch {}
@@ -1047,7 +1074,7 @@ try {
     $expectedManagerHash = [string](Get-JsonPropertyValue -Object $currentManager -Name 'sha256')
     $cpa = Get-CpaStatus -Settings $settings -SecretsState $secretsState -ExpectedHash $expectedCpaHash -TrustStateReady $trustStateReady
     $manager = Get-ManagerStatus -Settings $settings -SecretsState $secretsState -ExpectedHash $expectedManagerHash -TrustStateReady $trustStateReady
-    $overallHealthy = ($secretsState.Safe.Ready -and $rootSecurity.Protected -and $integrity.Ready -and $cpa.Healthy -and $manager.Healthy -and $pendingOperations.Count -eq 0)
+    $overallHealthy = ($secretsState.Safe.Ready -and $rootSecurity.Protected -and $managerDataSecurity.Protected -and $integrity.Ready -and $cpa.Healthy -and $manager.Healthy -and $pendingOperations.Count -eq 0)
     $adoptionPending = @($pendingOperations | Where-Object { (Split-Path -Leaf ([string]$_)) -ieq 'adopt.pending.json' }).Count -gt 0
     $legacyCanonicalAdoptionRequired = ($adoptionPending -or (-not $integrity.MarkerPresent -and $integrity.CurrentPresent))
     $cpaListenerAddresses = @($cpa.Listeners | ForEach-Object { @($_.LocalAddresses) } | Where-Object { $_ } | Select-Object -Unique)
@@ -1070,6 +1097,7 @@ try {
         }
         Security = [pscustomobject]@{
             RootAcl = $rootSecurity
+            ManagerDataTree = $managerDataSecurity
             Integrity = $integrity
             CpaLoopbackOnly = ($cpaListenerAddresses.Count -gt 0 -and -not @($cpaListenerAddresses | Where-Object { $_ -notin @('127.0.0.1', '::1') }))
             ManagerLoopbackOnly = ($managerListenerAddresses.Count -gt 0 -and -not @($managerListenerAddresses | Where-Object { $_ -notin @('127.0.0.1', '::1') }))

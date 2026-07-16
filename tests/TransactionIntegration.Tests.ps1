@@ -2,7 +2,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('All', 'CpaSuccess', 'CpaRollback', 'CpaPluginGate', 'CpaMigrationBinding', 'ManagerRollback', 'PendingGate')]
+    [ValidateSet('All', 'CpaSuccess', 'CpaRollback', 'CpaHangCleanup', 'ManagerRollback', 'ManagerMigrationRollback', 'ManagerMigrationTamper', 'ManagerRecoveryGate', 'PendingGate')]
     [string]$Case = 'All'
 )
 
@@ -43,9 +43,11 @@ public static class Program
     private static string behavior;
     private static string dataDirectory;
     private static string databasePath;
+    private static string cpaConfigPath;
     private static int cpaPort;
     private static bool collectorEnabled;
     private static bool managerMode;
+    private static bool sourceTampered;
 
     public static int Main(string[] args)
     {
@@ -57,7 +59,21 @@ public static class Program
                 System.Diagnostics.Process.GetCurrentProcess().MainModule.FileName
             ).IndexOf("manager", StringComparison.OrdinalIgnoreCase) >= 0;
 
+            string startRecordDirective = Path.Combine(workingDirectory, "start-record-path.txt");
+            if (File.Exists(startRecordDirective))
+            {
+                string startRecordPath = File.ReadAllText(startRecordDirective).Trim();
+                File.AppendAllText(
+                    startRecordPath,
+                    BuildId + "|" + System.Diagnostics.Process.GetCurrentProcess().Id + Environment.NewLine
+                );
+            }
+
             int port = managerMode ? ConfigureManager() : ConfigureCpa(args);
+            if (behavior.IndexOf("hang-before-listen", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                System.Threading.Thread.Sleep(System.Threading.Timeout.Infinite);
+            }
             TcpListener listener = new TcpListener(IPAddress.Loopback, port);
             listener.Start();
             while (true)
@@ -106,12 +122,14 @@ public static class Program
             throw new InvalidOperationException("Missing -config argument.");
         }
 
+        cpaConfigPath = configPath;
         Match match = Regex.Match(File.ReadAllText(configPath), @"(?m)^port:\s*(\d+)\s*$");
         if (!match.Success)
         {
             throw new InvalidOperationException("Config has no numeric port.");
         }
-        return Int32.Parse(match.Groups[1].Value);
+        cpaPort = Int32.Parse(match.Groups[1].Value);
+        return cpaPort;
     }
 
     private static int ConfigureManager()
@@ -130,8 +148,11 @@ public static class Program
         dataDirectory = Environment.GetEnvironmentVariable("USAGE_DATA_DIR");
         databasePath = Environment.GetEnvironmentVariable("USAGE_DB_PATH");
         cpaPort = Int32.Parse(ReadOptional(Path.Combine(workingDirectory, "cpa-port.txt"), "8317").Trim());
+        string collectorFallback = behavior.IndexOf("default-collector-false", StringComparison.OrdinalIgnoreCase) >= 0
+            ? "false"
+            : "true";
         collectorEnabled = Boolean.Parse(
-            ReadOptional(Path.Combine(dataDirectory, "collector-state.txt"), "true").Trim()
+            ReadOptional(Path.Combine(dataDirectory, "collector-state.txt"), collectorFallback).Trim()
         );
         return Int32.Parse(match.Groups[1].Value);
     }
@@ -187,6 +208,13 @@ public static class Program
     {
         if (path.StartsWith("/v1/models", StringComparison.OrdinalIgnoreCase))
         {
+            if (behavior.IndexOf("tamper-cpa-config", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                File.WriteAllText(
+                    cpaConfigPath,
+                    "host: 0.0.0.0\r\nport: " + cpaPort + "\r\napi-keys:\r\n  - fixture-client-key\r\n"
+                );
+            }
             string models = behavior.IndexOf("bad-models", StringComparison.OrdinalIgnoreCase) >= 0
                 ? "{\"data\":[]}"
                 : "{\"data\":[{\"id\":\"fixture-model\"}]}";
@@ -257,6 +285,16 @@ public static class Program
         }
         if (path.StartsWith("/management.html", StringComparison.OrdinalIgnoreCase))
         {
+            if (!sourceTampered && behavior.IndexOf("tamper-source", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                string directive = Path.Combine(workingDirectory, "tamper-source.txt");
+                if (File.Exists(directive))
+                {
+                    string sourcePath = File.ReadAllText(directive).Trim();
+                    File.AppendAllText(sourcePath, "tampered-by-transaction-fixture");
+                    sourceTampered = true;
+                }
+            }
             string page = behavior.IndexOf("bad-page", StringComparison.OrdinalIgnoreCase) >= 0
                 ? "<html>broken fixture</html>"
                 : "<html>CPA Manager Plus fixture</html>";
@@ -291,7 +329,7 @@ public static class Program
 }
 '@
 
-$testRunRoot = Join-Path $env:TEMP ('cpa-stack-transaction-tests-' + [guid]::NewGuid().ToString('N'))
+$testRunRoot = Join-Path $env:TEMP ('cst-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
 $compileRoot = Join-Path $testRunRoot 'compiled'
 $managedRoots = New-Object System.Collections.Generic.List[string]
 $legacySourceRoots = New-Object System.Collections.Generic.List[string]
@@ -335,8 +373,11 @@ Add-Type -TypeDefinition $code -Language CSharp -OutputAssembly $OutputPath -Out
 '@
     }
 
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $compilerPath -SourcePath $sourcePath -OutputPath $OutputPath
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $OutputPath -PathType Leaf)) {
+    $compilerArguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -SourcePath "{1}" -OutputPath "{2}"' -f $compilerPath, $sourcePath, $OutputPath
+    $compiler = Start-Process -FilePath (Get-Command powershell.exe -ErrorAction Stop).Source -ArgumentList $compilerArguments -WindowStyle Hidden -Wait -PassThru
+    $compilerExitCode = $compiler.ExitCode
+    $compiler.Dispose()
+    if ($compilerExitCode -ne 0 -or -not (Test-Path -LiteralPath $OutputPath -PathType Leaf)) {
         throw "Failed to compile transaction fixture executable: $BuildId"
     }
 }
@@ -344,7 +385,7 @@ Add-Type -TypeDefinition $code -Language CSharp -OutputAssembly $OutputPath -Out
 function New-ManagedRoot {
     param([string]$Name)
 
-    $root = Join-Path $testRunRoot ($Name + '-' + [guid]::NewGuid().ToString('N'))
+    $root = Join-Path $testRunRoot ($Name + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
     New-Item -ItemType Directory -Force -Path $root | Out-Null
     Protect-CpaStackPrivateDirectory -Path $root
     $marker = Ensure-CpaStackInstanceMarker -ControlRoot $root -AllowCreate
@@ -459,6 +500,26 @@ function New-SqliteFixture {
     }
 }
 
+function New-ShortTimeoutTransactionScript {
+    param(
+        [Parameter(Mandatory = $true)][string]$ControlRoot,
+        [Parameter(Mandatory = $true)][string]$SourceScript,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    $scriptDirectory = Join-Path $ControlRoot 'work\short-timeout-scripts'
+    New-Item -ItemType Directory -Force -Path $scriptDirectory | Out-Null
+    $commonDestination = Join-Path $scriptDirectory 'CpaStack.Common.ps1'
+    if (-not (Test-Path -LiteralPath $commonDestination -PathType Leaf)) {
+        Copy-Item -LiteralPath $commonScript -Destination $commonDestination
+    }
+    $destination = Join-Path $scriptDirectory $Name
+    $content = [System.IO.File]::ReadAllText($SourceScript, [System.Text.UTF8Encoding]::new($false, $true))
+    $content = $content.Replace('-Seconds 35', '-Seconds 3')
+    Write-Utf8Text -Path $destination -Value $content
+    return $destination
+}
+
 function Invoke-CpaSwitchSuccessTest {
     param([string]$OldBinary, [string]$NewBinary)
 
@@ -557,147 +618,84 @@ function Invoke-CpaSwitchRollbackTest {
     }
 }
 
-function Invoke-CpaPluginSecurityGateTest {
+function Invoke-CpaHangBeforeListenCleanupTest {
     param([string]$OldBinary, [string]$NewBinary)
 
-    $fixture = New-ManagedRoot -Name 'cpa-plugin-gate'
-    $root = $fixture.Root
-    $port = Get-UnusedLoopbackPort
-    $runtime = Join-Path $root 'runtime\cli-proxy-api'
-    $candidate = Join-Path $root 'work\current\cpa-candidate'
+    $candidateFixture = New-ManagedRoot -Name 'cpa-candidate-hang-cleanup'
+    $candidateRoot = $candidateFixture.Root
+    $candidateRuntime = Join-Path $candidateRoot 'work\current\cpa-candidate'
+    $candidateConfig = Join-Path $candidateRoot 'config\active.yaml'
+    $candidateResultPath = Join-Path $candidateRoot 'state\cpa-candidate-result.json'
+    $candidateStartRecord = Join-Path $candidateRoot 'candidate-start.txt'
+    $candidatePort = Get-UnusedLoopbackPort
+    New-Item -ItemType Directory -Force -Path $candidateRuntime | Out-Null
+    Copy-Item -LiteralPath $NewBinary -Destination (Join-Path $candidateRuntime 'cli-proxy-api.exe')
+    Write-Utf8Text -Path (Join-Path $candidateRuntime 'behavior.txt') -Value 'hang-before-listen'
+    Write-Utf8Text -Path (Join-Path $candidateRuntime 'start-record-path.txt') -Value $candidateStartRecord
+    Write-CpaConfig -Path $candidateConfig -Port (Get-UnusedLoopbackPort)
+    [void](Write-TestSecrets -ControlRoot $candidateRoot)
+    $candidateHash = Get-CpaStackFileHash -Path (Join-Path $candidateRuntime 'cli-proxy-api.exe')
+    $shortCandidateScript = New-ShortTimeoutTransactionScript -ControlRoot $candidateRoot -SourceScript $testCpaScript -Name 'Test-CpaCandidate.ps1'
+
+    $candidateFailure = $null
+    try {
+        & $shortCandidateScript -ControlRoot $candidateRoot -CandidateRuntime $candidateRuntime -ActiveConfig $candidateConfig -ResultPath $candidateResultPath -ExpectedCandidateHash $candidateHash -Port $candidatePort -InProcess | Out-Null
+    } catch {
+        $candidateFailure = $_.Exception.Message
+    }
+    Assert-True -Condition ($candidateFailure -match 'did not claim port') -Message "A candidate that hangs before listen must time out. Failure=[$candidateFailure]"
+    $candidateRecord = [System.IO.File]::ReadAllText($candidateStartRecord).Trim()
+    Assert-True -Condition ($candidateRecord -match '^fixture-new\|(?<pid>\d+)$') -Message 'The hanging candidate records its fixed process id'
+    $candidateProcessId = [int]([regex]::Match($candidateRecord, '\|(?<pid>\d+)$').Groups['pid'].Value)
+    Assert-True -Condition ($null -eq (Get-Process -Id $candidateProcessId -ErrorAction SilentlyContinue)) -Message 'Candidate cleanup terminates the fixed process even though it never listened'
+    Assert-True -Condition ($null -eq (Get-CpaStackListener -Port $candidatePort)) -Message 'Candidate cleanup leaves its temporary port free'
+
+    $formalFixture = New-ManagedRoot -Name 'cpa-formal-hang-cleanup'
+    $formalRoot = $formalFixture.Root
+    $formalPort = Get-UnusedLoopbackPort
+    $runtime = Join-Path $formalRoot 'runtime\cli-proxy-api'
+    $formalCandidate = Join-Path $formalRoot 'work\current\cpa-candidate'
     $config = Join-Path $runtime 'config.yaml'
-    $resultPath = Join-Path $root 'state\cpa-switch-result.json'
-    $plugins = Join-Path $runtime 'plugins'
+    $formalResultPath = Join-Path $formalRoot 'state\cpa-switch-result.json'
+    $formalStartRecord = Join-Path $formalRoot 'formal-target-start.txt'
     $auth = Join-Path $runtime 'auth'
-    $nestedPlugins = Join-Path $plugins 'nested'
-    New-Item -ItemType Directory -Force -Path $runtime, $candidate, $nestedPlugins, $auth | Out-Null
+    $plugins = Join-Path $runtime 'plugins'
+    New-Item -ItemType Directory -Force -Path $runtime, $formalCandidate, $auth, $plugins | Out-Null
     Copy-Item -LiteralPath $OldBinary -Destination (Join-Path $runtime 'cli-proxy-api.exe')
-    Copy-Item -LiteralPath $NewBinary -Destination (Join-Path $candidate 'cli-proxy-api.exe')
+    Copy-Item -LiteralPath $NewBinary -Destination (Join-Path $formalCandidate 'cli-proxy-api.exe')
     Write-Utf8Text -Path (Join-Path $runtime 'behavior.txt') -Value 'good-old'
-    Write-Utf8Text -Path (Join-Path $candidate 'behavior.txt') -Value 'good-new'
+    Write-Utf8Text -Path (Join-Path $formalCandidate 'behavior.txt') -Value 'hang-before-listen'
+    Write-Utf8Text -Path (Join-Path $formalCandidate 'start-record-path.txt') -Value $formalStartRecord
     Write-Utf8Text -Path (Join-Path $auth 'account.json') -Value '{}'
-    Write-Utf8Text -Path (Join-Path $nestedPlugins 'plugin.ps1') -Value '# plugin fixture'
-    Write-CpaConfig -Path $config -Port $port
-    [void](Write-TestSecrets -ControlRoot $root)
+    Write-Utf8Text -Path (Join-Path $plugins 'plugin.ps1') -Value '# rollback plugin'
+    Write-CpaConfig -Path $config -Port $formalPort
+    [void](Write-TestSecrets -ControlRoot $formalRoot)
     Protect-CpaStackPrivateTree -Root $auth
     Protect-CpaStackPrivateTree -Root $plugins
-
-    $untrustedSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0')
-    $pluginAcl = Get-Acl -LiteralPath $nestedPlugins
-    [void]$pluginAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
-        $untrustedSid,
-        [System.Security.AccessControl.FileSystemRights]::Write,
-        [System.Security.AccessControl.AccessControlType]::Allow
-    ))
-    Set-Acl -LiteralPath $nestedPlugins -AclObject $pluginAcl
-
     $sourceExe = Join-Path $runtime 'cli-proxy-api.exe'
     $oldHash = Get-CpaStackFileHash -Path $sourceExe
-    $newHash = Get-CpaStackFileHash -Path (Join-Path $candidate 'cli-proxy-api.exe')
+    $formalCandidateHash = Get-CpaStackFileHash -Path (Join-Path $formalCandidate 'cli-proxy-api.exe')
+    $shortSwitchScript = New-ShortTimeoutTransactionScript -ControlRoot $formalRoot -SourceScript $switchCpaScript -Name 'Switch-CpaRuntime.ps1'
     try {
-        $oldProcess = Start-CpaFixture -Executable $sourceExe -Runtime $runtime -Config $config -Port $port
-        $failure = $null
+        [void](Start-CpaFixture -Executable $sourceExe -Runtime $runtime -Config $config -Port $formalPort)
+        $formalFailure = $null
         try {
-            & $switchCpaScript -ControlRoot $root -SourceRuntime $runtime -TargetRuntime $runtime -CandidatePackageRoot $candidate -SourceConfig $config -ResultPath $resultPath -ExpectedCandidateHash $newHash -Port $port -InProcess | Out-Null
+            & $shortSwitchScript -ControlRoot $formalRoot -SourceRuntime $runtime -TargetRuntime $runtime -CandidatePackageRoot $formalCandidate -SourceConfig $config -ResultPath $formalResultPath -ExpectedCandidateHash $formalCandidateHash -Port $formalPort -InProcess | Out-Null
         } catch {
-            $failure = $_.Exception.Message
+            $formalFailure = $_.Exception.Message
         }
-        Assert-True -Condition ($failure -match 'unexpected identity') -Message "CPA switch should reject an untrusted plugins write ACE. Failure=[$failure]"
-        Assert-Equal -Expected $oldHash -Actual (Get-CpaStackFileHash -Path $sourceExe) -Message 'plugin security gate leaves the old executable untouched'
-        Assert-False -Condition (Test-Path -LiteralPath (Join-Path $root 'state\switch-cpa.pending.json')) -Message 'plugin security gate fails before writing a switch journal'
-        [void](Wait-CpaStackTrustedListener -Port $port -ExpectedPath $sourceExe -ExpectedProcessId $oldProcess.Id -ExpectedHash $oldHash -AllowedAddresses @('127.0.0.1') -Seconds 2)
+        $formalResult = Read-CpaStackJson -Path $formalResultPath
+        Assert-True -Condition ($formalFailure -match 'old service was restored') -Message "A formal target that hangs before listen must roll back. Failure=[$formalFailure]"
+        Assert-True -Condition ([bool]$formalResult.rolledBack) -Message 'Healthy old CPA is restored after formal target hang'
+        $formalRecord = [System.IO.File]::ReadAllText($formalStartRecord).Trim()
+        Assert-True -Condition ($formalRecord -match '^fixture-new\|(?<pid>\d+)$') -Message 'The hanging formal target records its fixed process id'
+        $formalTargetProcessId = [int]([regex]::Match($formalRecord, '\|(?<pid>\d+)$').Groups['pid'].Value)
+        Assert-True -Condition ($null -eq (Get-Process -Id $formalTargetProcessId -ErrorAction SilentlyContinue)) -Message 'Formal rollback terminates the fixed target process even though it never listened'
+        $restoredListener = Get-CpaStackListener -Port $formalPort
+        Assert-True -Condition ($null -ne $restoredListener -and [int]$restoredListener.ProcessId -ne $formalTargetProcessId) -Message 'Only the restored old CPA owns the formal port'
+        Assert-Equal -Expected $oldHash -Actual (Get-CpaStackFileHash -Path $sourceExe) -Message 'Formal hang rollback restores the old executable'
     } finally {
-        Stop-OwnedFixturePort -Port $port -ManagedRoot $root
-    }
-}
-
-function Invoke-CpaMigrationSnapshotBindingTest {
-    param([string]$OldBinary, [string]$NewBinary)
-
-    $fixture = New-ManagedRoot -Name 'cpa-migration-binding'
-    $root = $fixture.Root
-    $port = Get-UnusedLoopbackPort
-    $candidatePort = Get-UnusedLoopbackPort
-    $legacyRoot = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('cpa-legacy-source-' + [guid]::NewGuid().ToString('N'))
-    [void]$legacySourceRoots.Add($legacyRoot)
-    New-Item -ItemType Directory -Force -Path $legacyRoot | Out-Null
-    Protect-CpaStackPrivateDirectory -Path $legacyRoot
-
-    $sourceRuntime = Join-Path $legacyRoot 'runtime'
-    $sourceAuth = Join-Path $sourceRuntime 'auth'
-    $sourcePlugins = Join-Path $sourceRuntime 'plugins'
-    $sourceConfig = Join-Path $sourceRuntime 'config.yaml'
-    New-Item -ItemType Directory -Force -Path $sourceAuth, $sourcePlugins | Out-Null
-    Copy-Item -LiteralPath $OldBinary -Destination (Join-Path $sourceRuntime 'cli-proxy-api.exe')
-    Write-Utf8Text -Path (Join-Path $sourceRuntime 'behavior.txt') -Value 'good-old'
-    Write-Utf8Text -Path (Join-Path $sourceAuth 'account.json') -Value 'source-auth-before-candidate'
-    Write-Utf8Text -Path (Join-Path $sourcePlugins 'plugin.ps1') -Value 'source-plugin-before-candidate'
-    Write-CpaConfig -Path $sourceConfig -Port $port
-    Protect-CpaStackPrivateTree -Root $sourceRuntime
-
-    $targetRuntime = Join-Path $root 'runtime\cli-proxy-api'
-    $targetAuth = Join-Path $targetRuntime 'auth'
-    $targetPlugins = Join-Path $targetRuntime 'plugins'
-    $targetConfig = Join-Path $targetRuntime 'config.yaml'
-    New-Item -ItemType Directory -Force -Path $targetAuth, $targetPlugins | Out-Null
-    Copy-Item -LiteralPath $NewBinary -Destination (Join-Path $targetRuntime 'cli-proxy-api.exe')
-    Write-Utf8Text -Path (Join-Path $targetRuntime 'behavior.txt') -Value 'good-new'
-    Write-Utf8Text -Path (Join-Path $targetAuth 'account.json') -Value 'candidate-auth-snapshot'
-    Write-Utf8Text -Path (Join-Path $targetPlugins 'plugin.ps1') -Value 'candidate-plugin-snapshot'
-    Write-CpaConfig -Path $targetConfig -Port $port
-    Protect-CpaStackPrivateTree -Root $targetRuntime
-    [void](Write-TestSecrets -ControlRoot $root)
-
-    $candidateHash = Get-CpaStackFileHash -Path (Join-Path $targetRuntime 'cli-proxy-api.exe')
-    $candidateResultPath = Join-Path $root 'state\cpa-migration-candidate.json'
-    $candidateJson = & $testCpaScript -ControlRoot $root -CandidateRuntime $targetRuntime -ActiveConfig $targetConfig -ActiveRuntime $sourceRuntime -ResultPath $candidateResultPath -ExpectedCandidateHash $candidateHash -Port $candidatePort -InProcess
-    $candidateResult = ($candidateJson | Select-Object -Last 1) | ConvertFrom-Json
-    Assert-True -Condition ([bool]$candidateResult.success) -Message 'migration candidate should validate before snapshot binding'
-    Assert-True -Condition ([string]$candidateResult.runtimeManifestSha256 -match '^[0-9A-F]{64}$') -Message 'candidate returns a post-exit runtime manifest digest'
-    Assert-Equal -Expected '127.0.0.1' -Actual ([string]$candidateResult.activeConfigHost) -Message 'candidate binds the canonical target host'
-
-    $sourceExe = Join-Path $sourceRuntime 'cli-proxy-api.exe'
-    $targetExe = Join-Path $targetRuntime 'cli-proxy-api.exe'
-    $resultPath = Join-Path $root 'state\cpa-migration-switch.json'
-    try {
-        $sourceProcess = Start-CpaFixture -Executable $sourceExe -Runtime $sourceRuntime -Config $sourceConfig -Port $port
-
-        $untrustedSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0')
-        $unsafePlugin = Join-Path $sourcePlugins 'plugin.ps1'
-        $unsafeAcl = Get-Acl -LiteralPath $unsafePlugin
-        [void]$unsafeAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
-            $untrustedSid,
-            [System.Security.AccessControl.FileSystemRights]::Write,
-            [System.Security.AccessControl.AccessControlType]::Allow
-        ))
-        Set-Acl -LiteralPath $unsafePlugin -AclObject $unsafeAcl
-        $gateFailure = $null
-        try {
-            & $switchCpaScript -ControlRoot $root -SourceRuntime $sourceRuntime -TargetRuntime $targetRuntime -CandidatePackageRoot $targetRuntime -SourceConfig $sourceConfig -ResultPath $resultPath -ExpectedCandidateHash $candidateHash -ExpectedTargetRuntimeManifestSha256 ([string]$candidateResult.runtimeManifestSha256) -ExpectedTargetConfigHash ([string]$candidateResult.activeConfigSha256) -ExpectedTargetHost ([string]$candidateResult.activeConfigHost) -Port $port -InProcess | Out-Null
-        } catch {
-            $gateFailure = $_.Exception.Message
-        }
-        Assert-True -Condition ($gateFailure -match 'mutable access') -Message "Unsafe legacy source must fail before migration switch. Failure=[$gateFailure]"
-        Assert-False -Condition (Test-Path -LiteralPath (Join-Path $root 'state\switch-cpa.pending.json')) -Message 'unsafe legacy source fails before the switch journal'
-        [void](Wait-CpaStackTrustedListener -Port $port -ExpectedPath $sourceExe -ExpectedProcessId $sourceProcess.Id -ExpectedHash (Get-CpaStackFileHash -Path $sourceExe) -AllowedAddresses @('127.0.0.1') -Seconds 2)
-
-        Protect-CpaStackSecretFile -Path $unsafePlugin
-        Write-Utf8Text -Path (Join-Path $sourceAuth 'account.json') -Value 'source-auth-after-candidate'
-        Write-Utf8Text -Path $unsafePlugin -Value 'source-plugin-after-candidate'
-        Write-Utf8Text -Path $sourceConfig -Value "host: 0.0.0.0`r`nport: $port`r`napi-keys:`r`n  - fixture-client-key"
-
-        $switchJson = & $switchCpaScript -ControlRoot $root -SourceRuntime $sourceRuntime -TargetRuntime $targetRuntime -CandidatePackageRoot $targetRuntime -SourceConfig $sourceConfig -ResultPath $resultPath -ExpectedCandidateHash $candidateHash -ExpectedTargetRuntimeManifestSha256 ([string]$candidateResult.runtimeManifestSha256) -ExpectedTargetConfigHash ([string]$candidateResult.activeConfigSha256) -ExpectedTargetHost ([string]$candidateResult.activeConfigHost) -Port $port -InProcess
-        $switchResult = ($switchJson | Select-Object -Last 1) | ConvertFrom-Json
-        Assert-True -Condition ([bool]$switchResult.success) -Message 'bound non-in-place migration should succeed'
-        Assert-Equal -Expected 'candidate-auth-snapshot' -Actual ([System.IO.File]::ReadAllText((Join-Path $targetAuth 'account.json')).Trim()) -Message 'formal migration uses the candidate-tested auth snapshot'
-        Assert-Equal -Expected 'candidate-plugin-snapshot' -Actual ([System.IO.File]::ReadAllText((Join-Path $targetPlugins 'plugin.ps1')).Trim()) -Message 'formal migration uses the candidate-tested plugins snapshot'
-        Assert-Equal -Expected '127.0.0.1' -Actual (Get-CpaStackConfigHost -ConfigPath $targetConfig) -Message 'formal migration preserves the candidate-bound loopback config'
-        [void](Wait-CpaStackTrustedListener -Port $port -ExpectedPath $targetExe -ExpectedProcessId (Get-CpaStackListener -Port $port).ProcessId -ExpectedHash $candidateHash -AllowedAddresses @('127.0.0.1') -Seconds 2)
-    } finally {
-        $listener = Get-CpaStackListener -Port $port
-        if ($listener -and $listener.ExecutablePath -in @($sourceExe, $targetExe)) {
-            Stop-CpaStackPort -Port $port -ExpectedPath $listener.ExecutablePath
-        }
+        Stop-OwnedFixturePort -Port $formalPort -ManagedRoot $formalRoot
     }
 }
 
@@ -740,7 +738,7 @@ function Invoke-ManagerSwitchRollbackTest {
 
         $result = Read-CpaStackJson -Path $resultPath
         Assert-False -Condition ([bool]$result.success) -Message 'failed Manager switch result should be unsuccessful'
-        Assert-True -Condition ([bool]$result.rolledBack) -Message 'failed Manager formal validation should automatically roll back'
+        Assert-True -Condition ([bool]$result.rolledBack) -Message "failed Manager formal validation should automatically roll back. Failure=$failure ResultError=$($result.error)"
         Assert-Equal -Expected $oldHash -Actual (Get-CpaStackFileHash -Path $sourceExe) -Message 'Manager rollback should restore the old executable bytes'
         Assert-Equal -Expected $oldDataKeyHash -Actual (Get-CpaStackFileHash -Path (Join-Path $data 'data.key')) -Message 'Manager rollback should preserve data.key'
         Assert-Equal -Expected 'good-old' -Actual ([System.IO.File]::ReadAllText((Join-Path $runtime 'behavior.txt')).Trim()) -Message 'Manager rollback should restore the old runtime payload'
@@ -753,6 +751,200 @@ function Invoke-ManagerSwitchRollbackTest {
     } finally {
         Stop-OwnedFixturePort -Port $managerPort -ManagedRoot $root
     }
+}
+
+function Invoke-ManagerMigrationTamperGateTest {
+    param([string]$OldBinary, [string]$NewBinary)
+
+    $fixture = New-ManagedRoot -Name 'manager-migration-tamper'
+    $root = $fixture.Root
+    $managerPort = Get-UnusedLoopbackPort
+    $cpaPort = Get-UnusedLoopbackPort
+    $legacyRoot = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('cpa-manager-legacy-source-' + [guid]::NewGuid().ToString('N'))
+    [void]$legacySourceRoots.Add($legacyRoot)
+    Protect-CpaStackPrivateDirectory -Path $legacyRoot
+
+    $sourceRuntime = Join-Path $legacyRoot 'runtime'
+    $sourceData = Join-Path $legacyRoot 'data'
+    $targetRuntime = Join-Path $root 'runtime\manager-plus'
+    $targetData = Join-Path $root 'data\manager-plus'
+    $resultPath = Join-Path $root 'state\manager-migration-result.json'
+    New-Item -ItemType Directory -Force -Path $sourceRuntime, $sourceData, $targetRuntime | Out-Null
+    Copy-Item -LiteralPath $OldBinary -Destination (Join-Path $sourceRuntime 'cpa-manager-plus.exe')
+    Copy-Item -LiteralPath $NewBinary -Destination (Join-Path $targetRuntime 'cpa-manager-plus.exe')
+    Write-Utf8Text -Path (Join-Path $sourceRuntime 'behavior.txt') -Value 'good-old'
+    Write-Utf8Text -Path (Join-Path $sourceRuntime 'cpa-port.txt') -Value ([string]$cpaPort)
+    Write-Utf8Text -Path (Join-Path $targetRuntime 'behavior.txt') -Value 'bad-page-tamper-source-default-collector-false'
+    Write-Utf8Text -Path (Join-Path $targetRuntime 'cpa-port.txt') -Value ([string]$cpaPort)
+    Write-Utf8Text -Path (Join-Path $sourceData 'data.key') -Value 'fixture-data-key'
+    New-SqliteFixture -Path (Join-Path $sourceData 'usage.sqlite')
+    Protect-CpaStackPrivateTree -Root $sourceRuntime
+    Protect-CpaStackPrivateTree -Root $sourceData
+    Write-StackConfig -Path (Join-Path $root 'config\stack.psd1') -CpaPort $cpaPort -ManagerPort $managerPort
+    [void](Write-TestSecrets -ControlRoot $root)
+
+    $sourceExe = Join-Path $sourceRuntime 'cpa-manager-plus.exe'
+    $targetExe = Join-Path $targetRuntime 'cpa-manager-plus.exe'
+    $sourceDataKey = Join-Path $sourceData 'data.key'
+    Write-Utf8Text -Path (Join-Path $targetRuntime 'tamper-source.txt') -Value $sourceDataKey
+    $oldHash = Get-CpaStackFileHash -Path $sourceExe
+    $oldDataKeyHash = Get-CpaStackFileHash -Path $sourceDataKey
+    $newHash = Get-CpaStackFileHash -Path $targetExe
+    try {
+        [void](Start-ManagerFixture -Executable $sourceExe -Runtime $sourceRuntime -Data $sourceData -Port $managerPort)
+        $failure = $null
+        try {
+            & $switchManagerScript `
+                -ControlRoot $root `
+                -SourceRuntime $sourceRuntime `
+                -SourceData $sourceData `
+                -TargetRuntime $targetRuntime `
+                -TargetData $targetData `
+                -CandidatePackageRoot $targetRuntime `
+                -ResultPath $resultPath `
+                -ExpectedCandidateHash $newHash `
+                -ManagerPort $managerPort `
+                -CpaPort $cpaPort `
+                -InProcess | Out-Null
+        } catch {
+            $failure = $_.Exception.Message
+        }
+
+        Assert-True -Condition ($failure -match 'automatic recovery also failed') -Message "Tampered legacy Manager must make recovery fail closed. Failure=[$failure]"
+        $result = Read-CpaStackJson -Path $resultPath
+        Assert-False -Condition ([bool]$result.success) -Message 'Tampered non-in-place Manager migration should fail'
+        Assert-False -Condition ([bool]$result.rolledBack) -Message 'Tampered legacy Manager must not be reported as safely restored'
+        Assert-Equal -Expected $oldHash -Actual (Get-CpaStackFileHash -Path $sourceExe) -Message 'Fixture leaves the legacy executable unchanged'
+        Assert-False -Condition ((Get-CpaStackFileHash -Path $sourceDataKey) -eq $oldDataKeyHash) -Message "Fixture should have changed the stopped legacy data key. Failure=[$failure] Result=[$($result.error)]"
+        Assert-True -Condition ($null -eq (Get-CpaStackListener -Port $managerPort)) -Message 'Recovery trust failure must not execute either Manager binary'
+    } finally {
+        $listener = Get-CpaStackListener -Port $managerPort
+        if ($listener -and $listener.ExecutablePath -in @($sourceExe, $targetExe)) {
+            Stop-CpaStackPort -Port $managerPort -ExpectedPath $listener.ExecutablePath
+        }
+    }
+}
+
+function Invoke-ManagerMigrationRollbackTest {
+    param([string]$OldBinary, [string]$NewBinary)
+
+    $fixture = New-ManagedRoot -Name 'manager-migration-rollback'
+    $root = $fixture.Root
+    $managerPort = Get-UnusedLoopbackPort
+    $cpaPort = Get-UnusedLoopbackPort
+    $legacyRoot = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('cpa-manager-legacy-rollback-' + [guid]::NewGuid().ToString('N'))
+    [void]$legacySourceRoots.Add($legacyRoot)
+    Protect-CpaStackPrivateDirectory -Path $legacyRoot
+    $sourceRuntime = Join-Path $legacyRoot 'runtime'
+    $sourceData = Join-Path $legacyRoot 'data'
+    $targetRuntime = Join-Path $root 'runtime\manager-plus'
+    $targetData = Join-Path $root 'data\manager-plus'
+    $resultPath = Join-Path $root 'state\manager-migration-result.json'
+    New-Item -ItemType Directory -Force -Path $sourceRuntime, $sourceData, $targetRuntime | Out-Null
+    Copy-Item -LiteralPath $OldBinary -Destination (Join-Path $sourceRuntime 'cpa-manager-plus.exe')
+    Copy-Item -LiteralPath $NewBinary -Destination (Join-Path $targetRuntime 'cpa-manager-plus.exe')
+    Write-Utf8Text -Path (Join-Path $sourceRuntime 'behavior.txt') -Value 'good-old'
+    Write-Utf8Text -Path (Join-Path $sourceRuntime 'cpa-port.txt') -Value ([string]$cpaPort)
+    Write-Utf8Text -Path (Join-Path $targetRuntime 'behavior.txt') -Value 'bad-page-default-collector-false'
+    Write-Utf8Text -Path (Join-Path $targetRuntime 'cpa-port.txt') -Value ([string]$cpaPort)
+    Write-Utf8Text -Path (Join-Path $sourceData 'data.key') -Value 'fixture-data-key'
+    New-SqliteFixture -Path (Join-Path $sourceData 'usage.sqlite')
+    Protect-CpaStackPrivateTree -Root $sourceRuntime
+    Protect-CpaStackPrivateTree -Root $sourceData
+    Write-StackConfig -Path (Join-Path $root 'config\stack.psd1') -CpaPort $cpaPort -ManagerPort $managerPort
+    [void](Write-TestSecrets -ControlRoot $root)
+
+    $sourceExe = Join-Path $sourceRuntime 'cpa-manager-plus.exe'
+    $targetExe = Join-Path $targetRuntime 'cpa-manager-plus.exe'
+    $oldHash = Get-CpaStackFileHash -Path $sourceExe
+    $oldDataKeyHash = Get-CpaStackFileHash -Path (Join-Path $sourceData 'data.key')
+    $newHash = Get-CpaStackFileHash -Path $targetExe
+    try {
+        [void](Start-ManagerFixture -Executable $sourceExe -Runtime $sourceRuntime -Data $sourceData -Port $managerPort)
+        $failure = $null
+        try {
+            & $switchManagerScript -ControlRoot $root -SourceRuntime $sourceRuntime -SourceData $sourceData -TargetRuntime $targetRuntime -TargetData $targetData -CandidatePackageRoot $targetRuntime -ResultPath $resultPath -ExpectedCandidateHash $newHash -ManagerPort $managerPort -CpaPort $cpaPort -InProcess | Out-Null
+        } catch {
+            $failure = $_.Exception.Message
+        }
+        Assert-True -Condition (-not [string]::IsNullOrWhiteSpace($failure)) -Message 'Bad non-in-place Manager candidate should fail'
+        $result = Read-CpaStackJson -Path $resultPath
+        Assert-True -Condition ([bool]$result.rolledBack) -Message "Trusted legacy Manager should be restored. Failure=[$failure] Result=[$($result.error)]"
+        Assert-Equal -Expected $oldHash -Actual (Get-CpaStackFileHash -Path $sourceExe) -Message 'Non-in-place rollback preserves the legacy executable'
+        Assert-Equal -Expected $oldDataKeyHash -Actual (Get-CpaStackFileHash -Path (Join-Path $sourceData 'data.key')) -Message 'Non-in-place rollback preserves the legacy data key'
+        $listener = Get-CpaStackListener -Port $managerPort
+        [void](Wait-CpaStackTrustedListener -Port $managerPort -ExpectedPath $sourceExe -ExpectedProcessId $listener.ProcessId -ExpectedHash $oldHash -AllowedAddresses @('127.0.0.1') -Seconds 2)
+    } finally {
+        $listener = Get-CpaStackListener -Port $managerPort
+        if ($listener -and $listener.ExecutablePath -in @($sourceExe, $targetExe)) {
+            Stop-CpaStackPort -Port $managerPort -ExpectedPath $listener.ExecutablePath
+        }
+    }
+}
+
+function Invoke-ManagerRecoverySourceGateTest {
+    param([string]$OldBinary)
+
+    $legacyRoot = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('cpa-manager-recovery-gate-' + [guid]::NewGuid().ToString('N'))
+    [void]$legacySourceRoots.Add($legacyRoot)
+    Protect-CpaStackPrivateDirectory -Path $legacyRoot
+    $runtime = Join-Path $legacyRoot 'runtime'
+    $data = Join-Path $legacyRoot 'data'
+    New-Item -ItemType Directory -Force -Path $runtime, $data | Out-Null
+    $executable = Join-Path $runtime 'cpa-manager-plus.exe'
+    $database = Join-Path $data 'usage.sqlite'
+    $dataKey = Join-Path $data 'data.key'
+    Copy-Item -LiteralPath $OldBinary -Destination $executable
+    Write-Utf8Text -Path $dataKey -Value 'fixture-data-key'
+    New-SqliteFixture -Path $database
+    Protect-CpaStackPrivateTree -Root $runtime
+    Protect-CpaStackPrivateTree -Root $data
+
+    $python = Get-CpaStackPythonCommand
+    $seedCode = "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('INSERT INTO usage_events(timestamp_ms) VALUES (1000),(2000)'); c.execute('INSERT INTO settings(name,value) VALUES (?,?)',('fixture','stable')); c.commit(); c.close()"
+    $seedArguments = @($python.Prefix) + @('-c', $seedCode, $database)
+    & $python.Path @seedArguments
+    if ($LASTEXITCODE -ne 0) { throw 'Failed to seed the Manager recovery SQLite fixture.' }
+
+    $baselineRoot = Join-Path $legacyRoot 'baseline'
+    New-Item -ItemType Directory -Path $baselineRoot | Out-Null
+    $baselineDatabase = Join-Path $baselineRoot 'usage.sqlite'
+    $baseline = Invoke-CpaStackSqliteBackup -Source $database -Destination $baselineDatabase -ResultPath (Join-Path $baselineRoot 'sqlite.json')
+    $executableHash = Get-CpaStackFileHash -Path $executable
+    $dataKeyHash = Get-CpaStackFileHash -Path $dataKey
+    [void](Assert-CpaStackManagerRecoverySource `
+        -Runtime $runtime `
+        -Data $data `
+        -ExpectedExecutableSha256 $executableHash `
+        -ExpectedDataKeySha256 $dataKeyHash `
+        -ExpectedSnapshot $baseline `
+        -VerificationRoot (Join-Path $legacyRoot 'verify-good'))
+
+    Write-Utf8Text -Path $dataKey -Value 'changed-data-key'
+    Assert-ThrowsMatch {
+        Assert-CpaStackManagerRecoverySource -Runtime $runtime -Data $data -ExpectedExecutableSha256 $executableHash -ExpectedDataKeySha256 $dataKeyHash -ExpectedSnapshot $baseline -VerificationRoot (Join-Path $legacyRoot 'verify-key')
+    } 'data.key changed' 'Manager recovery rejects a changed data key before execution'
+    Write-Utf8Text -Path $dataKey -Value 'fixture-data-key'
+
+    $baselineDatabaseHash = Get-CpaStackFileHash -Path $database
+    $physicalRewriteArguments = @($python.Prefix) + @('-c', "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('PRAGMA user_version=7'); c.commit(); c.close()", $database)
+    & $python.Path @physicalRewriteArguments
+    if ($LASTEXITCODE -ne 0) { throw 'Failed to rewrite the Manager recovery SQLite fixture.' }
+    Assert-False -Condition ((Get-CpaStackFileHash -Path $database) -eq $baselineDatabaseHash) -Message 'Physical SQLite bytes change for the semantic recovery test'
+    [void](Assert-CpaStackManagerRecoverySource -Runtime $runtime -Data $data -ExpectedExecutableSha256 $executableHash -ExpectedDataKeySha256 $dataKeyHash -ExpectedSnapshot $baseline -VerificationRoot (Join-Path $legacyRoot 'verify-physical-rewrite'))
+
+    $regressionArguments = @($python.Prefix) + @('-c', "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('DELETE FROM usage_events WHERE id=(SELECT max(id) FROM usage_events)'); c.commit(); c.close()", $database)
+    & $python.Path @regressionArguments
+    if ($LASTEXITCODE -ne 0) { throw 'Failed to regress the Manager recovery SQLite fixture.' }
+    Assert-ThrowsMatch {
+        Assert-CpaStackManagerRecoverySource -Runtime $runtime -Data $data -ExpectedExecutableSha256 $executableHash -ExpectedDataKeySha256 $dataKeyHash -ExpectedSnapshot $baseline -VerificationRoot (Join-Path $legacyRoot 'verify-database')
+    } 'count regressed' 'Manager recovery rejects a usage_events count below the rollback baseline'
+    Copy-Item -LiteralPath $baselineDatabase -Destination $database -Force
+
+    [System.IO.File]::AppendAllText($executable, 'changed-executable')
+    Assert-ThrowsMatch {
+        Assert-CpaStackManagerRecoverySource -Runtime $runtime -Data $data -ExpectedExecutableSha256 $executableHash -ExpectedDataKeySha256 $dataKeyHash -ExpectedSnapshot $baseline -VerificationRoot (Join-Path $legacyRoot 'verify-executable')
+    } 'executable changed' 'Manager recovery rejects a changed executable before execution'
 }
 
 function Invoke-PendingJournalStartupGateTest {
@@ -807,7 +999,8 @@ function Invoke-PendingJournalStartupGateTest {
     )) {
         Protect-CpaStackSecretFile -Path $criticalPath
     }
-    Protect-CpaStackPrivateTree -Root (Join-Path $cpaRuntime 'auth')
+    Protect-CpaStackPrivateTree -Root (Join-Path $root 'runtime')
+    Protect-CpaStackPrivateTree -Root (Join-Path $root 'data')
 
     $failure = $null
     try {
@@ -842,14 +1035,20 @@ try {
     if ($Case -in @('All', 'CpaRollback')) {
         Invoke-CpaSwitchRollbackTest -OldBinary $oldBinary -NewBinary $newBinary
     }
-    if ($Case -in @('All', 'CpaPluginGate')) {
-        Invoke-CpaPluginSecurityGateTest -OldBinary $oldBinary -NewBinary $newBinary
-    }
-    if ($Case -in @('All', 'CpaMigrationBinding')) {
-        Invoke-CpaMigrationSnapshotBindingTest -OldBinary $oldBinary -NewBinary $newBinary
+    if ($Case -in @('All', 'CpaHangCleanup')) {
+        Invoke-CpaHangBeforeListenCleanupTest -OldBinary $oldBinary -NewBinary $newBinary
     }
     if ($Case -in @('All', 'ManagerRollback')) {
         Invoke-ManagerSwitchRollbackTest -OldBinary $oldBinary -NewBinary $newBinary
+    }
+    if ($Case -in @('All', 'ManagerMigrationRollback')) {
+        Invoke-ManagerMigrationRollbackTest -OldBinary $oldBinary -NewBinary $newBinary
+    }
+    if ($Case -in @('All', 'ManagerMigrationTamper')) {
+        Invoke-ManagerMigrationTamperGateTest -OldBinary $oldBinary -NewBinary $newBinary
+    }
+    if ($Case -in @('All', 'ManagerRecoveryGate')) {
+        Invoke-ManagerRecoverySourceGateTest -OldBinary $oldBinary
     }
     if ($Case -in @('All', 'PendingGate')) {
         Invoke-PendingJournalStartupGateTest -OldBinary $oldBinary
@@ -870,11 +1069,9 @@ try {
         }
     }
     if (Test-Path -LiteralPath $testRunRoot) {
-        Remove-Item -LiteralPath $testRunRoot -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-TestPathWithRetry -Path $testRunRoot
     }
     foreach ($legacyRoot in $legacySourceRoots) {
-        if (Test-Path -LiteralPath $legacyRoot) {
-            Remove-Item -LiteralPath $legacyRoot -Recurse -Force -ErrorAction SilentlyContinue
-        }
+        Remove-TestPathWithRetry -Path $legacyRoot
     }
 }

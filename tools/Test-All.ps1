@@ -9,9 +9,11 @@ $repo = Split-Path -Parent $PSScriptRoot
 
 foreach ($test in @(
     'tests\Static.Tests.ps1',
+    'tests\Shortcut.Tests.ps1',
     'tests\PathSafety.Tests.ps1',
     'tests\SafetyRegression.Tests.ps1',
     'tests\SecretAndEnvironment.Tests.ps1',
+    'tests\ProcessLifecycle.Tests.ps1',
     'tests\Adoption.Tests.ps1',
     'tests\Install.Tests.ps1',
     'tests\Cli.Tests.ps1',

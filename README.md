@@ -8,7 +8,7 @@
 
 面向 Windows 的 CLIProxyAPI/CPA 与 CPA Manager Plus 安全自动升级工具。
 
-新版本会先从官方 GitHub Release 下载并校验，再在仅本机可访问的临时端口启动候选版本。只有候选验证、SQLite 一致快照和数据兼容检查全部通过后，才切换正式服务；正式切换失败会自动恢复上一个健康版本。
+新版本会先从官方 GitHub Release 下载并校验，再在仅本机可访问的临时端口启动候选版本。只有候选验证、SQLite online backup 可生成并重新打开、`quick_check` 和数据兼容检查全部通过后，才切换正式服务；正式切换失败会自动恢复上一个健康版本。
 
 > 本项目是社区工具，与两个上游项目不存在官方隶属或背书关系。
 
@@ -33,7 +33,13 @@
 - 同一 Windows 账户跨登录会话文件锁阻止并发升级、安装和卸载。
 - pending journal 支持硬中断恢复，绑定实例 ID 且不保存密钥。
 - 候选测试后、正式切换前再次校验 exe hash。
+- 长驻服务以无控制台窗口方式启动，只继承显式指向 `NUL` 的标准句柄，不会把升级命令的输出管道永久占住。
+- 停服前固定已验证 listener 的 `Process`；即使 listener 提前消失，仍等待同一进程退出和 executable 文件锁释放。updater 启动但未监听的游离候选也按固定进程清理。
 - 整个管理根只允许当前用户、SYSTEM 和 Administrators 访问。
+- runtime 直接父目录和整个 Manager data tree（含 WAL/SHM）都会做 owner、ACL 与 reparse 检查。
+- 非原地回滚在执行旧 Manager 前复核 exe、`data.key`、必需业务表，以及 `usage_events` 的 count/max-id/max-timestamp 水位；升级前存在的 settings/model-price 数据不得减少。
+- SQLite 校验保护业务数据语义，不要求数据库文件 SHA256、大小、页布局、WAL/SHM、checkpoint 或 rollup 绝对一致。
+- 按 Windows PowerShell 5.1 的目录 247 字符、文件 259 字符预算预检所有切换路径；超限会在停服前失败。
 - 不会终止路径不匹配的未知端口进程。
 - 未经单独明确授权，不删除旧安装和历史目录。
 
@@ -81,6 +87,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli plan -Root 'E:\C
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli upgrade -Root 'E:\CPA-Stack' -UpdateDesktopShortcut -Json
 ```
+
+  更新后的 `.lnk` 会通过 `powershell.exe -NonInteractive -WindowStyle Hidden` 启动 canonical launcher，双击时不显示 PowerShell 窗口。直接在终端运行 CLI 时仍保留正常输出，内部 bundled PowerShell 复用当前控制台，不会另开窗口。
 
 - 如果不授权修改快捷方式，请执行不带该开关的升级；以后不要再使用旧快捷方式，统一通过 canonical CLI 启动：
 

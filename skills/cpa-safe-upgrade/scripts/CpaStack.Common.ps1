@@ -351,6 +351,7 @@ function Write-CpaStackJson {
         [int]$Depth = 12
     )
 
+    Assert-CpaStackJsonWritePathBudget -Paths @($Path)
     $parent = Split-Path -Parent $Path
     if ($parent) {
         New-Item -ItemType Directory -Force -Path $parent | Out-Null
@@ -427,6 +428,89 @@ function Sync-CpaStackCanonicalLauncher {
         throw 'Canonical launcher synchronization did not preserve the bundled hash.'
     }
     return [pscustomobject]@{ changed = $true; path = $destination; sha256 = $sourceHash; previousSha256 = $previousHash }
+}
+
+function Get-CpaStackCanonicalShortcutContract {
+    param(
+        [Parameter(Mandatory = $true)][string]$StartScript,
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory
+    )
+
+    if ($StartScript.IndexOf('"') -ge 0) {
+        throw 'Canonical start script path must not contain a quote.'
+    }
+    $startScriptFull = [System.IO.Path]::GetFullPath($StartScript)
+    $workingDirectoryFull = [System.IO.Path]::GetFullPath($WorkingDirectory).TrimEnd('\')
+    $powershell = [System.IO.Path]::GetFullPath((Get-Command powershell.exe -ErrorAction Stop).Source)
+    return [pscustomobject]@{
+        TargetPath = $powershell
+        Arguments = '-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $startScriptFull
+        WorkingDirectory = $workingDirectoryFull
+        WindowStyle = 7
+    }
+}
+
+function Assert-CpaStackCanonicalShortcutContract {
+    param(
+        [Parameter(Mandatory = $true)]$Shortcut,
+        [Parameter(Mandatory = $true)][string]$StartScript,
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory
+    )
+
+    $contract = Get-CpaStackCanonicalShortcutContract -StartScript $StartScript -WorkingDirectory $WorkingDirectory
+    $actualWorkingDirectory = try {
+        [System.IO.Path]::GetFullPath([string]$Shortcut.WorkingDirectory).TrimEnd('\')
+    } catch {
+        ''
+    }
+    if (-not [string]::Equals([string]$Shortcut.TargetPath, [string]$contract.TargetPath, [System.StringComparison]::OrdinalIgnoreCase) -or
+        [string]$Shortcut.Arguments -cne [string]$contract.Arguments -or
+        -not [string]::Equals($actualWorkingDirectory, [string]$contract.WorkingDirectory, [System.StringComparison]::OrdinalIgnoreCase) -or
+        [int]$Shortcut.WindowStyle -ne [int]$contract.WindowStyle) {
+        throw 'Canonical desktop shortcut does not match the hidden-window launch contract.'
+    }
+    return $contract
+}
+
+function Set-CpaStackCanonicalShortcut {
+    param(
+        [Parameter(Mandatory = $true)][string]$ShortcutPath,
+        [Parameter(Mandatory = $true)][string]$StartScript,
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+        [string]$IconPath = ''
+    )
+
+    if ([System.IO.Path]::GetExtension($ShortcutPath) -ine '.lnk') {
+        throw 'Canonical desktop shortcut must use the .lnk extension.'
+    }
+    Assert-CpaStackPath -Path $ShortcutPath -PathType Leaf
+    Assert-CpaStackPath -Path $StartScript -PathType Leaf
+    Assert-CpaStackPath -Path $WorkingDirectory -PathType Container
+    $contract = Get-CpaStackCanonicalShortcutContract -StartScript $StartScript -WorkingDirectory $WorkingDirectory
+    $wsh = $null
+    $link = $null
+    $verify = $null
+    try {
+        $wsh = New-Object -ComObject WScript.Shell
+        $link = $wsh.CreateShortcut($ShortcutPath)
+        $link.TargetPath = $contract.TargetPath
+        $link.Arguments = $contract.Arguments
+        $link.WorkingDirectory = $contract.WorkingDirectory
+        $link.WindowStyle = [int]$contract.WindowStyle
+        if ($IconPath -and (Test-Path -LiteralPath $IconPath -PathType Leaf)) {
+            $link.IconLocation = "$IconPath,0"
+        }
+        $link.Save()
+        $verify = $wsh.CreateShortcut($ShortcutPath)
+        [void](Assert-CpaStackCanonicalShortcutContract -Shortcut $verify -StartScript $StartScript -WorkingDirectory $WorkingDirectory)
+        return $contract
+    } finally {
+        foreach ($comObject in @($verify, $link, $wsh)) {
+            if ($null -ne $comObject -and [System.Runtime.InteropServices.Marshal]::IsComObject($comObject)) {
+                [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($comObject)
+            }
+        }
+    }
 }
 
 function Read-CpaStackJson {
@@ -774,8 +858,34 @@ function Assert-CpaStackLegacyCpaSource {
     Assert-CpaStackLegacySourceAcl -Path $ConfigPath -Description 'Legacy CPA config'
 }
 
+function Assert-CpaStackLegacyManagerSource {
+    param(
+        [Parameter(Mandatory = $true)][string]$Runtime,
+        [Parameter(Mandatory = $true)][string]$Data
+    )
+
+    Assert-CpaStackPath -Path $Runtime
+    Assert-CpaStackPathNoReparseAncestors -Path $Runtime -Description 'Legacy Manager runtime'
+    Assert-CpaStackLegacyAncestorAcl -Path $Runtime -Description 'Legacy Manager runtime ancestor'
+    Assert-CpaStackLegacySourceTree -Root $Runtime -Description 'Legacy Manager runtime tree'
+
+    $executable = Join-Path $Runtime 'cpa-manager-plus.exe'
+    Assert-CpaStackPath -Path $executable -PathType Leaf
+
+    Assert-CpaStackPath -Path $Data
+    Assert-CpaStackPathNoReparseAncestors -Path $Data -Description 'Legacy Manager data'
+    Assert-CpaStackLegacyAncestorAcl -Path $Data -Description 'Legacy Manager data ancestor'
+    Assert-CpaStackLegacySourceTree -Root $Data -Description 'Legacy Manager data tree'
+    Assert-CpaStackPath -Path (Join-Path $Data 'usage.sqlite') -PathType Leaf
+    Assert-CpaStackPath -Path (Join-Path $Data 'data.key') -PathType Leaf
+}
+
 function Get-CpaStackTreeManifest {
-    param([Parameter(Mandatory = $true)][string]$Root)
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [string[]]$ExcludeDirectoryNames = @(),
+        [string[]]$ExcludeFileNames = @()
+    )
 
     $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\')
     $items = @(Get-CpaStackTreeItemsNoReparse -Root $rootFull)
@@ -786,6 +896,9 @@ function Get-CpaStackTreeManifest {
         $fullName = [System.IO.Path]::GetFullPath($item.FullName).TrimEnd('\')
         if ($fullName -ieq $rootFull) { continue }
         $relative = $fullName.Substring($rootFull.Length + 1)
+        $topLevelName = ($relative -split '\\', 2)[0]
+        if ($ExcludeDirectoryNames -contains $topLevelName) { continue }
+        if (-not $item.PSIsContainer -and $ExcludeFileNames -contains $item.Name) { continue }
         $encodedPath = [Convert]::ToBase64String($utf8.GetBytes($relative))
         if ($item.PSIsContainer) {
             [void]$entries.Add([pscustomobject][ordered]@{
@@ -838,14 +951,18 @@ function Get-CpaStackTreeManifest {
 function Assert-CpaStackPrivateTree {
     param(
         [Parameter(Mandatory = $true)][string]$Root,
-        [string]$Description = 'Protected CPA stack tree'
+        [string]$Description = 'Protected CPA stack tree',
+        [switch]$AllowInheritedDescendants
     )
 
+    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\')
     $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     $allowedSids = @($currentSid, 'S-1-5-18', 'S-1-5-32-544')
     foreach ($item in @(Get-CpaStackTreeItemsNoReparse -Root $Root)) {
         $acl = Get-Acl -LiteralPath $item.FullName -ErrorAction Stop
-        if (-not $acl.AreAccessRulesProtected) {
+        $itemFull = [System.IO.Path]::GetFullPath($item.FullName).TrimEnd('\')
+        $isRoot = [string]::Equals($itemFull, $rootFull, [System.StringComparison]::OrdinalIgnoreCase)
+        if (-not $acl.AreAccessRulesProtected -and ($isRoot -or -not $AllowInheritedDescendants)) {
             throw "$Description ACL inheritance is enabled: $($item.FullName)"
         }
         try {
@@ -858,7 +975,8 @@ function Assert-CpaStackPrivateTree {
         } catch {
             throw "$Description owner could not be verified: $($item.FullName)"
         }
-        if ($ownerSid -ne $currentSid) {
+        $allowedOwnerSids = if ($AllowInheritedDescendants -and -not $isRoot) { $allowedSids } else { @($currentSid) }
+        if ($allowedOwnerSids -notcontains $ownerSid) {
             throw "$Description has an unexpected owner: $($item.FullName)"
         }
         foreach ($rule in $acl.Access | Where-Object { $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow }) {
@@ -887,6 +1005,340 @@ function Protect-CpaStackPrivateTree {
     Assert-CpaStackPrivateTree -Root $Root
 }
 
+function Initialize-CpaStackNativeProcessType {
+    if ($null -ne ('CpaStack.NativeProcessV1' -as [type])) { return }
+
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+
+namespace CpaStack
+{
+    public static class NativeProcessV1
+    {
+        private const uint GenericRead = 0x80000000;
+        private const uint GenericWrite = 0x40000000;
+        private const uint FileShareRead = 0x00000001;
+        private const uint FileShareWrite = 0x00000002;
+        private const uint FileShareDelete = 0x00000004;
+        private const uint OpenExisting = 3;
+        private const uint FileAttributeNormal = 0x00000080;
+        private const uint StartfUseStdHandles = 0x00000100;
+        private const uint CreateSuspended = 0x00000004;
+        private const uint CreateUnicodeEnvironment = 0x00000400;
+        private const uint ExtendedStartupInfoPresent = 0x00080000;
+        private const uint CreateNoWindow = 0x08000000;
+        private const uint WaitObject0 = 0x00000000;
+        private static readonly IntPtr ProcThreadAttributeHandleList = new IntPtr(0x00020002);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SecurityAttributes
+        {
+            public int Length;
+            public IntPtr SecurityDescriptor;
+            [MarshalAs(UnmanagedType.Bool)] public bool InheritHandle;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct StartupInfo
+        {
+            public int Size;
+            public IntPtr Reserved;
+            public IntPtr Desktop;
+            public IntPtr Title;
+            public int X;
+            public int Y;
+            public int XSize;
+            public int YSize;
+            public int XCountChars;
+            public int YCountChars;
+            public int FillAttribute;
+            public int Flags;
+            public short ShowWindow;
+            public short Reserved2Size;
+            public IntPtr Reserved2;
+            public IntPtr StandardInput;
+            public IntPtr StandardOutput;
+            public IntPtr StandardError;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct StartupInfoEx
+        {
+            public StartupInfo StartupInfo;
+            public IntPtr AttributeList;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ProcessInformation
+        {
+            public IntPtr Process;
+            public IntPtr Thread;
+            public uint ProcessId;
+            public uint ThreadId;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFile(
+            string fileName,
+            uint desiredAccess,
+            uint shareMode,
+            ref SecurityAttributes securityAttributes,
+            uint creationDisposition,
+            uint flagsAndAttributes,
+            IntPtr templateFile);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool InitializeProcThreadAttributeList(
+            IntPtr attributeList,
+            int attributeCount,
+            int flags,
+            ref IntPtr size);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool UpdateProcThreadAttribute(
+            IntPtr attributeList,
+            uint flags,
+            IntPtr attribute,
+            IntPtr value,
+            IntPtr size,
+            IntPtr previousValue,
+            IntPtr returnSize);
+
+        [DllImport("kernel32.dll")]
+        private static extern void DeleteProcThreadAttributeList(IntPtr attributeList);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CreateProcess(
+            string applicationName,
+            StringBuilder commandLine,
+            IntPtr processAttributes,
+            IntPtr threadAttributes,
+            [MarshalAs(UnmanagedType.Bool)] bool inheritHandles,
+            uint creationFlags,
+            IntPtr environment,
+            string currentDirectory,
+            ref StartupInfoEx startupInfo,
+            out ProcessInformation processInformation);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint ResumeThread(IntPtr thread);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool TerminateProcess(IntPtr process, uint exitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+
+        private static SafeFileHandle OpenNull(uint access)
+        {
+            SecurityAttributes attributes = new SecurityAttributes();
+            attributes.Length = Marshal.SizeOf(typeof(SecurityAttributes));
+            attributes.InheritHandle = true;
+            SafeFileHandle handle = CreateFile(
+                "NUL",
+                access,
+                FileShareRead | FileShareWrite | FileShareDelete,
+                ref attributes,
+                OpenExisting,
+                FileAttributeNormal,
+                IntPtr.Zero);
+            if (handle.IsInvalid)
+            {
+                int error = Marshal.GetLastWin32Error();
+                handle.Dispose();
+                throw new Win32Exception(error, "Could not open the Windows null device for managed-process isolation.");
+            }
+            return handle;
+        }
+
+        private static IntPtr BuildEnvironmentBlock(IDictionary environment, out int characterCount)
+        {
+            List<string> entries = new List<string>();
+            foreach (DictionaryEntry entry in environment)
+            {
+                string name = Convert.ToString(entry.Key);
+                string value = Convert.ToString(entry.Value);
+                if (String.IsNullOrEmpty(name) || name.IndexOf('=') >= 0 || name.IndexOf('\0') >= 0 || value.IndexOf('\0') >= 0)
+                {
+                    throw new InvalidOperationException("Managed-process environment contains an invalid name or value.");
+                }
+                entries.Add(name + "=" + value);
+            }
+            entries.Sort(StringComparer.OrdinalIgnoreCase);
+            StringBuilder block = new StringBuilder();
+            foreach (string entry in entries)
+            {
+                block.Append(entry);
+                block.Append('\0');
+            }
+            block.Append('\0');
+            string text = block.ToString();
+            characterCount = text.Length;
+            return Marshal.StringToHGlobalUni(text);
+        }
+
+        private static void ZeroAndFreeEnvironment(IntPtr environment, int characterCount)
+        {
+            if (environment == IntPtr.Zero) { return; }
+            for (int offset = 0; offset < characterCount * 2; offset += 2)
+            {
+                Marshal.WriteInt16(environment, offset, 0);
+            }
+            Marshal.FreeHGlobal(environment);
+        }
+
+        public static Process Start(string filePath, string arguments, string workingDirectory, IDictionary environment)
+        {
+            if (String.IsNullOrWhiteSpace(filePath) || filePath.IndexOf('"') >= 0)
+            {
+                throw new ArgumentException("Managed-process executable path is invalid.", "filePath");
+            }
+            if (String.IsNullOrWhiteSpace(workingDirectory))
+            {
+                throw new ArgumentException("Managed-process working directory is required.", "workingDirectory");
+            }
+            if (environment == null)
+            {
+                throw new ArgumentNullException("environment");
+            }
+
+            SafeFileHandle standardInput = null;
+            SafeFileHandle standardOutput = null;
+            SafeFileHandle standardError = null;
+            IntPtr attributeList = IntPtr.Zero;
+            IntPtr handleList = IntPtr.Zero;
+            IntPtr environmentBlock = IntPtr.Zero;
+            int environmentCharacters = 0;
+            ProcessInformation processInformation = new ProcessInformation();
+            Process process = null;
+            bool processCreated = false;
+            bool processResumed = false;
+            bool attributeListInitialized = false;
+
+            try
+            {
+                standardInput = OpenNull(GenericRead);
+                standardOutput = OpenNull(GenericWrite);
+                standardError = OpenNull(GenericWrite);
+
+                IntPtr attributeListSize = IntPtr.Zero;
+                InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref attributeListSize);
+                if (attributeListSize == IntPtr.Zero)
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not size the managed-process handle list.");
+                }
+                attributeList = Marshal.AllocHGlobal(attributeListSize);
+                if (!InitializeProcThreadAttributeList(attributeList, 1, 0, ref attributeListSize))
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not initialize the managed-process handle list.");
+                }
+                attributeListInitialized = true;
+
+                handleList = Marshal.AllocHGlobal(IntPtr.Size * 3);
+                Marshal.WriteIntPtr(handleList, 0, standardInput.DangerousGetHandle());
+                Marshal.WriteIntPtr(handleList, IntPtr.Size, standardOutput.DangerousGetHandle());
+                Marshal.WriteIntPtr(handleList, IntPtr.Size * 2, standardError.DangerousGetHandle());
+                if (!UpdateProcThreadAttribute(
+                    attributeList,
+                    0,
+                    ProcThreadAttributeHandleList,
+                    handleList,
+                    new IntPtr(IntPtr.Size * 3),
+                    IntPtr.Zero,
+                    IntPtr.Zero))
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not restrict managed-process inherited handles.");
+                }
+
+                environmentBlock = BuildEnvironmentBlock(environment, out environmentCharacters);
+                StartupInfoEx startupInfo = new StartupInfoEx();
+                startupInfo.StartupInfo.Size = Marshal.SizeOf(typeof(StartupInfoEx));
+                startupInfo.StartupInfo.Flags = (int)StartfUseStdHandles;
+                startupInfo.StartupInfo.StandardInput = standardInput.DangerousGetHandle();
+                startupInfo.StartupInfo.StandardOutput = standardOutput.DangerousGetHandle();
+                startupInfo.StartupInfo.StandardError = standardError.DangerousGetHandle();
+                startupInfo.AttributeList = attributeList;
+
+                string command = "\"" + filePath + "\"";
+                if (!String.IsNullOrWhiteSpace(arguments)) { command += " " + arguments; }
+                StringBuilder commandLine = new StringBuilder(command);
+                uint flags = CreateSuspended | CreateUnicodeEnvironment | ExtendedStartupInfoPresent | CreateNoWindow;
+                if (!CreateProcess(
+                    filePath,
+                    commandLine,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    true,
+                    flags,
+                    environmentBlock,
+                    workingDirectory,
+                    ref startupInfo,
+                    out processInformation))
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Managed process could not be started.");
+                }
+                processCreated = true;
+                process = Process.GetProcessById((int)processInformation.ProcessId);
+                IntPtr processHandle = process.Handle;
+                if (ResumeThread(processInformation.Thread) == UInt32.MaxValue)
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Managed process could not be resumed.");
+                }
+                processResumed = true;
+                return process;
+            }
+            catch
+            {
+                Exception cleanupError = null;
+                if (processCreated && !processResumed && processInformation.Process != IntPtr.Zero)
+                {
+                    if (!TerminateProcess(processInformation.Process, 1))
+                    {
+                        cleanupError = new Win32Exception(Marshal.GetLastWin32Error(), "A suspended managed process could not be terminated after startup failed.");
+                    }
+                    else if (WaitForSingleObject(processInformation.Process, 5000) != WaitObject0)
+                    {
+                        cleanupError = new InvalidOperationException("A suspended managed process did not exit after startup failed.");
+                    }
+                }
+                if (process != null) { process.Dispose(); }
+                if (cleanupError != null) { throw cleanupError; }
+                throw;
+            }
+            finally
+            {
+                ZeroAndFreeEnvironment(environmentBlock, environmentCharacters);
+                if (processInformation.Thread != IntPtr.Zero) { CloseHandle(processInformation.Thread); }
+                if (processInformation.Process != IntPtr.Zero) { CloseHandle(processInformation.Process); }
+                if (attributeListInitialized) { DeleteProcThreadAttributeList(attributeList); }
+                if (handleList != IntPtr.Zero) { Marshal.FreeHGlobal(handleList); }
+                if (attributeList != IntPtr.Zero) { Marshal.FreeHGlobal(attributeList); }
+                if (standardError != null) { standardError.Dispose(); }
+                if (standardOutput != null) { standardOutput.Dispose(); }
+                if (standardInput != null) { standardInput.Dispose(); }
+            }
+        }
+    }
+}
+'@
+}
+
 function Start-CpaStackProcess {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
@@ -897,13 +1349,7 @@ function Start-CpaStackProcess {
         [switch]$MinimalEnvironment
     )
 
-    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $startInfo.FileName = $FilePath
-    $startInfo.Arguments = $Arguments
-    $startInfo.WorkingDirectory = $WorkingDirectory
-    $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
-    $startInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+    $processEnvironment = @{}
     if ($MinimalEnvironment) {
         $allowedNames = @(
             'SystemRoot', 'WINDIR', 'COMSPEC', 'TEMP', 'TMP', 'PATH', 'PATHEXT',
@@ -931,52 +1377,216 @@ function Start-CpaStackProcess {
                 $allowedValues[$name] = $value
             }
         }
-        $startInfo.EnvironmentVariables.Clear()
         foreach ($name in $allowedValues.Keys) {
-            $startInfo.EnvironmentVariables[$name] = [string]$allowedValues[$name]
+            $processEnvironment[$name] = [string]$allowedValues[$name]
+        }
+    } else {
+        foreach ($entry in [Environment]::GetEnvironmentVariables([System.EnvironmentVariableTarget]::Process).GetEnumerator()) {
+            $processEnvironment[[string]$entry.Key] = [string]$entry.Value
         }
     }
     foreach ($name in $RemoveEnvironment) {
-        [void]$startInfo.EnvironmentVariables.Remove($name)
+        [void]$processEnvironment.Remove($name)
     }
     foreach ($name in $Environment.Keys) {
-        $startInfo.EnvironmentVariables[$name] = [string]$Environment[$name]
+        $processEnvironment[$name] = [string]$Environment[$name]
     }
 
-    $process = New-Object System.Diagnostics.Process
-    $process.StartInfo = $startInfo
-    if (-not $process.Start()) {
-        throw "Failed to start process: $FilePath"
+    Initialize-CpaStackNativeProcessType
+    return [CpaStack.NativeProcessV1]::Start($FilePath, $Arguments, $WorkingDirectory, $processEnvironment)
+}
+
+function Stop-CpaStackStartedProcess {
+    param(
+        [Parameter(Mandatory = $true)]$Process,
+        [Parameter(Mandatory = $true)][string]$ExpectedPath,
+        [int]$WaitSeconds = 10
+    )
+
+    try {
+        $Process.Refresh()
+        if ([bool]$Process.HasExited) { return }
+        $actualPath = [System.IO.Path]::GetFullPath([string]$Process.MainModule.FileName)
+        $expectedFull = [System.IO.Path]::GetFullPath($ExpectedPath)
+        if (-not [string]::Equals($actualPath, $expectedFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Started process path changed before cleanup: $actualPath"
+        }
+        $Process.Kill()
+        if (-not $Process.WaitForExit($WaitSeconds * 1000)) {
+            throw "Started process did not exit within $WaitSeconds seconds: $expectedFull"
+        }
+    } catch {
+        try {
+            $Process.Refresh()
+            if ([bool]$Process.HasExited) { return }
+        } catch {}
+        throw
     }
-    return $process
+}
+
+function Get-CpaStackFixedListenerProcess {
+    param(
+        [Parameter(Mandatory = $true)]$Listener,
+        [Parameter(Mandatory = $true)][string]$ExpectedPath
+    )
+
+    $expectedFull = [System.IO.Path]::GetFullPath($ExpectedPath)
+    if ([int]$Listener.ProcessId -le 0 -or
+        -not [string]::Equals([System.IO.Path]::GetFullPath([string]$Listener.ExecutablePath), $expectedFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The listener does not match the expected executable.'
+    }
+
+    $process = Get-Process -Id ([int]$Listener.ProcessId) -ErrorAction Stop
+    try {
+        [void]$process.Handle
+        $actualPath = [System.IO.Path]::GetFullPath([string]$process.MainModule.FileName)
+        if ([int]$process.Id -ne [int]$Listener.ProcessId -or
+            -not [string]::Equals($actualPath, $expectedFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw 'The listener process identity changed before its handle was fixed.'
+        }
+        return $process
+    } catch {
+        if ($process -is [System.IDisposable]) { $process.Dispose() }
+        throw
+    }
+}
+
+function Stop-CpaStackProcessesByExecutablePath {
+    param(
+        [Parameter(Mandatory = $true)][string]$ExpectedPath,
+        [int]$WaitSeconds = 10
+    )
+
+    $expectedFull = [System.IO.Path]::GetFullPath($ExpectedPath)
+    $escapedName = [System.IO.Path]::GetFileName($expectedFull).Replace("'", "''")
+    $processRecords = @(Get-CimInstance Win32_Process -Filter "Name='$escapedName'" -ErrorAction SilentlyContinue)
+    $matchingRecords = @($processRecords | Where-Object {
+        -not [string]::IsNullOrWhiteSpace([string]$_.ExecutablePath) -and
+        [string]::Equals([System.IO.Path]::GetFullPath([string]$_.ExecutablePath), $expectedFull, [System.StringComparison]::OrdinalIgnoreCase)
+    })
+
+    $stopped = 0
+    foreach ($record in $matchingRecords) {
+        $process = Get-Process -Id ([int]$record.ProcessId) -ErrorAction SilentlyContinue
+        if ($null -eq $process) { continue }
+        try {
+            [void]$process.Handle
+            if (-not [bool]$process.HasExited) {
+                $actualPath = [System.IO.Path]::GetFullPath([string]$process.MainModule.FileName)
+                if (-not [string]::Equals($actualPath, $expectedFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    throw "Process identity changed while quarantining executable: $expectedFull"
+                }
+            }
+            Stop-CpaStackStartedProcess -Process $process -ExpectedPath $expectedFull -WaitSeconds $WaitSeconds
+            $stopped++
+        } finally {
+            if ($process -is [System.IDisposable]) { $process.Dispose() }
+        }
+    }
+    return $stopped
+}
+
+function Test-CpaStackFileReadyForReplacement {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $true
+    }
+    $stream = $null
+    try {
+        $stream = [System.IO.File]::Open(
+            $Path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None)
+        return $true
+    } catch [System.IO.IOException] {
+        return $false
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
 }
 
 function Stop-CpaStackPort {
     param(
         [Parameter(Mandatory = $true)][int]$Port,
         [string]$ExpectedPath = "",
-        [int]$WaitSeconds = 10
+        [int]$WaitSeconds = 10,
+        [switch]$RequireExecutableWriteAccess,
+        $ExpectedProcess
     )
 
     $listener = Get-CpaStackListener -Port $Port
-    if (-not $listener) {
+    if (-not $listener -and $null -eq $ExpectedProcess) {
         return
     }
-    if ($ExpectedPath -and $listener.ExecutablePath -ine $ExpectedPath) {
+    if ($listener -and $ExpectedPath -and $listener.ExecutablePath -ine $ExpectedPath -and $null -eq $ExpectedProcess) {
         throw "Port $Port is owned by an unexpected process: $($listener.ExecutablePath)"
     }
-    Stop-Process -Id $listener.ProcessId -Force -ErrorAction Stop
-    $deadline = (Get-Date).AddSeconds($WaitSeconds)
-    while ((Get-Date) -lt $deadline) {
-        $connections = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
-        if ($connections.Count -eq 0) {
-            return
+
+    $ownedProcess = $ExpectedProcess
+    $disposeOwnedProcess = $false
+    if ($null -eq $ownedProcess) {
+        $ownedProcess = Get-CpaStackFixedListenerProcess -Listener $listener -ExpectedPath $listener.ExecutablePath
+        $disposeOwnedProcess = $true
+    }
+
+    $timer = $null
+    try {
+        [void]$ownedProcess.Handle
+        $processExited = [bool]$ownedProcess.HasExited
+        if ($processExited) {
+            $verifiedPath = if ($ExpectedPath) { $ExpectedPath } elseif ($listener) { [string]$listener.ExecutablePath } else { $null }
+            if ([string]::IsNullOrWhiteSpace($verifiedPath)) {
+                throw "The fixed process for port $Port exited without a verified executable path."
+            }
+            $ownedProcessPath = [System.IO.Path]::GetFullPath($verifiedPath)
+        } else {
+            try {
+                $ownedProcessPath = [System.IO.Path]::GetFullPath([string]$ownedProcess.MainModule.FileName)
+            } catch {
+                try { $ownedProcess.Refresh() } catch {}
+                if (-not [bool]$ownedProcess.HasExited) { throw }
+                $processExited = $true
+                $verifiedPath = if ($ExpectedPath) { $ExpectedPath } elseif ($listener) { [string]$listener.ExecutablePath } else { $null }
+                if ([string]::IsNullOrWhiteSpace($verifiedPath)) { throw }
+                $ownedProcessPath = [System.IO.Path]::GetFullPath($verifiedPath)
+            }
         }
-        $owners = @($connections | Select-Object -ExpandProperty OwningProcess -Unique)
-        if ($owners.Count -ne 1 -or [int]$owners[0] -ne [int]$listener.ProcessId) {
-            throw "Port $Port was claimed by an unexpected process while the expected process was stopping."
+        if ($ExpectedPath -and
+            -not [string]::Equals($ownedProcessPath, [System.IO.Path]::GetFullPath($ExpectedPath), [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "The fixed process for port $Port does not match the expected executable."
         }
-        Start-Sleep -Milliseconds 200
+
+        if (-not $processExited) {
+            $ownedProcess.Kill()
+        }
+
+        $timer = [System.Diagnostics.Stopwatch]::StartNew()
+        $processRunning = -not [bool]$ownedProcess.HasExited
+        while ($timer.Elapsed.TotalSeconds -lt $WaitSeconds) {
+            $connections = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+            $owners = @($connections | Select-Object -ExpandProperty OwningProcess -Unique)
+            if ($owners.Count -gt 0 -and ($owners.Count -ne 1 -or [int]$owners[0] -ne [int]$ownedProcess.Id)) {
+                throw "Port $Port was claimed by an unexpected process while the expected process was stopping."
+            }
+
+            $processRunning = -not [bool]$ownedProcess.HasExited
+            $fileReady = (-not $RequireExecutableWriteAccess) -or (Test-CpaStackFileReadyForReplacement -Path $ExpectedPath)
+            if (-not $processRunning -and $connections.Count -eq 0 -and $fileReady) {
+                return
+            }
+            Start-Sleep -Milliseconds 200
+        }
+    } finally {
+        if ($null -ne $timer) { $timer.Stop() }
+        if ($disposeOwnedProcess -and $ownedProcess -is [System.IDisposable]) { $ownedProcess.Dispose() }
+    }
+    if ($processRunning) {
+        throw "Process on port $Port did not fully exit within $WaitSeconds seconds."
+    }
+    if ($RequireExecutableWriteAccess -and -not (Test-CpaStackFileReadyForReplacement -Path $ExpectedPath)) {
+        throw "Executable for port $Port remained locked after the process exited."
     }
     throw "Process on port $Port did not stop within $WaitSeconds seconds."
 }
@@ -1574,7 +2184,7 @@ function Assert-CpaStackChildPath {
         '^rollback\\(?:last-known-good|legacy-migration|(?:staging|pending)-(?:cpa|manager)-[0-9a-fA-F]{32})(?:\\.*)?$',
         '^runtime\\(?:cli-proxy-api|manager-plus)(?:\\.*)?$',
         '^state\\[^\\]+(?:\\.*)?$',
-        '^work\\(?:current|cpa-8318-[0-9a-fA-F]{32}|manager-18318-[0-9a-fA-F]{32}|manager-formal-verification-[0-9a-fA-F]{32})(?:\\.*)?$'
+        '^work\\(?:current|cpa-8318-[0-9a-fA-F]{32}|manager-18318-[0-9a-fA-F]{32}|manager-formal-verification-[0-9a-fA-F]{32}|mv-[0-9a-fA-F]{32})(?:\\.*)?$'
     )
     if ($segments.Count -lt 2 -or -not ($allowedPatterns | Where-Object { $relative -match $_ } | Select-Object -First 1)) {
         throw "Managed paths must name a fixed slot below the control root. Path=$Path"
@@ -1596,6 +2206,59 @@ function Assert-CpaStackChildPath {
         if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
             throw "Managed path crosses a reparse point: $current"
         }
+    }
+}
+
+function Assert-CpaStackPathBudget {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Paths,
+        [ValidateSet('Leaf', 'Container')][string]$PathType = 'Leaf'
+    )
+
+    $maximumLength = if ($PathType -eq 'Container') { 247 } else { 259 }
+    foreach ($path in $Paths) {
+        if ([string]::IsNullOrWhiteSpace($path)) { throw 'Path budget validation received an empty path.' }
+        $fullPath = [System.IO.Path]::GetFullPath($path)
+        if ($fullPath.Length -gt $maximumLength) {
+            throw "Path exceeds the Windows PowerShell 5.1 $PathType budget of $maximumLength characters: $fullPath"
+        }
+    }
+}
+
+function Assert-CpaStackJsonWritePathBudget {
+    param([Parameter(Mandatory = $true)][string[]]$Paths)
+
+    foreach ($path in $Paths) {
+        Assert-CpaStackPathBudget -Paths @(
+            $path,
+            ($path + '.previous'),
+            ($path + '.tmp-' + ('0' * 32))
+        ) -PathType Leaf
+        Assert-CpaStackPathBudget -Paths @((Split-Path -Parent ([System.IO.Path]::GetFullPath($path)))) -PathType Container
+    }
+}
+
+function Assert-CpaStackProjectedTreePathBudget {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [string[]]$ExcludeDirectoryNames = @(),
+        [string[]]$ExcludeFileNames = @()
+    )
+
+    $sourceFull = [System.IO.Path]::GetFullPath($Source).TrimEnd('\')
+    $destinationFull = [System.IO.Path]::GetFullPath($Destination).TrimEnd('\')
+    Assert-CpaStackPathBudget -Paths @($destinationFull) -PathType Container
+    foreach ($item in @(Get-CpaStackTreeItemsNoReparse -Root $sourceFull)) {
+        $itemFull = [System.IO.Path]::GetFullPath($item.FullName).TrimEnd('\')
+        if ($itemFull -ieq $sourceFull) { continue }
+        $relative = $itemFull.Substring($sourceFull.Length + 1)
+        $topLevelName = ($relative -split '\\', 2)[0]
+        if ($ExcludeDirectoryNames -contains $topLevelName) { continue }
+        if (-not $item.PSIsContainer -and $ExcludeFileNames -contains $item.Name) { continue }
+        $projected = Join-Path $destinationFull $relative
+        $projectedType = if ($item.PSIsContainer) { 'Container' } else { 'Leaf' }
+        Assert-CpaStackPathBudget -Paths @($projected) -PathType $projectedType
     }
 }
 
@@ -1630,6 +2293,7 @@ function Commit-CpaStackDirectorySlot {
     Assert-CpaStackChildPath -Root $ControlRoot -Path $PendingPath
     Assert-CpaStackChildPath -Root $ControlRoot -Path $DestinationPath
     Assert-CpaStackPath -Path $PendingPath
+    Assert-CpaStackPathBudget -Paths @($PendingPath, $DestinationPath, ($DestinationPath + '.previous-' + ('0' * 32))) -PathType Container
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $DestinationPath) | Out-Null
 
     $previousPath = $DestinationPath + ".previous-" + [guid]::NewGuid().ToString("N")
@@ -1713,7 +2377,82 @@ function Invoke-CpaStackSqliteBackup {
     [System.IO.File]::WriteAllText($ResultPath, $text, [System.Text.UTF8Encoding]::new($false))
     $result = $text | ConvertFrom-Json
     if ($exitCode -ne 0 -or -not $result.success) {
-        throw "SQLite online backup failed. See $ResultPath"
+        $detail = if ($null -ne $result.error -and -not [string]::IsNullOrWhiteSpace([string]$result.error.message)) {
+            " $([string]$result.error.type): $([string]$result.error.message)"
+        } else {
+            ''
+        }
+        throw "SQLite online backup failed.$detail See $ResultPath"
     }
     return $result
+}
+
+function Assert-CpaStackManagerRecoveryState {
+    param(
+        [Parameter(Mandatory = $true)][string]$Runtime,
+        [Parameter(Mandatory = $true)][string]$Data,
+        [Parameter(Mandatory = $true)][string]$ExpectedExecutableSha256,
+        [Parameter(Mandatory = $true)][string]$ExpectedDataKeySha256,
+        [Parameter(Mandatory = $true)]$ExpectedSnapshot,
+        [Parameter(Mandatory = $true)][string]$VerificationRoot
+    )
+
+    $executable = Join-Path $Runtime 'cpa-manager-plus.exe'
+    $database = Join-Path $Data 'usage.sqlite'
+    $dataKey = Join-Path $Data 'data.key'
+    if ((Get-CpaStackFileHash -Path $executable) -cne $ExpectedExecutableSha256.ToUpperInvariant()) {
+        throw 'Legacy Manager recovery executable changed after the source was stopped.'
+    }
+    if ((Get-CpaStackFileHash -Path $dataKey) -cne $ExpectedDataKeySha256.ToUpperInvariant()) {
+        throw 'Legacy Manager recovery data.key changed after the source was stopped.'
+    }
+
+    if (Test-Path -LiteralPath $VerificationRoot) {
+        throw "Manager recovery verification directory already exists: $VerificationRoot"
+    }
+    New-Item -ItemType Directory -Path $VerificationRoot | Out-Null
+    $actual = Invoke-CpaStackSqliteBackup `
+        -Source $database `
+        -Destination (Join-Path $VerificationRoot 'usage.sqlite') `
+        -ResultPath (Join-Path $VerificationRoot 'sqlite-verification.json')
+    if (-not [bool]$actual.snapshot.quick_check.ok) {
+        throw 'Legacy Manager recovery database quick_check failed.'
+    }
+    if ([bool]$ExpectedSnapshot.snapshot.usage_events.exists -and -not [bool]$actual.snapshot.usage_events.exists) {
+        throw 'Legacy Manager recovery lost the required usage_events table.'
+    }
+    if ([Int64]$actual.snapshot.usage_events.count -lt [Int64]$ExpectedSnapshot.snapshot.usage_events.count) {
+        throw 'Legacy Manager recovery usage_events count regressed below the rollback baseline.'
+    }
+    foreach ($field in @('max_id', 'max_timestamp_ms')) {
+        $expectedValue = $ExpectedSnapshot.snapshot.usage_events.$field
+        $actualValue = $actual.snapshot.usage_events.$field
+        if ($null -ne $expectedValue -and ($null -eq $actualValue -or [Int64]$actualValue -lt [Int64]$expectedValue)) {
+            throw "Legacy Manager recovery usage watermark regressed below the rollback baseline: $field"
+        }
+    }
+
+    foreach ($table in @('settings', 'model_prices')) {
+        $expectedCount = $ExpectedSnapshot.snapshot.critical_table_counts.$table
+        if ($null -eq $expectedCount) { continue }
+        $actualCount = $actual.snapshot.critical_table_counts.$table
+        if ($null -eq $actualCount -or [Int64]$actualCount -lt [Int64]$expectedCount) {
+            throw "Legacy Manager recovery required business table regressed below the rollback baseline: $table"
+        }
+    }
+    return $actual
+}
+
+function Assert-CpaStackManagerRecoverySource {
+    param(
+        [Parameter(Mandatory = $true)][string]$Runtime,
+        [Parameter(Mandatory = $true)][string]$Data,
+        [Parameter(Mandatory = $true)][string]$ExpectedExecutableSha256,
+        [Parameter(Mandatory = $true)][string]$ExpectedDataKeySha256,
+        [Parameter(Mandatory = $true)]$ExpectedSnapshot,
+        [Parameter(Mandatory = $true)][string]$VerificationRoot
+    )
+
+    Assert-CpaStackLegacyManagerSource -Runtime $Runtime -Data $Data
+    return Assert-CpaStackManagerRecoveryState @PSBoundParameters
 }

@@ -43,6 +43,18 @@ $formalBaseline = $null
 $formalBaselineRestoreRequired = $false
 $formalProcessId = 0
 $formalExpectedHash = $null
+$candidateProcess = $null
+
+function Stop-ManagerCandidateProcess {
+    if ($null -eq $script:candidateProcess) {
+        Stop-CpaStackPort -Port $TempPort -ExpectedPath $candidateExe -RequireExecutableWriteAccess
+        return
+    }
+
+    Stop-CpaStackPort -Port $TempPort -ExpectedPath $candidateExe -ExpectedProcess $script:candidateProcess -RequireExecutableWriteAccess
+    if ($script:candidateProcess -is [System.IDisposable]) { $script:candidateProcess.Dispose() }
+    $script:candidateProcess = $null
+}
 
 function Start-ManagerCandidate {
     param([string]$Data)
@@ -118,7 +130,7 @@ try {
         Assert-FormalManagerListener
         $result.emptyDataSmoke = $true
     } finally {
-        Stop-CpaStackPort -Port $TempPort -ExpectedPath $candidateExe
+        Stop-ManagerCandidateProcess
         if ($formalBaselineRestoreRequired) {
             Assert-FormalManagerListener
             [void](Set-CpaStackManagerCollector -ManagerPort $FormalPort -CpaPort $CpaPort -ManagerAdminKey $secrets.managerAdminKey -CpaManagementKey $secrets.cpaManagementKey -Enabled ([bool]$formalBaseline.collectorEnabled) -Baseline $formalBaseline)
@@ -156,7 +168,7 @@ try {
         $snapshotState = Test-ManagerCandidateHttp -ExpectHistorical $expectHistorical -ExpectedProcessId $candidateProcess.Id
         if ($RequireV111Schema) {
             $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
-            & $powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "Test-ManagerData.ps1") -DatabasePath (Join-Path $snapshotData "usage.sqlite") -BaselineJsonPath $baselinePath | Out-Null
+            & $powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "Test-ManagerData.ps1") -DatabasePath (Join-Path $snapshotData "usage.sqlite") -BaselineJsonPath $baselinePath | Out-Null
             if ($LASTEXITCODE -ne 0) {
                 throw "Manager candidate v1.11 schema/history assertions failed."
             }
@@ -165,16 +177,18 @@ try {
             New-Item -ItemType Directory -Force -Path $verifyDir | Out-Null
             $after = Invoke-CpaStackSqliteBackup -Source (Join-Path $snapshotData "usage.sqlite") -Destination (Join-Path $verifyDir "usage.sqlite") -ResultPath (Join-Path $verifyDir "result.json")
             foreach ($field in @("count", "max_id", "max_timestamp_ms")) {
-                if ([string]$baseline.snapshot.usage_events.$field -cne [string]$after.snapshot.usage_events.$field) {
-                    throw "Manager candidate changed the historical watermark: $field"
+                $beforeValue = $baseline.snapshot.usage_events.$field
+                $afterValue = $after.snapshot.usage_events.$field
+                if ($null -ne $beforeValue -and ($null -eq $afterValue -or [Int64]$afterValue -lt [Int64]$beforeValue)) {
+                    throw "Manager candidate regressed the historical watermark: $field"
                 }
             }
-            foreach ($property in $baseline.snapshot.critical_table_counts.PSObject.Properties) {
-                if ($null -eq $property.Value) { continue }
-                $actualProperty = $after.snapshot.critical_table_counts.PSObject.Properties[$property.Name]
-                $actualValue = if ($null -eq $actualProperty) { $null } else { $actualProperty.Value }
-                if ([string]$property.Value -cne [string]$actualValue) {
-                    throw "Manager candidate changed a critical table count: $($property.Name)"
+            foreach ($table in @('settings', 'model_prices')) {
+                $beforeValue = $baseline.snapshot.critical_table_counts.$table
+                if ($null -eq $beforeValue) { continue }
+                $afterValue = $after.snapshot.critical_table_counts.$table
+                if ($null -eq $afterValue -or [Int64]$afterValue -lt [Int64]$beforeValue) {
+                    throw "Manager candidate regressed a required business table: $table"
                 }
             }
         }
@@ -183,7 +197,7 @@ try {
         $result.collectorEnabled = [bool]$snapshotState.config.config.collector.enabled
         $result.dataKeyPreserved = ((Get-CpaStackFileHash -Path (Join-Path $snapshotData "data.key")) -eq $sourceDataKeyHash)
     } finally {
-        Stop-CpaStackPort -Port $TempPort -ExpectedPath $candidateExe
+        Stop-ManagerCandidateProcess
     }
 
     $result.success = ($result.emptyDataSmoke -and $result.snapshotCompatibility -and $result.dataKeyPreserved -and ($result.collectorEnabled -eq $false))
@@ -191,10 +205,14 @@ try {
     $result.error = $_.Exception.Message
 } finally {
     try {
-        Stop-CpaStackPort -Port $TempPort -ExpectedPath $candidateExe
+        Stop-ManagerCandidateProcess
     } catch {
         $result.success = $false
         $result.error = (($result.error, "Candidate cleanup failed: $($_.Exception.Message)") | Where-Object { $_ }) -join ' '
+    } finally {
+        if ($null -ne $candidateProcess -and $candidateProcess -is [System.IDisposable]) {
+            $candidateProcess.Dispose()
+        }
     }
     if ($formalBaselineRestoreRequired -and $null -ne $formalBaseline) {
         try {

@@ -23,10 +23,12 @@ $targetExe = Join-Path $TargetRuntime "cpa-manager-plus.exe"
 $candidateExe = Join-Path $CandidatePackageRoot "cpa-manager-plus.exe"
 $sourceDb = Join-Path $SourceData "usage.sqlite"
 $targetDb = Join-Path $TargetData "usage.sqlite"
+$sourceDataKey = Join-Path $SourceData "data.key"
+$targetDataKey = Join-Path $TargetData "data.key"
 $sameRuntime = [System.IO.Path]::GetFullPath($SourceRuntime).TrimEnd('\') -ieq [System.IO.Path]::GetFullPath($TargetRuntime).TrimEnd('\')
 $sameData = [System.IO.Path]::GetFullPath($SourceData).TrimEnd('\') -ieq [System.IO.Path]::GetFullPath($TargetData).TrimEnd('\')
 $rollbackRoot = Join-Path $ControlRoot "rollback\last-known-good\manager-plus"
-$workVerification = Join-Path $ControlRoot ("work\manager-formal-verification-" + [guid]::NewGuid().ToString("N"))
+$workVerification = Join-Path $ControlRoot ("work\mv-" + [guid]::NewGuid().ToString("N"))
 $journalPath = Join-Path $ControlRoot "state\switch-manager.pending.json"
 $journal = $null
 $snapshotStaging = $null
@@ -44,6 +46,7 @@ $result = [ordered]@{
     hasHistoricalData = $false
     collectorEnabled = $null
     dataKeyPreserved = $false
+    sourceSnapshot   = $null
     backupPath      = if ($sameRuntime -and $sameData) { $rollbackRoot } else { [ordered]@{ runtime = $SourceRuntime; data = $SourceData } }
     backupCleanupWarning = $null
     journalCleanupWarning = $null
@@ -66,6 +69,9 @@ $baseline = $null
 $backupComplete = $false
 $formalBaseline = $null
 $expectHistorical = $false
+$targetProcess = $null
+$sourceProcess = $null
+$fixedSourceProcess = $null
 
 function Start-ManagerFormal {
     param([string]$Exe, [string]$Runtime, [string]$Data)
@@ -150,8 +156,10 @@ function Assert-HistoryPreserved {
     param($Before, $After)
 
     foreach ($field in @("count", "max_id", "max_timestamp_ms")) {
-        if ([string]$Before.snapshot.usage_events.$field -cne [string]$After.snapshot.usage_events.$field) {
-            throw "Manager history watermark changed while collector was disabled: $field"
+        $beforeValue = $Before.snapshot.usage_events.$field
+        $afterValue = $After.snapshot.usage_events.$field
+        if ($null -ne $beforeValue -and ($null -eq $afterValue -or [Int64]$afterValue -lt [Int64]$beforeValue)) {
+            throw "Manager history watermark regressed while collector was disabled: $field"
         }
     }
     foreach ($table in @("settings", "model_prices")) {
@@ -172,6 +180,9 @@ try {
     Assert-CpaStackPath -Path $sourceExe -PathType Leaf
     Assert-CpaStackPath -Path $sourceDb -PathType Leaf
     Assert-CpaStackPath -Path $candidateExe -PathType Leaf
+    if ($sameRuntime -xor $sameData) {
+        throw 'Manager runtime and data must either both remain in place or both move to canonical paths.'
+    }
     if ($DeferFinalCommit -and (-not $sameRuntime -or -not $sameData)) {
         throw 'Deferred Manager commit is only valid for an in-place canonical upgrade.'
     }
@@ -181,11 +192,15 @@ try {
     Assert-CpaStackChildPath -Root $ControlRoot -Path $TargetRuntime
     Assert-CpaStackChildPath -Root $ControlRoot -Path $TargetData
     Assert-CpaStackChildPath -Root $ControlRoot -Path $workVerification
+    if (-not $sameRuntime -and -not $sameData) {
+        Assert-CpaStackLegacyManagerSource -Runtime $SourceRuntime -Data $SourceData
+    }
 
     $listener = Get-CpaStackListener -Port $ManagerPort
     if (-not $listener -or $listener.ExecutablePath -ine $sourceExe) {
         throw "Manager source process is not the owner of port $ManagerPort. Expected $sourceExe"
     }
+    $fixedSourceProcess = Get-CpaStackFixedListenerProcess -Listener $listener -ExpectedPath $sourceExe
     $result.oldHash = Get-CpaStackFileHash -Path $sourceExe
     [void](Wait-CpaStackTrustedListener -Port $ManagerPort -ExpectedPath $sourceExe -ExpectedProcessId $listener.ProcessId -ExpectedHash $result.oldHash -AllowedAddresses $managerAllowedAddresses -Seconds 2)
     $sourceDataKeyHash = Get-CpaStackFileHash -Path (Join-Path $SourceData "data.key")
@@ -193,6 +208,20 @@ try {
 
     $formalBaseline = Get-CpaStackManagerSetupBaseline -ManagerPort $ManagerPort -ManagerAdminKey $secrets.managerAdminKey
     $operationId = [guid]::NewGuid().ToString("N")
+    if ($sameRuntime -and $sameData) {
+        $snapshotStaging = Join-Path $ControlRoot ("rollback\staging-manager-" + $operationId)
+        $pending = Join-Path $ControlRoot ("rollback\pending-manager-" + $operationId)
+        Assert-CpaStackPathBudget -Paths @($snapshotStaging, (Join-Path $snapshotStaging 'runtime'), (Join-Path $snapshotStaging 'data'), $pending, $rollbackRoot, ($rollbackRoot + '.previous-' + ('0' * 32)), $workVerification, (Join-Path $workVerification 'post-start'), (Join-Path $workVerification 'r-3'), (Join-Path $workVerification 'rp-3')) -PathType Container
+        Assert-CpaStackProjectedTreePathBudget -Source $SourceRuntime -Destination (Join-Path $snapshotStaging 'runtime') -ExcludeDirectoryNames @('data') -ExcludeFileNames @('server.log')
+        Assert-CpaStackPathBudget -Paths @((Join-Path $snapshotStaging 'data\usage.sqlite'), (Join-Path $snapshotStaging 'data\data.key'), (Join-Path $snapshotStaging 'data\usage.sqlite-wal'), (Join-Path $snapshotStaging 'data\usage.sqlite-shm')) -PathType Leaf
+        Assert-CpaStackProjectedTreePathBudget -Source $CandidatePackageRoot -Destination $TargetRuntime -ExcludeDirectoryNames @('data') -ExcludeFileNames @('config.json', 'server.log')
+        Assert-CpaStackJsonWritePathBudget -Paths @($journalPath, $ResultPath, (Join-Path $snapshotStaging 'manifest.json'), (Join-Path $snapshotStaging 'sqlite-backup.json'))
+    } else {
+        Assert-CpaStackPathBudget -Paths @($workVerification, (Join-Path $workVerification 'post-start'), (Join-Path $workVerification 'r-3'), (Join-Path $workVerification 'rp-3'), $TargetRuntime, $TargetData) -PathType Container
+        Assert-CpaStackProjectedTreePathBudget -Source $TargetRuntime -Destination $TargetRuntime
+        Assert-CpaStackPathBudget -Paths @($targetDb, $targetDataKey, ($targetDb + '-wal'), ($targetDb + '-shm'), (Join-Path $workVerification 'usage.sqlite'), (Join-Path $workVerification 'post-start\usage.sqlite')) -PathType Leaf
+        Assert-CpaStackJsonWritePathBudget -Paths @($journalPath, $ResultPath, (Join-Path $workVerification 'sqlite-baseline.json'), (Join-Path $workVerification 'post-start\sqlite-after.json'))
+    }
     Assert-CpaStackChildPath -Root $ControlRoot -Path $journalPath
     $journal = [ordered]@{
         operation = "switch-manager"
@@ -214,6 +243,8 @@ try {
             pollIntervalMs = [int]$formalBaseline.pollIntervalMs
             usageStatisticsEnabled = [bool]$formalBaseline.usageStatisticsEnabled
         }
+        sourceSnapshot = $null
+        targetProcessId = $null
     }
     Write-CpaStackJson -Value $journal -Path $journalPath
     $collectorDisabled = $true
@@ -221,14 +252,12 @@ try {
     $journal.phase = "collector-disabled"
     Write-CpaStackJson -Value $journal -Path $journalPath
 
-    Stop-CpaStackPort -Port $ManagerPort -ExpectedPath $sourceExe
+    Stop-CpaStackPort -Port $ManagerPort -ExpectedPath $sourceExe -ExpectedProcess $fixedSourceProcess -RequireExecutableWriteAccess:$sameRuntime
     $journal.phase = "source-stopped"
     Write-CpaStackJson -Value $journal -Path $journalPath
 
     try {
         if ($sameRuntime -and $sameData) {
-            $snapshotStaging = Join-Path $ControlRoot ("rollback\staging-manager-" + $operationId)
-            $pending = Join-Path $ControlRoot ("rollback\pending-manager-" + $operationId)
             Assert-CpaStackChildPath -Root $ControlRoot -Path $rollbackRoot
             Assert-CpaStackChildPath -Root $ControlRoot -Path $snapshotStaging
             Assert-CpaStackChildPath -Root $ControlRoot -Path $pending
@@ -240,6 +269,8 @@ try {
             }
             $stagingBaselinePath = Join-Path $snapshotStaging "sqlite-backup.json"
             $baseline = Copy-ManagerDataSnapshot -FromData $SourceData -ToData (Join-Path $snapshotStaging "data") -MetadataPath $stagingBaselinePath
+            $result.sourceSnapshot = $baseline.snapshot
+            $journal.sourceSnapshot = $baseline.snapshot
             $expectHistorical = ([Int64]$baseline.snapshot.usage_events.count -gt 0)
             if ((Get-CpaStackFileHash -Path (Join-Path $snapshotStaging "data\data.key")) -ne $sourceDataKeyHash) {
                 throw "Manager rollback data.key snapshot hash validation failed."
@@ -248,7 +279,6 @@ try {
                 operationId = $operationId
                 capturedAt = (Get-Date).ToString("o")
                 executableSha256 = $result.oldHash
-                databaseSha256 = $baseline.snapshot.sha256
                 dataKeySha256 = $sourceDataKeyHash
                 sourceRuntime = $SourceRuntime
                 sourceData = $SourceData
@@ -264,14 +294,23 @@ try {
             $baselinePath = Join-Path $workVerification "sqlite-baseline.json"
             New-Item -ItemType Directory -Force -Path $workVerification | Out-Null
             $baseline = Copy-ManagerDataSnapshot -FromData $SourceData -ToData $TargetData -MetadataPath $baselinePath
+            $result.sourceSnapshot = $baseline.snapshot
+            $journal.sourceSnapshot = $baseline.snapshot
+            Write-CpaStackJson -Value $journal -Path $journalPath
             $expectHistorical = ([Int64]$baseline.snapshot.usage_events.count -gt 0)
         }
 
+        Protect-CpaStackPrivateDirectory -Path $TargetRuntime
         if ((Get-CpaStackFileHash -Path $targetExe) -ne $result.newHash) {
             throw "Manager target executable hash does not match the candidate."
         }
+        Protect-CpaStackSecretFile -Path $targetExe
+        Protect-CpaStackPrivateTree -Root $TargetData
 
         $targetProcess = Start-ManagerFormal -Exe $targetExe -Runtime $TargetRuntime -Data $TargetData
+        $journal.targetProcessId = [int]$targetProcess.Id
+        $journal.phase = 'target-started'
+        Write-CpaStackJson -Value $journal -Path $journalPath
         $formal = Test-ManagerFormal -ExpectedExe $targetExe -ExpectedData $TargetData -ExpectedCollector $false -ExpectHistorical $expectHistorical -ExpectedProcessId $targetProcess.Id -ExpectedHash $result.newHash
 
         $verifyDir = Join-Path $workVerification "post-start"
@@ -281,7 +320,7 @@ try {
 
         if ($RequireV111Schema) {
             $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
-            & $powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "Test-ManagerData.ps1") -DatabasePath $targetDb -BaselineJsonPath $baselinePath | Out-Null
+            & $powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "Test-ManagerData.ps1") -DatabasePath $targetDb -BaselineJsonPath $baselinePath | Out-Null
             if ($LASTEXITCODE -ne 0) {
                 throw "Manager v1.11 data compatibility assertions failed."
             }
@@ -294,6 +333,7 @@ try {
         $formal = Test-ManagerFormal -ExpectedExe $targetExe -ExpectedData $TargetData -ExpectedCollector ([bool]$formalBaseline.collectorEnabled) -ExpectHistorical $expectHistorical -ExpectedProcessId $targetProcess.Id -ExpectedHash $result.newHash
         $result.dataKeyPreserved = ((Get-CpaStackFileHash -Path (Join-Path $TargetData "data.key")) -eq $sourceDataKeyHash)
         if (-not $result.dataKeyPreserved) { throw "Manager formal data.key hash changed during the switch." }
+        Assert-CpaStackPrivateTree -Root $TargetData -Description 'Manager data tree' -AllowInheritedDescendants
         $result.hasHistoricalData = [bool]$formal.info.hasHistoricalData
         $result.collectorEnabled = [bool]$formal.config.config.collector.enabled
         $result.activeHash = Get-CpaStackFileHash -Path $targetExe
@@ -318,12 +358,25 @@ try {
         $recoveryError = $null
         for ($attempt = 1; $attempt -le 3 -and -not $recovered; $attempt++) {
             try {
+                if ($null -ne $targetProcess) {
+                    Stop-CpaStackStartedProcess -Process $targetProcess -ExpectedPath $targetExe
+                    $targetProcess = $null
+                }
+                if ($null -ne $sourceProcess) {
+                    Stop-CpaStackStartedProcess -Process $sourceProcess -ExpectedPath $sourceExe
+                    $sourceProcess = $null
+                }
                 $recoveryListener = Get-CpaStackListener -Port $ManagerPort
                 if ($recoveryListener) {
                     if (@($sourceExe, $targetExe) -inotcontains $recoveryListener.ExecutablePath) {
                         throw "Unexpected process owns Manager port $ManagerPort during recovery: $($recoveryListener.ExecutablePath)"
                     }
-                    Stop-CpaStackPort -Port $ManagerPort -ExpectedPath $recoveryListener.ExecutablePath
+                    $recoveryProcess = Get-CpaStackFixedListenerProcess -Listener $recoveryListener -ExpectedPath $recoveryListener.ExecutablePath
+                    try {
+                        Stop-CpaStackPort -Port $ManagerPort -ExpectedPath $recoveryListener.ExecutablePath -ExpectedProcess $recoveryProcess -RequireExecutableWriteAccess:$sameRuntime
+                    } finally {
+                        if ($recoveryProcess -is [System.IDisposable]) { $recoveryProcess.Dispose() }
+                    }
                 }
                 if ($sameRuntime -and $sameData -and $pending -and $backupComplete) {
                     foreach ($item in Get-ChildItem -Force -LiteralPath $SourceRuntime) {
@@ -339,20 +392,66 @@ try {
                     Copy-Item -LiteralPath (Join-Path $pending "data") -Destination $SourceData -Recurse -Force
                     $rollbackManifest = Read-CpaStackJson -Path (Join-Path $pending 'manifest.json')
                     if ((Get-CpaStackFileHash -Path (Join-Path $SourceRuntime 'cpa-manager-plus.exe')) -ne [string]$rollbackManifest.executableSha256 -or
-                        (Get-CpaStackFileHash -Path (Join-Path $SourceData 'usage.sqlite')) -ne [string]$rollbackManifest.databaseSha256 -or
                         (Get-CpaStackFileHash -Path (Join-Path $SourceData 'data.key')) -ne [string]$rollbackManifest.dataKeySha256) {
-                        throw 'Manager recovery copy did not reproduce the rollback snapshot hashes.'
+                        throw 'Manager recovery copy did not reproduce the rollback executable and data.key hashes.'
                     }
+                }
+                $legacyVerification = Join-Path $workVerification ("r-$attempt")
+                Assert-CpaStackChildPath -Root $ControlRoot -Path $legacyVerification
+                $recoveryStateParameters = @{
+                    Runtime = $SourceRuntime
+                    Data = $SourceData
+                    ExpectedExecutableSha256 = $result.oldHash
+                    ExpectedDataKeySha256 = $sourceDataKeyHash
+                    ExpectedSnapshot = $baseline
+                    VerificationRoot = $legacyVerification
+                }
+                if ($sameRuntime -and $sameData) {
+                    [void](Assert-CpaStackManagerRecoveryState @recoveryStateParameters)
+                } else {
+                    [void](Assert-CpaStackManagerRecoverySource @recoveryStateParameters)
+                }
+                Protect-CpaStackPrivateDirectory -Path $SourceRuntime
+                Protect-CpaStackSecretFile -Path $sourceExe
+                Protect-CpaStackPrivateTree -Root $SourceData
+                if ((Get-CpaStackFileHash -Path $sourceExe) -ne $result.oldHash -or
+                    (Get-CpaStackFileHash -Path $sourceDataKey) -ne $sourceDataKeyHash) {
+                    throw 'Manager recovery source changed while its ACLs were being hardened.'
+                }
+                $protectedVerification = Join-Path $workVerification ("rp-$attempt")
+                Assert-CpaStackChildPath -Root $ControlRoot -Path $protectedVerification
+                $recoveryStateParameters.VerificationRoot = $protectedVerification
+                if ($sameRuntime -and $sameData) {
+                    [void](Assert-CpaStackManagerRecoveryState @recoveryStateParameters)
+                } else {
+                    [void](Assert-CpaStackManagerRecoverySource @recoveryStateParameters)
                 }
                 $sourceProcess = Start-ManagerFormal -Exe $sourceExe -Runtime $SourceRuntime -Data $SourceData
                 [void](Wait-CpaStackTrustedListener -Port $ManagerPort -ExpectedPath $sourceExe -ExpectedProcessId $sourceProcess.Id -ExpectedHash $result.oldHash -AllowedAddresses $managerAllowedAddresses -Seconds 35)
                 [void](Set-CpaStackManagerCollector -ManagerPort $ManagerPort -CpaPort $CpaPort -ManagerAdminKey $secrets.managerAdminKey -CpaManagementKey $secrets.cpaManagementKey -Enabled ([bool]$formalBaseline.collectorEnabled) -Baseline $formalBaseline)
                 [void](Assert-CpaStackManagerSetupBaseline -ManagerPort $ManagerPort -ManagerAdminKey $secrets.managerAdminKey -Expected $formalBaseline)
                 [void](Test-ManagerFormal -ExpectedExe $sourceExe -ExpectedData $SourceData -ExpectedCollector ([bool]$formalBaseline.collectorEnabled) -ExpectHistorical $expectHistorical -ExpectedProcessId $sourceProcess.Id -ExpectedHash $result.oldHash)
+                Assert-CpaStackPrivateTree -Root $SourceData -Description 'Recovered Manager data tree' -AllowInheritedDescendants
                 $collectorDisabled = $false
                 $recovered = $true
             } catch {
                 $recoveryError = $_.Exception.Message
+                if ($null -ne $sourceProcess) {
+                    try {
+                        Stop-CpaStackStartedProcess -Process $sourceProcess -ExpectedPath $sourceExe
+                        $sourceProcess = $null
+                    } catch {
+                        throw "Manager recovery refused another attempt because source process cleanup failed: $($_.Exception.Message)"
+                    }
+                }
+                if ($null -ne $targetProcess) {
+                    try {
+                        Stop-CpaStackStartedProcess -Process $targetProcess -ExpectedPath $targetExe
+                        $targetProcess = $null
+                    } catch {
+                        throw "Manager recovery refused another attempt because target process cleanup failed: $($_.Exception.Message)"
+                    }
+                }
                 Start-Sleep -Seconds 1
             }
         }
@@ -376,11 +475,10 @@ try {
     if ($collectorDisabled) {
         try {
             $restoreListener = Get-CpaStackListener -Port $ManagerPort
-            if (-not $restoreListener -or @($sourceExe, $targetExe) -inotcontains $restoreListener.ExecutablePath) {
-                throw "Manager collector restore refused an unexpected port owner."
+            if (-not $restoreListener -or $restoreListener.ExecutablePath -ine $sourceExe) {
+                throw "Manager collector restore requires the fully verified source Manager."
             }
-            $restoreHash = if ($restoreListener.ExecutablePath -ieq $sourceExe) { $result.oldHash } else { $result.newHash }
-            [void](Wait-CpaStackTrustedListener -Port $ManagerPort -ExpectedPath $restoreListener.ExecutablePath -ExpectedProcessId $restoreListener.ProcessId -ExpectedHash $restoreHash -AllowedAddresses $managerAllowedAddresses -Seconds 2)
+            [void](Wait-CpaStackTrustedListener -Port $ManagerPort -ExpectedPath $sourceExe -ExpectedProcessId $restoreListener.ProcessId -ExpectedHash $result.oldHash -AllowedAddresses $managerAllowedAddresses -Seconds 2)
             [void](Set-CpaStackManagerCollector -ManagerPort $ManagerPort -CpaPort $CpaPort -ManagerAdminKey $secrets.managerAdminKey -CpaManagementKey $secrets.cpaManagementKey -Enabled ([bool]$formalBaseline.collectorEnabled) -Baseline $formalBaseline)
             [void](Assert-CpaStackManagerSetupBaseline -ManagerPort $ManagerPort -ManagerAdminKey $secrets.managerAdminKey -Expected $formalBaseline)
             $collectorDisabled = $false
@@ -389,6 +487,9 @@ try {
         }
     }
 } finally {
+    if ($null -ne $fixedSourceProcess -and $fixedSourceProcess -is [System.IDisposable]) {
+        $fixedSourceProcess.Dispose()
+    }
     Write-CpaStackJson -Value $result -Path $ResultPath
     if (Test-Path -LiteralPath $workVerification) {
         Remove-Item -LiteralPath $workVerification -Recurse -Force -ErrorAction SilentlyContinue

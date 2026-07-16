@@ -9,7 +9,6 @@ watermarks that can be used for post-migration compatibility checks.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import sqlite3
 import sys
@@ -197,16 +196,12 @@ def remove_generated_snapshot_sidecars(path: Path) -> None:
         raise ValidationError(f"snapshot SQLite sidecar cleanup failed: {names}")
 
 
-def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def same_scalar(left: Any, right: Any) -> bool:
-    return left == right
+def not_decreased(before: Any, after: Any) -> bool:
+    if before is None:
+        return True
+    if after is None:
+        return False
+    return int(after) >= int(before)
 
 
 def compare_usage_events(
@@ -214,10 +209,14 @@ def compare_usage_events(
 ) -> dict[str, Any]:
     fields = ("count", "max_id", "max_timestamp_ms")
     field_results = {
-        field: same_scalar(source.get(field), snapshot.get(field)) for field in fields
+        field: not_decreased(source.get(field), snapshot.get(field)) for field in fields
     }
+    existence_preserved = not source.get("exists", False) or snapshot.get(
+        "exists", False
+    )
     return {
-        "ok": all(field_results.values()),
+        "ok": existence_preserved and all(field_results.values()),
+        "existence_preserved": existence_preserved,
         "fields": field_results,
     }
 
@@ -226,8 +225,8 @@ def compare_critical_table_counts(
     source: dict[str, int | None], snapshot: dict[str, int | None]
 ) -> dict[str, Any]:
     fields = {
-        name: source.get(name) == snapshot.get(name)
-        for name in sorted(set(source) | set(snapshot))
+        name: not_decreased(source.get(name), snapshot.get(name))
+        for name in ("settings", "model_prices")
     }
     return {"ok": all(fields.values()), "fields": fields}
 
@@ -353,7 +352,6 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         },
         "snapshot": {
             **file_metadata(destination_path),
-            "sha256": sha256(destination_path),
             **snapshot_summary,
         },
         "invariants": {

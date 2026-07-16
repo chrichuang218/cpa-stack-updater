@@ -1,5 +1,15 @@
 # 更新记录
 
+## 0.1.2 - 2026-07-16
+
+- 修复长驻 CPA/Manager 继承嵌套 PowerShell 输出管道的问题；托管进程以无控制台窗口方式启动，且只继承指向 Windows `NUL` 的 stdin/stdout/stderr，升级结果不再等待正式服务退出才返回。
+- 停服前固定已验证 listener 的 `Process` 对象；即使 listener 提前消失，仍会终止并等待同一进程、端口和 executable 文件锁全部释放。updater 已启动但尚未监听的游离候选也按固定进程清理，端口被新 owner 抢占时拒绝继续且不误杀。
+- Manager 候选验证和非原地回滚改为业务语义校验：online backup 必须可生成、可重新打开并通过 `quick_check`，`usage_events` 三项水位与升级前存在的关键业务表不得回退；不再要求 SQLite 文件 SHA256、大小、页布局、WAL/SHM、checkpoint 或 rollup 绝对一致。exe 与 `data.key` hash 仍严格校验。
+- 增加 Windows PowerShell 5.1 兼容路径预算：目录最长 247 字符、文件最长 259 字符，并在停止正式服务或禁用 collector 前校验所有投影路径和事务后缀。
+- 正式切换与自动回滚会重新加固 runtime 父目录和整个 Manager data tree（含 WAL/SHM）；非原地回滚在执行旧 Manager 前复核父链 ACL、exe、`data.key` 与 SQLite 水位。无 pending 时，升级还可在 hash、监听路径与 PID 全部匹配后修复已记录 executable 的 ACL 漂移。
+- 增加 PS5.1/PS7 进程生命周期回归，覆盖嵌套输出捕获、长驻进程存活、listener 消失但 PID 未退出，以及 standalone canonical launcher 的同等隔离。
+- 获准刷新的 canonical 桌面快捷方式默认用 `powershell.exe -NonInteractive -WindowStyle Hidden` 启动，并对 target、参数、工作目录和 WSH window style 做统一写入与恢复校验。直接 CLI 保留调用方终端，内部 PowerShell 复用同一控制台，不另弹窗口。
+
 ## 0.1.1 - 2026-07-16
 
 - 修复编辑器或终端占用已安装 Skill 时的更新事务：有限重试后给出明确提示，不结束用户进程。

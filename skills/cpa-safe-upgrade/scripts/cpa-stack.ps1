@@ -76,7 +76,7 @@ function Invoke-BundledScript {
     $previousModulePath = $env:PSModulePath
     try {
         $env:PSModulePath = Get-CpaStackWindowsPowerShellModulePath
-        $output = @(& $powershell -NoProfile -ExecutionPolicy Bypass -File $script @Arguments 2>&1)
+        $output = @(& $powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $script @Arguments 2>&1)
         $exitCode = $LASTEXITCODE
     } finally {
         $env:PSModulePath = $previousModulePath

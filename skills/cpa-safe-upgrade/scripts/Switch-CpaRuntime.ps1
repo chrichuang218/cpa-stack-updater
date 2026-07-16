@@ -31,6 +31,9 @@ $rollbackRoot = Join-Path $ControlRoot "rollback\last-known-good\cpa"
 $journalPath = Join-Path $ControlRoot "state\switch-cpa.pending.json"
 $journal = $null
 $snapshotStaging = $null
+$fixedSourceProcess = $null
+$targetProcess = $null
+$sourceProcess = $null
 $result = [ordered]@{
     component  = "CPA"
     success    = $false
@@ -134,6 +137,7 @@ try {
     if (-not $listener -or $listener.ExecutablePath -ine $sourceExe) {
         throw "CPA source process is not the owner of port $Port. Expected $sourceExe"
     }
+    $fixedSourceProcess = Get-CpaStackFixedListenerProcess -Listener $listener -ExpectedPath $sourceExe
     $result.oldHash = Get-CpaStackFileHash -Path $sourceExe
 
     if ($sameRuntime) {
@@ -143,6 +147,10 @@ try {
         $pending = Join-Path $ControlRoot ("rollback\pending-cpa-" + $operationId)
         Assert-CpaStackChildPath -Root $ControlRoot -Path $snapshotStaging
         Assert-CpaStackChildPath -Root $ControlRoot -Path $pending
+        Assert-CpaStackPathBudget -Paths @($snapshotStaging, (Join-Path $snapshotStaging 'runtime'), $pending, $rollbackRoot, ($rollbackRoot + '.previous-' + ('0' * 32))) -PathType Container
+        Assert-CpaStackProjectedTreePathBudget -Source $SourceRuntime -Destination (Join-Path $snapshotStaging 'runtime') -ExcludeDirectoryNames @('auth', 'plugins') -ExcludeFileNames @('config.yaml', 'server.log')
+        Assert-CpaStackProjectedTreePathBudget -Source $CandidatePackageRoot -Destination $TargetRuntime -ExcludeDirectoryNames @('auth', 'plugins') -ExcludeFileNames @('config.yaml')
+        Assert-CpaStackJsonWritePathBudget -Paths @($journalPath, $ResultPath, (Join-Path $snapshotStaging 'manifest.json'))
         New-Item -ItemType Directory -Force -Path (Join-Path $snapshotStaging "runtime") | Out-Null
         Copy-CpaStackTree -Source $SourceRuntime -Destination (Join-Path $snapshotStaging "runtime") -ExcludeDirectoryNames @("auth", "plugins") -ExcludeFileNames @("config.yaml")
         $snapshotExe = Join-Path $snapshotStaging "runtime\cli-proxy-api.exe"
@@ -158,6 +166,9 @@ try {
     } else {
         $operationId = [guid]::NewGuid().ToString("N")
         $pending = $null
+        Assert-CpaStackProjectedTreePathBudget -Source $SourceRuntime -Destination $SourceRuntime -ExcludeDirectoryNames @('_updates', '_backups', 'logs') -ExcludeFileNames @('server.log')
+        Assert-CpaStackProjectedTreePathBudget -Source $TargetRuntime -Destination $TargetRuntime
+        Assert-CpaStackJsonWritePathBudget -Paths @($journalPath, $ResultPath)
     }
 
     Assert-CpaStackChildPath -Root $ControlRoot -Path $journalPath
@@ -176,6 +187,7 @@ try {
         targetRuntimeManifestSha256 = if ($sameRuntime) { $null } else { $ExpectedTargetRuntimeManifestSha256.ToUpperInvariant() }
         targetConfigSha256 = if ($sameRuntime) { $null } else { $ExpectedTargetConfigHash.ToUpperInvariant() }
         targetHost = if ($sameRuntime) { $null } else { $ExpectedTargetHost }
+        targetProcessId = $null
     }
     Write-CpaStackJson -Value $journal -Path $journalPath
     if ($sameRuntime) {
@@ -185,7 +197,7 @@ try {
         Write-CpaStackJson -Value $journal -Path $journalPath
     }
 
-    Stop-CpaStackPort -Port $Port -ExpectedPath $sourceExe
+    Stop-CpaStackPort -Port $Port -ExpectedPath $sourceExe -ExpectedProcess $fixedSourceProcess -RequireExecutableWriteAccess:$sameRuntime
     $journal.phase = "source-stopped"
     Write-CpaStackJson -Value $journal -Path $journalPath
 
@@ -211,14 +223,19 @@ try {
             }
         }
 
+        Protect-CpaStackPrivateDirectory -Path $TargetRuntime
         if ((Get-CpaStackFileHash -Path $targetExe) -ne $result.newHash) {
             throw "CPA target executable hash does not match the candidate."
         }
+        Protect-CpaStackSecretFile -Path $targetExe
         Assert-CpaStackPrivateTree -Root $targetAuth -Description 'Preserved CPA auth'
         if (Test-Path -LiteralPath $targetPlugins) {
             Assert-CpaStackPrivateTree -Root $targetPlugins -Description 'Preserved CPA plugins'
         }
         $targetProcess = Start-CpaFormal -Exe $targetExe -Runtime $TargetRuntime -Config $targetConfig
+        $journal.targetProcessId = [int]$targetProcess.Id
+        $journal.phase = 'target-started'
+        Write-CpaStackJson -Value $journal -Path $journalPath
         $result.modelCount = Test-CpaFormal -ExpectedExe $targetExe -Config $targetConfig -ExpectedProcessId $targetProcess.Id -ExpectedHash $result.newHash
         $result.activeHash = Get-CpaStackFileHash -Path $targetExe
 
@@ -242,12 +259,25 @@ try {
         $recoveryError = $null
         for ($attempt = 1; $attempt -le 3 -and -not $recovered; $attempt++) {
             try {
+                if ($null -ne $targetProcess) {
+                    Stop-CpaStackStartedProcess -Process $targetProcess -ExpectedPath $targetExe
+                    $targetProcess = $null
+                }
+                if ($null -ne $sourceProcess) {
+                    Stop-CpaStackStartedProcess -Process $sourceProcess -ExpectedPath $sourceExe
+                    $sourceProcess = $null
+                }
                 $recoveryListener = Get-CpaStackListener -Port $Port
                 if ($recoveryListener) {
                     if (@($sourceExe, $targetExe) -inotcontains $recoveryListener.ExecutablePath) {
                         throw "Unexpected process owns CPA port $Port during recovery: $($recoveryListener.ExecutablePath)"
                     }
-                    Stop-CpaStackPort -Port $Port -ExpectedPath $recoveryListener.ExecutablePath
+                    $recoveryProcess = Get-CpaStackFixedListenerProcess -Listener $recoveryListener -ExpectedPath $recoveryListener.ExecutablePath
+                    try {
+                        Stop-CpaStackPort -Port $Port -ExpectedPath $recoveryListener.ExecutablePath -ExpectedProcess $recoveryProcess -RequireExecutableWriteAccess:$sameRuntime
+                    } finally {
+                        if ($recoveryProcess -is [System.IDisposable]) { $recoveryProcess.Dispose() }
+                    }
                 }
                 if ($sameRuntime) {
                     foreach ($item in Get-ChildItem -Force -LiteralPath $SourceRuntime) {
@@ -258,14 +288,33 @@ try {
                     }
                     Copy-CpaStackTree -Source (Join-Path $pending "runtime") -Destination $SourceRuntime
                 }
-                if ($sameRuntime -and (Test-Path -LiteralPath $sourcePlugins)) {
-                    Assert-CpaStackPrivateTree -Root $sourcePlugins -Description 'Preserved CPA plugins'
-                }
+                if ((Get-CpaStackFileHash -Path $sourceExe) -ne $result.oldHash) { throw 'CPA recovery copy did not reproduce the rollback executable hash.' }
+                Protect-CpaStackPrivateDirectory -Path $SourceRuntime
+                Protect-CpaStackSecretFile -Path $sourceExe
+                Protect-CpaStackSecretFile -Path $SourceConfig
+                Protect-CpaStackPrivateTree -Root $sourceAuth
+                if (Test-Path -LiteralPath $sourcePlugins) { Protect-CpaStackPrivateTree -Root $sourcePlugins }
                 $sourceProcess = Start-CpaFormal -Exe $sourceExe -Runtime $SourceRuntime -Config $SourceConfig
                 [void](Test-CpaFormal -ExpectedExe $sourceExe -Config $SourceConfig -ExpectedProcessId $sourceProcess.Id -ExpectedHash $result.oldHash)
                 $recovered = $true
             } catch {
                 $recoveryError = $_.Exception.Message
+                if ($null -ne $sourceProcess) {
+                    try {
+                        Stop-CpaStackStartedProcess -Process $sourceProcess -ExpectedPath $sourceExe
+                        $sourceProcess = $null
+                    } catch {
+                        throw "CPA recovery refused another attempt because source process cleanup failed: $($_.Exception.Message)"
+                    }
+                }
+                if ($null -ne $targetProcess) {
+                    try {
+                        Stop-CpaStackStartedProcess -Process $targetProcess -ExpectedPath $targetExe
+                        $targetProcess = $null
+                    } catch {
+                        throw "CPA recovery refused another attempt because target process cleanup failed: $($_.Exception.Message)"
+                    }
+                }
                 Start-Sleep -Seconds 1
             }
         }
@@ -287,6 +336,11 @@ try {
 } catch {
     $result.error = $_.Exception.Message
 } finally {
+    foreach ($processHandle in @($fixedSourceProcess, $targetProcess, $sourceProcess)) {
+        if ($null -ne $processHandle -and $processHandle -is [System.IDisposable]) {
+            $processHandle.Dispose()
+        }
+    }
     Write-CpaStackJson -Value $result -Path $ResultPath
     if ($snapshotStaging -and (Test-Path -LiteralPath $snapshotStaging)) {
         Remove-Item -LiteralPath $snapshotStaging -Recurse -Force -ErrorAction SilentlyContinue

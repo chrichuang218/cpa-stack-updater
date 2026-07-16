@@ -38,10 +38,12 @@ $secretsPath = Join-Path $configDir "secrets.local.json"
 $newStartScript = Join-Path $opsDir "Start-CPA-Stack.ps1"
 $migrationRollback = Join-Path $ControlRoot "rollback\legacy-migration"
 $sourceManagerBaseline = $null
+$sourceManagerSnapshot = $null
 $sourceManagerBindAddress = "127.0.0.1"
 $operationMutex = $null
 $switchPhaseStarted = $false
 $legacyRestored = $false
+$managerRecoveryBlocked = $false
 $initializeJournal = $null
 $recoveryAttempted = $false
 $recoveryCompleted = $false
@@ -71,7 +73,7 @@ function Invoke-ChildPowerShellJson {
     param([string]$Script, [string[]]$Arguments)
 
     $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
-    $output = @(& $powershell -NoProfile -ExecutionPolicy Bypass -File $Script @Arguments 2>&1)
+    $output = @(& $powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $Script @Arguments 2>&1)
     $exitCode = $LASTEXITCODE
     $text = $output -join [Environment]::NewLine
     if ($exitCode -ne 0) {
@@ -257,43 +259,235 @@ function Initialize-Secrets {
 
 function Start-LegacyCpa {
     $exe = Join-Path $SourceCpaRuntime "cli-proxy-api.exe"
-    $process = Start-CpaStackProcess -FilePath $exe -Arguments "-config `"$SourceCpaConfig`"" -WorkingDirectory $SourceCpaRuntime -MinimalEnvironment
-    [void](Wait-CpaStackTrustedListener -Port 8317 -ExpectedPath $exe -ExpectedProcessId $process.Id -ExpectedHash (Get-CpaStackFileHash -Path $exe) -Seconds 35)
-    $secrets = Get-CpaStackSecrets -ControlRoot $ControlRoot
-    [void](Wait-CpaStackHttpJson -Uri "http://127.0.0.1:8317/v0/management/config" -Headers @{ Authorization = "Bearer $($secrets.cpaManagementKey)" } -Seconds 35)
-    $models = Wait-CpaStackHttpJson -Uri "http://127.0.0.1:8317/v1/models" -Headers @{ Authorization = "Bearer $($secrets.cpaClientApiKey)" } -Seconds 20
-    if (-not $models.data -or @($models.data).Count -lt 1) {
-        throw "Legacy CPA did not recover with a non-empty model list."
+    [void](Stop-CpaStackProcessesByExecutablePath -ExpectedPath $exe)
+    Protect-CpaStackPrivateDirectory -Path $SourceCpaRuntime
+    Protect-CpaStackSecretFile -Path $exe
+    Protect-CpaStackSecretFile -Path $SourceCpaConfig
+    Protect-CpaStackPrivateTree -Root (Join-Path $SourceCpaRuntime 'auth')
+    $plugins = Join-Path $SourceCpaRuntime 'plugins'
+    if (Test-Path -LiteralPath $plugins) { Protect-CpaStackPrivateTree -Root $plugins }
+
+    $expectedHash = [string]$initializeJournal.sourceCpaSha256
+    $process = $null
+    try {
+        $process = Start-CpaStackProcess -FilePath $exe -Arguments "-config `"$SourceCpaConfig`"" -WorkingDirectory $SourceCpaRuntime -MinimalEnvironment
+        [void](Wait-CpaStackTrustedListener -Port 8317 -ExpectedPath $exe -ExpectedProcessId $process.Id -ExpectedHash $expectedHash -Seconds 35)
+        $secrets = Get-CpaStackSecrets -ControlRoot $ControlRoot
+        [void](Wait-CpaStackHttpJson -Uri "http://127.0.0.1:8317/v0/management/config" -Headers @{ Authorization = "Bearer $($secrets.cpaManagementKey)" } -Seconds 35)
+        $models = Wait-CpaStackHttpJson -Uri "http://127.0.0.1:8317/v1/models" -Headers @{ Authorization = "Bearer $($secrets.cpaClientApiKey)" } -Seconds 20
+        if (-not $models.data -or @($models.data).Count -lt 1) {
+            throw "Legacy CPA did not recover with a non-empty model list."
+        }
+    } catch {
+        if ($null -ne $process) { Stop-CpaStackStartedProcess -Process $process -ExpectedPath $exe }
+        throw
+    } finally {
+        if ($null -ne $process -and $process -is [System.IDisposable]) { $process.Dispose() }
+    }
+}
+
+function Set-SourceManagerSnapshot {
+    param(
+        [Parameter(Mandatory = $true)]$Snapshot,
+        [string]$Description = 'Manager source snapshot'
+    )
+
+    if ($null -eq $Snapshot.quick_check -or -not [bool]$Snapshot.quick_check.ok -or
+        $null -eq $Snapshot.usage_events -or $null -eq $Snapshot.critical_table_counts) {
+        throw "$Description is missing the trusted SQLite recovery fields."
+    }
+    $script:sourceManagerSnapshot = $Snapshot
+}
+
+function Resolve-SourceManagerSnapshot {
+    if ($null -ne $sourceManagerSnapshot) { return }
+    if ($null -eq $initializeJournal) { return }
+
+    foreach ($path in @(
+        (Join-Path $stateDir 'manager-migration-switch.json'),
+        (Join-Path $stateDir 'switch-manager.pending.json')
+    )) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+        $state = Read-CpaStackJson -Path $path
+        $stateSourceRuntime = if ($null -ne $state.PSObject.Properties['sourceRuntime']) {
+            [string]$state.sourceRuntime
+        } else {
+            Split-Path -Parent ([string]$state.sourcePath)
+        }
+        $stateSourceData = [string]$state.sourceData
+        if ([string]$state.oldHash -ne [string]$initializeJournal.sourceManagerSha256 -or
+            -not [string]::Equals([System.IO.Path]::GetFullPath($stateSourceRuntime).TrimEnd('\'), [System.IO.Path]::GetFullPath($SourceManagerRuntime).TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase) -or
+            -not [string]::Equals([System.IO.Path]::GetFullPath($stateSourceData).TrimEnd('\'), [System.IO.Path]::GetFullPath($SourceManagerData).TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Manager recovery snapshot state is not bound to the initialization source: $path"
+        }
+        if ($null -ne $state.PSObject.Properties['instanceId'] -and [string]$state.instanceId -ne [string]$initializeJournal.instanceId) {
+            throw "Manager recovery snapshot state belongs to another instance: $path"
+        }
+        if ($null -ne $state.sourceSnapshot) {
+            Set-SourceManagerSnapshot -Snapshot $state.sourceSnapshot -Description "Manager recovery snapshot in $path"
+            return
+        }
     }
 }
 
 function Start-LegacyManager {
-    $secrets = Get-CpaStackSecrets -ControlRoot $ControlRoot
     $exe = Join-Path $SourceManagerRuntime "cpa-manager-plus.exe"
+    $dataKey = Join-Path $SourceManagerData 'data.key'
+    if ($null -eq $initializeJournal -or
+        [string]$initializeJournal.sourceManagerSha256 -notmatch '^[0-9A-Fa-f]{64}$' -or
+        [string]$initializeJournal.sourceDataKeySha256 -notmatch '^[0-9A-Fa-f]{64}$') {
+        throw 'Legacy Manager recovery requires recorded executable and data-key hashes.'
+    }
+    Resolve-SourceManagerSnapshot
+    if ($null -eq $sourceManagerSnapshot) {
+        throw 'Legacy Manager recovery requires a stopped-source SQLite business-data baseline.'
+    }
+    $expectedExecutableHash = [string]$initializeJournal.sourceManagerSha256
+    $expectedDataKeyHash = [string]$initializeJournal.sourceDataKeySha256
+    $expectedSnapshot = [pscustomobject]@{ snapshot = $sourceManagerSnapshot }
+    $preVerification = Join-Path $ControlRoot ('work\mv-' + [guid]::NewGuid().ToString('N'))
+    $postVerification = Join-Path $ControlRoot ('work\mv-' + [guid]::NewGuid().ToString('N'))
+    Assert-CpaStackChildPath -Root $ControlRoot -Path $preVerification
+    Assert-CpaStackChildPath -Root $ControlRoot -Path $postVerification
+    try {
+        [void](Assert-CpaStackManagerRecoverySource -Runtime $SourceManagerRuntime -Data $SourceManagerData -ExpectedExecutableSha256 $expectedExecutableHash -ExpectedDataKeySha256 $expectedDataKeyHash -ExpectedSnapshot $expectedSnapshot -VerificationRoot $preVerification)
+        Protect-CpaStackPrivateDirectory -Path $SourceManagerRuntime
+        Protect-CpaStackSecretFile -Path $exe
+        Protect-CpaStackPrivateTree -Root $SourceManagerData
+        [void](Assert-CpaStackManagerRecoverySource -Runtime $SourceManagerRuntime -Data $SourceManagerData -ExpectedExecutableSha256 $expectedExecutableHash -ExpectedDataKeySha256 $expectedDataKeyHash -ExpectedSnapshot $expectedSnapshot -VerificationRoot $postVerification)
+    } finally {
+        foreach ($verificationRoot in @($preVerification, $postVerification)) {
+            if (Test-Path -LiteralPath $verificationRoot) {
+                Remove-Item -LiteralPath $verificationRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    if ((Get-CpaStackFileHash -Path $exe) -ne $expectedExecutableHash -or
+        (Get-CpaStackFileHash -Path $dataKey) -ne $expectedDataKeyHash) {
+        throw 'Legacy Manager recovery source changed immediately before execution.'
+    }
+    $secrets = Get-CpaStackSecrets -ControlRoot $ControlRoot
     $environment = @{
         HTTP_ADDR = "${sourceManagerBindAddress}:18317"
         USAGE_DATA_DIR = $SourceManagerData
         USAGE_DB_PATH = (Join-Path $SourceManagerData "usage.sqlite")
         CPA_MANAGER_ADMIN_KEY = [string]$secrets.managerAdminKey
     }
-    $process = Start-CpaStackProcess -FilePath $exe -WorkingDirectory $SourceManagerRuntime -Environment $environment -RemoveEnvironment @("PANEL_PATH") -MinimalEnvironment
-    [void](Wait-CpaStackTrustedListener -Port 18317 -ExpectedPath $exe -ExpectedProcessId $process.Id -ExpectedHash (Get-CpaStackFileHash -Path $exe) -AllowedAddresses @($sourceManagerBindAddress) -Seconds 35)
-    [void](Wait-CpaStackHttpJson -Uri "http://127.0.0.1:18317/health" -Seconds 35)
+    $process = $null
+    try {
+        $process = Start-CpaStackProcess -FilePath $exe -WorkingDirectory $SourceManagerRuntime -Environment $environment -RemoveEnvironment @("PANEL_PATH") -MinimalEnvironment
+        [void](Wait-CpaStackTrustedListener -Port 18317 -ExpectedPath $exe -ExpectedProcessId $process.Id -ExpectedHash $expectedExecutableHash -AllowedAddresses @($sourceManagerBindAddress) -Seconds 35)
+        [void](Wait-CpaStackHttpJson -Uri "http://127.0.0.1:18317/health" -Seconds 35)
+    } catch {
+        if ($null -ne $process) {
+            Stop-CpaStackStartedProcess -Process $process -ExpectedPath $exe
+        }
+        throw
+    } finally {
+        if ($null -ne $process -and $process -is [System.IDisposable]) { $process.Dispose() }
+    }
+}
+
+function Stop-UncommittedCanonicalProcesses {
+    foreach ($path in @(
+        (Join-Path $targetCpaRuntime 'cli-proxy-api.exe'),
+        (Join-Path $targetManagerRuntime 'cpa-manager-plus.exe')
+    )) {
+        [void](Stop-CpaStackProcessesByExecutablePath -ExpectedPath $path)
+    }
+
+    foreach ($entry in @(
+        [pscustomobject]@{ Port = 8317; Source = (Join-Path $SourceCpaRuntime 'cli-proxy-api.exe'); Target = (Join-Path $targetCpaRuntime 'cli-proxy-api.exe') },
+        [pscustomobject]@{ Port = 18317; Source = (Join-Path $SourceManagerRuntime 'cpa-manager-plus.exe'); Target = (Join-Path $targetManagerRuntime 'cpa-manager-plus.exe') }
+    )) {
+        $listener = Get-CpaStackListener -Port $entry.Port
+        if ($listener -and $listener.ExecutablePath -ieq $entry.Target) {
+            throw "Uncommitted target process remained on port $($entry.Port) after quarantine."
+        }
+        if ($listener -and $listener.ExecutablePath -ine $entry.Source) {
+            throw "Unexpected process owns port $($entry.Port) during interrupted initialization recovery."
+        }
+    }
+}
+
+function Restore-LegacyCpa {
+    [void](Stop-CpaStackProcessesByExecutablePath -ExpectedPath (Join-Path $targetCpaRuntime 'cli-proxy-api.exe'))
+    $cpaListener = Get-CpaStackListener -Port 8317
+    if ($cpaListener) {
+        $allowedCpaPaths = @((Join-Path $SourceCpaRuntime "cli-proxy-api.exe"), (Join-Path $targetCpaRuntime "cli-proxy-api.exe"))
+        if ($allowedCpaPaths -inotcontains $cpaListener.ExecutablePath) { throw "Unexpected process owns port 8317 during legacy recovery." }
+        $cpaProcess = Get-CpaStackFixedListenerProcess -Listener $cpaListener -ExpectedPath $cpaListener.ExecutablePath
+        try {
+            Stop-CpaStackPort -Port 8317 -ExpectedPath $cpaListener.ExecutablePath -ExpectedProcess $cpaProcess
+        } finally {
+            if ($cpaProcess -is [System.IDisposable]) { $cpaProcess.Dispose() }
+        }
+    }
+    Start-LegacyCpa
 }
 
 function Assert-LegacyStackState {
     if ($null -eq $sourceManagerBaseline) { throw "Legacy Manager baseline is unavailable." }
     $sourceCpaExe = Join-Path $SourceCpaRuntime "cli-proxy-api.exe"
     $sourceManagerExe = Join-Path $SourceManagerRuntime "cpa-manager-plus.exe"
+    $expectedCpaHash = if ($null -ne $initializeJournal) { [string]$initializeJournal.sourceCpaSha256 } else { Get-CpaStackFileHash -Path $sourceCpaExe }
+    $expectedManagerHash = if ($null -ne $initializeJournal) { [string]$initializeJournal.sourceManagerSha256 } else { Get-CpaStackFileHash -Path $sourceManagerExe }
+    if ($expectedCpaHash -notmatch '^[0-9A-Fa-f]{64}$' -or $expectedManagerHash -notmatch '^[0-9A-Fa-f]{64}$') {
+        throw 'Legacy stack verification requires recorded executable hashes.'
+    }
+    if ((Get-CpaStackFileHash -Path $sourceCpaExe) -ne $expectedCpaHash -or
+        (Get-CpaStackFileHash -Path $sourceManagerExe) -ne $expectedManagerHash) {
+        throw 'Legacy executable changed after initialization recorded its identity.'
+    }
+    if ($null -ne $initializeJournal) {
+        if ((Get-CpaStackFileHash -Path $SourceCpaConfig) -ne [string]$initializeJournal.sourceCpaConfigSha256 -or
+            (Get-CpaStackFileHash -Path (Join-Path $SourceManagerData 'data.key')) -ne [string]$initializeJournal.sourceDataKeySha256) {
+            throw 'Legacy config or Manager data.key changed after initialization recorded it.'
+        }
+    }
     $cpaListener = Get-CpaStackListener -Port 8317
     $managerListener = Get-CpaStackListener -Port 18317
     if (-not $cpaListener -or $cpaListener.ExecutablePath -ine $sourceCpaExe) { throw "Legacy CPA does not own port 8317." }
     if (-not $managerListener -or $managerListener.ExecutablePath -ine $sourceManagerExe) { throw "Legacy Manager does not own port 18317." }
-    [void](Wait-CpaStackTrustedListener -Port 8317 -ExpectedPath $sourceCpaExe -ExpectedProcessId $cpaListener.ProcessId -ExpectedHash (Get-CpaStackFileHash -Path $sourceCpaExe) -Seconds 2)
-    [void](Wait-CpaStackTrustedListener -Port 18317 -ExpectedPath $sourceManagerExe -ExpectedProcessId $managerListener.ProcessId -ExpectedHash (Get-CpaStackFileHash -Path $sourceManagerExe) -Seconds 2)
+    [void](Wait-CpaStackTrustedListener -Port 8317 -ExpectedPath $sourceCpaExe -ExpectedProcessId $cpaListener.ProcessId -ExpectedHash $expectedCpaHash -Seconds 2)
+    [void](Wait-CpaStackTrustedListener -Port 18317 -ExpectedPath $sourceManagerExe -ExpectedProcessId $managerListener.ProcessId -ExpectedHash $expectedManagerHash -Seconds 2)
     $secrets = Get-CpaStackSecrets -ControlRoot $ControlRoot
     $models = Wait-CpaStackHttpJson -Uri "http://127.0.0.1:8317/v1/models" -Headers @{ Authorization = "Bearer $($secrets.cpaClientApiKey)" } -Seconds 20
     if (-not $models.data -or @($models.data).Count -lt 1) { throw "Legacy CPA model list is empty." }
+    Resolve-SourceManagerSnapshot
+    if ($null -ne $sourceManagerSnapshot) {
+        $verificationRoot = Join-Path $ControlRoot ('work\mv-' + [guid]::NewGuid().ToString('N'))
+        Assert-CpaStackChildPath -Root $ControlRoot -Path $verificationRoot
+        try {
+            New-Item -ItemType Directory -Path $verificationRoot | Out-Null
+            $currentSnapshot = Invoke-CpaStackSqliteBackup `
+                -Source (Join-Path $SourceManagerData 'usage.sqlite') `
+                -Destination (Join-Path $verificationRoot 'usage.sqlite') `
+                -ResultPath (Join-Path $verificationRoot 'sqlite-current.json')
+            if (-not [bool]$currentSnapshot.snapshot.quick_check.ok -or
+                ([bool]$sourceManagerSnapshot.usage_events.exists -and -not [bool]$currentSnapshot.snapshot.usage_events.exists)) {
+                throw 'Recovered Manager database failed quick_check or lost the required usage_events table.'
+            }
+            foreach ($field in @('count', 'max_id', 'max_timestamp_ms')) {
+                $expectedValue = $sourceManagerSnapshot.usage_events.$field
+                if ($null -ne $expectedValue -and [Int64]$currentSnapshot.snapshot.usage_events.$field -lt [Int64]$expectedValue) {
+                    throw "Recovered Manager history regressed below the trusted snapshot: $field"
+                }
+            }
+            foreach ($table in @('settings', 'model_prices')) {
+                $expectedProperty = $sourceManagerSnapshot.critical_table_counts.PSObject.Properties[$table]
+                if ($null -eq $expectedProperty -or $null -eq $expectedProperty.Value) { continue }
+                $actualProperty = $currentSnapshot.snapshot.critical_table_counts.PSObject.Properties[$table]
+                if ($null -eq $actualProperty -or $null -eq $actualProperty.Value -or [Int64]$actualProperty.Value -lt [Int64]$expectedProperty.Value) {
+                    throw "Recovered Manager required business table regressed below the trusted baseline: $table"
+                }
+            }
+        } finally {
+            if (Test-Path -LiteralPath $verificationRoot) {
+                Remove-Item -LiteralPath $verificationRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
     [void](Set-CpaStackManagerCollector -ManagerPort 18317 -CpaPort 8317 -ManagerAdminKey $secrets.managerAdminKey -CpaManagementKey $secrets.cpaManagementKey -Enabled ([bool]$sourceManagerBaseline.collectorEnabled) -Baseline $sourceManagerBaseline)
     [void](Assert-CpaStackManagerSetupBaseline -ManagerPort 18317 -ManagerAdminKey $secrets.managerAdminKey -Expected $sourceManagerBaseline)
     $status = Wait-CpaStackHttpJson -Uri "http://127.0.0.1:18317/status" -Headers @{ Authorization = "Bearer $($secrets.managerAdminKey)" } -Seconds 20
@@ -306,20 +500,33 @@ function Assert-LegacyStackState {
 }
 
 function Restore-LegacyStack {
+    [void](Stop-CpaStackProcessesByExecutablePath -ExpectedPath (Join-Path $targetManagerRuntime 'cpa-manager-plus.exe'))
     $managerListener = Get-CpaStackListener -Port 18317
+    $startLegacyManager = $true
     if ($managerListener) {
         $allowedManagerPaths = @((Join-Path $SourceManagerRuntime "cpa-manager-plus.exe"), (Join-Path $targetManagerRuntime "cpa-manager-plus.exe"))
         if ($allowedManagerPaths -inotcontains $managerListener.ExecutablePath) { throw "Unexpected process owns port 18317 during legacy recovery." }
-        Stop-CpaStackPort -Port 18317 -ExpectedPath $managerListener.ExecutablePath
+        if ($managerListener.ExecutablePath -ieq (Join-Path $SourceManagerRuntime 'cpa-manager-plus.exe')) {
+            Assert-CpaStackLegacyManagerSource -Runtime $SourceManagerRuntime -Data $SourceManagerData
+            if ((Get-CpaStackFileHash -Path $managerListener.ExecutablePath) -ne [string]$initializeJournal.sourceManagerSha256 -or
+                (Get-CpaStackFileHash -Path (Join-Path $SourceManagerData 'data.key')) -ne [string]$initializeJournal.sourceDataKeySha256) {
+                throw 'Running legacy Manager no longer matches the initialization journal.'
+            }
+            [void](Wait-CpaStackTrustedListener -Port 18317 -ExpectedPath $managerListener.ExecutablePath -ExpectedProcessId $managerListener.ProcessId -ExpectedHash ([string]$initializeJournal.sourceManagerSha256) -AllowedAddresses @($sourceManagerBindAddress) -Seconds 2)
+            $startLegacyManager = $false
+        } else {
+            $managerProcess = Get-CpaStackFixedListenerProcess -Listener $managerListener -ExpectedPath $managerListener.ExecutablePath
+            try {
+                Stop-CpaStackPort -Port 18317 -ExpectedPath $managerListener.ExecutablePath -ExpectedProcess $managerProcess
+            } finally {
+                if ($managerProcess -is [System.IDisposable]) { $managerProcess.Dispose() }
+            }
+        }
     }
-    $cpaListener = Get-CpaStackListener -Port 8317
-    if ($cpaListener) {
-        $allowedCpaPaths = @((Join-Path $SourceCpaRuntime "cli-proxy-api.exe"), (Join-Path $targetCpaRuntime "cli-proxy-api.exe"))
-        if ($allowedCpaPaths -inotcontains $cpaListener.ExecutablePath) { throw "Unexpected process owns port 8317 during legacy recovery." }
-        Stop-CpaStackPort -Port 8317 -ExpectedPath $cpaListener.ExecutablePath
+    Restore-LegacyCpa
+    if ($startLegacyManager) {
+        Start-LegacyManager
     }
-    Start-LegacyCpa
-    Start-LegacyManager
     Assert-LegacyStackState
 }
 
@@ -435,7 +642,7 @@ function Stop-InitializationTemporaryListeners {
         if ($listener.ExecutablePath -ine $entry.Expected) {
             throw "Unexpected process owns initialization temporary port $($entry.Port): $($listener.ExecutablePath)"
         }
-        Stop-CpaStackPort -Port $entry.Port -ExpectedPath $entry.Expected
+        Stop-CpaStackPort -Port $entry.Port -ExpectedPath $entry.Expected -RequireExecutableWriteAccess
     }
 }
 
@@ -586,9 +793,7 @@ function Test-CommittedCanonicalInitialization {
     if ($Journal.desktopShortcut) {
         Assert-TrustedDesktopShortcut -Path ([string]$Journal.desktopShortcut)
         $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut([string]$Journal.desktopShortcut)
-        if ($shortcut.Arguments -notmatch [regex]::Escape($newStartScript) -or $shortcut.WorkingDirectory -ine $opsDir) {
-            throw "Committed desktop shortcut does not target the canonical start script."
-        }
+        [void](Assert-CpaStackCanonicalShortcutContract -Shortcut $shortcut -StartScript $newStartScript -WorkingDirectory $opsDir)
     }
     return $true
 }
@@ -614,20 +819,13 @@ function Recover-InterruptedInitialization {
             throw "Initialization journal $($pair[2]) target is invalid."
         }
     }
+    $script:initializeJournal = $journal
     $script:SourceCpaRuntime = [string]$journal.sourceCpaRuntime
     $script:SourceCpaConfig = [string]$journal.sourceCpaConfig
     $script:SourceManagerRuntime = [string]$journal.sourceManagerRuntime
     $script:SourceManagerData = [string]$journal.sourceManagerData
     $script:LegacyStartScript = [string]$journal.legacyStartScript
     $script:DesktopShortcut = [string]$journal.desktopShortcut
-    if ($journal.managerBaseline) { $script:sourceManagerBaseline = $journal.managerBaseline }
-    if ($journal.managerBindAddress) { $script:sourceManagerBindAddress = [string]$journal.managerBindAddress }
-    if ($sourceManagerBindAddress -notmatch '^[A-Za-z0-9.:%\[\]-]+$') { throw "Initialization journal Manager bind address is invalid." }
-    foreach ($field in @("cpaBaseUrl", "collectorEnabled", "pollIntervalMs", "usageStatisticsEnabled")) {
-        if ($null -eq $sourceManagerBaseline -or $null -eq $sourceManagerBaseline.PSObject.Properties[$field]) {
-            throw "Initialization journal is missing Manager baseline field $field."
-        }
-    }
     Stop-InitializationTemporaryListeners
 
     if (Test-Path -LiteralPath $currentStatePath -PathType Leaf) {
@@ -642,8 +840,21 @@ function Recover-InterruptedInitialization {
         return $true
     }
 
+    Stop-UncommittedCanonicalProcesses
+    if ($journal.managerBaseline) { $script:sourceManagerBaseline = $journal.managerBaseline }
+    if ($journal.sourceManagerSnapshot) {
+        Set-SourceManagerSnapshot -Snapshot $journal.sourceManagerSnapshot -Description 'Initialization journal Manager source snapshot'
+    }
+    if ($journal.managerBindAddress) { $script:sourceManagerBindAddress = [string]$journal.managerBindAddress }
+    if ($sourceManagerBindAddress -notmatch '^[A-Za-z0-9.:%\[\]-]+$') { throw "Initialization journal Manager bind address is invalid." }
+    foreach ($field in @("cpaBaseUrl", "collectorEnabled", "pollIntervalMs", "usageStatisticsEnabled")) {
+        if ($null -eq $sourceManagerBaseline -or $null -eq $sourceManagerBaseline.PSObject.Properties[$field]) {
+            throw "Initialization journal is missing Manager baseline field $field."
+        }
+    }
     Assert-MigrationSourceBoundaries
     Assert-CpaStackLegacyCpaSource -Runtime $SourceCpaRuntime -ConfigPath $SourceCpaConfig
+    Assert-CpaStackLegacyManagerSource -Runtime $SourceManagerRuntime -Data $SourceManagerData
     foreach ($field in @("sourceCpaSha256", "sourceManagerSha256", "sourceCpaConfigSha256", "sourceDataKeySha256")) {
         if ([string]$journal.$field -notmatch '^[0-9A-Fa-f]{64}$') { throw "Initialization journal hash field is invalid: $field" }
     }
@@ -696,21 +907,46 @@ function Update-DesktopShortcut {
         return [pscustomobject]@{ updated = $false; reason = "not-found" }
     }
     Backup-DesktopShortcut
-    $wsh = New-Object -ComObject WScript.Shell
-    $link = $wsh.CreateShortcut($DesktopShortcut)
-    $link.TargetPath = (Get-Command powershell.exe -ErrorAction Stop).Source
-    $link.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$newStartScript`""
-    $link.WorkingDirectory = $opsDir
     $icon = Join-Path $ControlRoot "assets\cpa-frontend-logo.ico"
-    if (Test-Path -LiteralPath $icon) {
-        $link.IconLocation = "$icon,0"
-    }
-    $link.Save()
-    $verify = $wsh.CreateShortcut($DesktopShortcut)
-    if ($verify.Arguments -notmatch [regex]::Escape($newStartScript) -or $verify.WorkingDirectory -ine $opsDir) {
-        throw "Desktop shortcut verification failed."
-    }
-    return [pscustomobject]@{ updated = $true; path = $DesktopShortcut; script = $newStartScript }
+    [void](Set-CpaStackCanonicalShortcut -ShortcutPath $DesktopShortcut -StartScript $newStartScript -WorkingDirectory $opsDir -IconPath $icon)
+    return [pscustomobject]@{ updated = $true; path = $DesktopShortcut; script = $newStartScript; hiddenWindow = $true }
+}
+
+function Assert-InitializationSwitchPathBudget {
+    $managerVerification = Join-Path $ControlRoot ('work\mv-' + ('0' * 32))
+    Assert-CpaStackPathBudget -Paths @(
+        $targetCpaRuntime,
+        $targetManagerRuntime,
+        $targetManagerData,
+        $managerVerification,
+        (Join-Path $managerVerification 'post-start'),
+        (Join-Path $managerVerification 'r-3'),
+        (Join-Path $managerVerification 'rp-3'),
+        $migrationRollback,
+        ($migrationRollback + '.previous-' + ('0' * 32))
+    ) -PathType Container
+    Assert-CpaStackProjectedTreePathBudget -Source $targetCpaRuntime -Destination $targetCpaRuntime
+    Assert-CpaStackProjectedTreePathBudget -Source $targetManagerRuntime -Destination $targetManagerRuntime
+    Assert-CpaStackPathBudget -Paths @(
+        (Join-Path $targetManagerData 'usage.sqlite'),
+        (Join-Path $targetManagerData 'usage.sqlite-wal'),
+        (Join-Path $targetManagerData 'usage.sqlite-shm'),
+        (Join-Path $targetManagerData 'data.key'),
+        (Join-Path $managerVerification 'usage.sqlite'),
+        (Join-Path $managerVerification 'post-start\usage.sqlite'),
+        $newStartScript
+    ) -PathType Leaf
+    Assert-CpaStackJsonWritePathBudget -Paths @(
+        $initializeJournalPath,
+        $currentStatePath,
+        $resultPath,
+        (Join-Path $stateDir 'cpa-migration-switch.json'),
+        (Join-Path $stateDir 'manager-migration-switch.json'),
+        (Join-Path $stateDir 'switch-cpa.pending.json'),
+        (Join-Path $stateDir 'switch-manager.pending.json'),
+        (Join-Path $managerVerification 'sqlite-baseline.json'),
+        (Join-Path $managerVerification 'post-start\sqlite-after.json')
+    )
 }
 
 try {
@@ -740,7 +976,7 @@ try {
         $current = Read-CpaStackJson -Path $currentStatePath
         $result.cpa = $current.cpa
         $result.manager = $current.manager
-        $result.shortcut = [ordered]@{ updated = $true; path = $DesktopShortcut; script = $newStartScript }
+        $result.shortcut = [ordered]@{ updated = $true; path = $DesktopShortcut; script = $newStartScript; hiddenWindow = $true }
         $result.success = $true
     } else {
     if (Test-Path -LiteralPath $currentStatePath -PathType Leaf) {
@@ -766,6 +1002,7 @@ try {
 
     Assert-MigrationSourceBoundaries
     Assert-CpaStackLegacyCpaSource -Runtime $SourceCpaRuntime -ConfigPath $SourceCpaConfig
+    Assert-CpaStackLegacyManagerSource -Runtime $SourceManagerRuntime -Data $SourceManagerData
     $cpaListener = Get-CpaStackListener -Port 8317
     $managerListener = Get-CpaStackListener -Port 18317
     if (-not $cpaListener -or $cpaListener.ExecutablePath -ine (Join-Path $SourceCpaRuntime "cli-proxy-api.exe")) { throw "CPA source path does not own port 8317." }
@@ -881,6 +1118,7 @@ try {
         "-ResultPath", (Join-Path $stateDir "manager-18318-migration-test.json")
     ))
     Set-InitializeJournalPhase -Phase "candidates-validated"
+    Assert-InitializationSwitchPathBudget
 
     $cpaSwitchResult = Join-Path $stateDir "cpa-migration-switch.json"
     Set-InitializeJournalPhase -Phase "switching"
@@ -911,15 +1149,91 @@ try {
             "-ExpectedCandidateHash", (Get-CpaStackFileHash -Path (Join-Path $targetManagerRuntime "cpa-manager-plus.exe")),
             "-ResultPath", $managerSwitchResult
         )
-        $result.manager = Read-CpaStackJson -Path $managerSwitchResult
+        $managerResult = Read-CpaStackJson -Path $managerSwitchResult
+        $managerResultSourceRuntime = Split-Path -Parent ([string]$managerResult.sourcePath)
+        if (-not [bool]$managerResult.success -or
+            [string]$managerResult.oldHash -ne [string]$initializeJournal.sourceManagerSha256 -or
+            -not [string]::Equals([System.IO.Path]::GetFullPath($managerResultSourceRuntime).TrimEnd('\'), [System.IO.Path]::GetFullPath($SourceManagerRuntime).TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase) -or
+            -not [string]::Equals([System.IO.Path]::GetFullPath([string]$managerResult.sourceData).TrimEnd('\'), [System.IO.Path]::GetFullPath($SourceManagerData).TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Manager migration result is not bound to the initialization source.'
+        }
+        Set-SourceManagerSnapshot -Snapshot $managerResult.sourceSnapshot -Description 'Manager migration result source snapshot'
+        $result.manager = $managerResult
+        $initializeJournal | Add-Member -NotePropertyName sourceManagerSnapshot -NotePropertyValue $result.manager.sourceSnapshot -Force
         Set-InitializeJournalPhase -Phase "services-switched"
         $result.shortcut = Update-DesktopShortcut
         Set-InitializeJournalPhase -Phase "shortcut-updated"
     } catch {
-        Restore-LegacyStack
-        $legacyRestored = $true
-        if ($DesktopShortcut) { Restore-DesktopShortcut }
-        $result.rolledBack = $true
+        $managerRecoveryBlocked = $true
+        $managerSwitchState = $null
+        $managerSwitchValidationError = $null
+        if (Test-Path -LiteralPath $managerSwitchResult -PathType Leaf) {
+            try {
+                $candidateManagerSwitchState = Read-CpaStackJson -Path $managerSwitchResult
+                $candidateSourceRuntime = Split-Path -Parent ([string]$candidateManagerSwitchState.sourcePath)
+                if ([string]$candidateManagerSwitchState.oldHash -ne [string]$initializeJournal.sourceManagerSha256 -or
+                    -not [string]::Equals([System.IO.Path]::GetFullPath($candidateSourceRuntime).TrimEnd('\'), [System.IO.Path]::GetFullPath($SourceManagerRuntime).TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase) -or
+                    -not [string]::Equals([System.IO.Path]::GetFullPath([string]$candidateManagerSwitchState.sourceData).TrimEnd('\'), [System.IO.Path]::GetFullPath($SourceManagerData).TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase) -or
+                    $null -eq $candidateManagerSwitchState.sourceSnapshot) {
+                    throw 'Manager switch result is not bound to the initialization source snapshot.'
+                }
+                Set-SourceManagerSnapshot -Snapshot $candidateManagerSwitchState.sourceSnapshot -Description 'Failed Manager migration source snapshot'
+                $managerSwitchState = $candidateManagerSwitchState
+                $result.manager = $candidateManagerSwitchState
+            } catch {
+                $managerSwitchState = $null
+                $managerSwitchValidationError = $_.Exception.Message
+            }
+        }
+        if ($managerSwitchValidationError) {
+            [void](Stop-CpaStackProcessesByExecutablePath -ExpectedPath (Join-Path $targetManagerRuntime 'cpa-manager-plus.exe'))
+            try {
+                Restore-LegacyCpa
+            } catch {
+                throw "Manager switch result validation failed and CPA recovery also failed. Validation: $managerSwitchValidationError CPA recovery: $($_.Exception.Message)"
+            }
+            throw "Manager switch result validation failed; recovery state was not trusted. $managerSwitchValidationError"
+        }
+        if ($null -ne $managerSwitchState -and [bool]$managerSwitchState.success) {
+            Restore-LegacyStack
+            $legacyRestored = $true
+            $managerRecoveryBlocked = $false
+            if ($DesktopShortcut) { Restore-DesktopShortcut }
+            $result.rolledBack = $true
+            throw
+        }
+        $sourceManagerExe = Join-Path $SourceManagerRuntime 'cpa-manager-plus.exe'
+        $managerListener = Get-CpaStackListener -Port 18317
+        $managerSafelyRestored = [bool]($null -ne $managerSwitchState -and $managerSwitchState.rolledBack)
+        if (-not $managerSafelyRestored -and $managerListener -and $managerListener.ExecutablePath -ieq $sourceManagerExe) {
+            Resolve-SourceManagerSnapshot
+            $managerSnapshotEvidenceValid = ($null -ne $sourceManagerSnapshot)
+            $managerPendingPath = Join-Path $stateDir 'switch-manager.pending.json'
+            if (-not $managerSnapshotEvidenceValid -and (Test-Path -LiteralPath $managerPendingPath -PathType Leaf)) {
+                $managerPendingState = Read-CpaStackJson -Path $managerPendingPath
+                $managerSnapshotEvidenceValid = [string]$managerPendingState.phase -in @('prepared', 'collector-disabled')
+            }
+            Assert-CpaStackLegacyManagerSource -Runtime $SourceManagerRuntime -Data $SourceManagerData
+            $expectedManagerHash = if ($null -ne $initializeJournal) { [string]$initializeJournal.sourceManagerSha256 } else { $null }
+            $expectedDataKeyHash = if ($null -ne $initializeJournal) { [string]$initializeJournal.sourceDataKeySha256 } else { $null }
+            $managerSafelyRestored = (
+                $managerSnapshotEvidenceValid -and
+                $expectedManagerHash -match '^[0-9A-Fa-f]{64}$' -and
+                $expectedDataKeyHash -match '^[0-9A-Fa-f]{64}$' -and
+                (Get-CpaStackFileHash -Path $sourceManagerExe) -eq $expectedManagerHash -and
+                (Get-CpaStackFileHash -Path (Join-Path $SourceManagerData 'data.key')) -eq $expectedDataKeyHash
+            )
+        }
+        Restore-LegacyCpa
+        if ($managerSafelyRestored) {
+            Assert-LegacyStackState
+            $legacyRestored = $true
+            $managerRecoveryBlocked = $false
+            if ($DesktopShortcut) { Restore-DesktopShortcut }
+            $result.rolledBack = $true
+        } else {
+            throw 'Manager automatic recovery did not establish a trusted legacy listener; the outer initializer refused to execute the legacy Manager.'
+        }
         throw
     }
 
@@ -963,8 +1277,8 @@ try {
     $originalError = $_.Exception.Message
     $initializationStarted = (Test-Path -LiteralPath $initializeJournalPath -PathType Leaf)
     $recoveryInvocationFailed = ($recoveryAttempted -and -not $recoveryCompleted)
-    $recoverySucceeded = (-not $switchPhaseStarted -and -not $recoveryInvocationFailed)
-    if (-not $recoveryInvocationFailed -and $switchPhaseStarted -and -not $legacyRestored -and (Test-Path -LiteralPath $secretsPath -PathType Leaf)) {
+    $recoverySucceeded = (-not $switchPhaseStarted -and -not $recoveryInvocationFailed -and -not $managerRecoveryBlocked)
+    if (-not $managerRecoveryBlocked -and -not $recoveryInvocationFailed -and $switchPhaseStarted -and -not $legacyRestored -and (Test-Path -LiteralPath $secretsPath -PathType Leaf)) {
         try {
             Restore-LegacyStack
             $legacyRestored = $true
@@ -976,6 +1290,8 @@ try {
         }
     } elseif ($switchPhaseStarted -and $legacyRestored) {
         $recoverySucceeded = $true
+    } elseif ($managerRecoveryBlocked) {
+        $recoverySucceeded = $false
     }
     if (($initializationStarted -or $preparationStarted) -and $recoverySucceeded) {
         try {

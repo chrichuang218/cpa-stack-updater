@@ -2,7 +2,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'TestHelpers.ps1')
 
 $sourceRepo = Split-Path -Parent $PSScriptRoot
-$temp = Join-Path ([System.IO.Path]::GetTempPath()) ('cpa-adoption-tests-' + [guid]::NewGuid().ToString('N'))
+$temp = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('cpa-adoption-tests-' + [guid]::NewGuid().ToString('N'))
 $fixtureRepo = Join-Path $temp 'repository'
 $fixtureLocalAppData = Join-Path $temp 'local-app-data'
 $harness = Join-Path $temp 'harness'
@@ -16,6 +16,7 @@ try {
     $repo = $fixture.Repository
     $commonPath = Join-Path $repo 'skills\cpa-safe-upgrade\scripts\CpaStack.Common.ps1'
     . $commonPath
+    Protect-CpaStackPrivateTree -Root $temp
     $locatorPath = Get-CpaStackRootLocatorPath
     $productionLocatorPath = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'CPAStack\root.json'
     Assert-False ([string]::Equals($locatorPath, $productionLocatorPath, [System.StringComparison]::OrdinalIgnoreCase)) 'Adoption tests never use the production root locator'
@@ -54,13 +55,14 @@ param([string]$ControlRoot)
     Manager = [pscustomobject]@{ Healthy = $true }
     Security = [pscustomobject]@{
         RootAcl = [pscustomobject]@{ Protected = $true }
+        ManagerDataTree = [pscustomobject]@{ Protected = $true }
         Integrity = [pscustomobject]@{ Ready = $true }
     }
 } | ConvertTo-Json -Depth 10
 exit 1
 '@ | Set-Content -LiteralPath (Join-Path $harness 'Get-CpaStackState.ps1') -Encoding ASCII
 
-    $fixtureStateOutput = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $harness 'Get-CpaStackState.ps1') -ControlRoot $root 2>&1)
+    $fixtureStateOutput = @(& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $harness 'Get-CpaStackState.ps1') -ControlRoot $root 2>&1)
     Assert-Equal 1 $LASTEXITCODE 'Adoption status fixture preserves the unhealthy pre-adoption exit code'
     Assert-True ($fixtureStateOutput.Count -gt 1) 'Adoption status fixture emits realistic multi-line JSON'
     Assert-Equal '{' ([string]$fixtureStateOutput[0]).Trim() 'Adoption status fixture starts a JSON document on its own line'
@@ -119,8 +121,9 @@ exit 1
             data = Join-Path $root 'data\manager-plus'
         }
     }) -Path (Join-Path $root 'state\current.json')
+    Protect-CpaStackPrivateTree -Root $root
 
-    $output = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $harness 'Adopt-CpaStackLegacyCanonical.ps1') -ControlRoot $root 2>&1)
+    $output = @(& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $harness 'Adopt-CpaStackLegacyCanonical.ps1') -ControlRoot $root 2>&1)
     Assert-Equal 0 $LASTEXITCODE ('Legacy canonical adoption succeeds. Output=' + ($output -join ' | '))
     $jsonLine = @($output | ForEach-Object { [string]$_ } | Where-Object { $_.Trim().StartsWith('{') -and $_.Trim().EndsWith('}') } | Select-Object -Last 1)
     Assert-Equal 1 $jsonLine.Count 'Adoption returns one structured result'
@@ -148,7 +151,7 @@ exit 1
         createdAt = [DateTimeOffset]::Now.ToString('o')
     }) -Path (Join-Path $root 'state\adopt.pending.json')
 
-    $replayOutput = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $harness 'Adopt-CpaStackLegacyCanonical.ps1') -ControlRoot $root 2>&1)
+    $replayOutput = @(& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $harness 'Adopt-CpaStackLegacyCanonical.ps1') -ControlRoot $root 2>&1)
     Assert-Equal 0 $LASTEXITCODE ('Interrupted adoption replay succeeds. Output=' + ($replayOutput -join ' | '))
     $replayedMarker = Read-CpaStackJson -Path (Join-Path $root '.cpa-stack-instance.json')
     Assert-Equal ([string]$current.instanceId) ([string]$replayedMarker.instanceId) 'Adoption replay uses the journal-bound instance id'
@@ -161,7 +164,7 @@ exit 1
     $savedErrorAction = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        $wrongPortOutput = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $harness 'Adopt-CpaStackLegacyCanonical.ps1') -ControlRoot $root 2>&1)
+        $wrongPortOutput = @(& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $harness 'Adopt-CpaStackLegacyCanonical.ps1') -ControlRoot $root 2>&1)
         $wrongPortExitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $savedErrorAction
@@ -178,7 +181,7 @@ exit 1
     $pluginRootJunction = New-Item -ItemType Junction -Path $pluginsRoot -Target $externalPlugins
     $ErrorActionPreference = 'Continue'
     try {
-        $pluginReparseOutput = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $harness 'Adopt-CpaStackLegacyCanonical.ps1') -ControlRoot $root 2>&1)
+        $pluginReparseOutput = @(& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $harness 'Adopt-CpaStackLegacyCanonical.ps1') -ControlRoot $root 2>&1)
         $pluginReparseExitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $savedErrorAction
@@ -197,7 +200,7 @@ exit 1
     $authRootJunction = New-Item -ItemType Junction -Path $authRoot -Target $externalAuth
     $ErrorActionPreference = 'Continue'
     try {
-        $reparseOutput = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $harness 'Adopt-CpaStackLegacyCanonical.ps1') -ControlRoot $root 2>&1)
+        $reparseOutput = @(& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $harness 'Adopt-CpaStackLegacyCanonical.ps1') -ControlRoot $root 2>&1)
         $reparseExitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $savedErrorAction
