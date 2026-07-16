@@ -1,0 +1,170 @@
+$ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'TestHelpers.ps1')
+
+$repo = Split-Path -Parent $PSScriptRoot
+$files = @(Get-ChildItem -LiteralPath $repo -Recurse -File -Force | Where-Object { $_.FullName -notlike '*\.git\*' })
+
+foreach ($file in $files | Where-Object { $_.Extension -eq '.ps1' }) {
+    $tokens = $null
+    $errors = $null
+    [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+    Assert-Equal 0 @($errors).Count "PowerShell parser errors in $($file.FullName)"
+}
+
+$nonAsciiPowerShell = @($files | Where-Object {
+    $_.Extension -eq '.ps1' -and
+    @([System.IO.File]::ReadAllBytes($_.FullName) | Where-Object { $_ -gt 127 }).Count -gt 0
+})
+Assert-Equal 0 $nonAsciiPowerShell.Count 'PowerShell sources remain ASCII-safe for Windows PowerShell 5.1'
+
+$textFiles = @($files | Where-Object {
+    $_.Extension -in @('.ps1', '.psd1', '.md', '.json', '.yaml', '.yml', '.py') -and
+    $_.FullName -ne $PSCommandPath
+})
+$forbiddenPatterns = @(
+    'D:\\Develop',
+    'h00019146',
+    'HIHONOR',
+    'Local\\CPAStackSafeOperation',
+    'HTTP_ADDR\s*=\s*"0\.0\.0\.0:\$TempPort"'
+)
+foreach ($pattern in $forbiddenPatterns) {
+    $matches = @($textFiles | Select-String -Pattern $pattern -ErrorAction SilentlyContinue)
+    Assert-Equal 0 $matches.Count "Forbidden private or unsafe pattern '$pattern'"
+}
+
+$skillRoot = Join-Path $repo 'skills\cpa-safe-upgrade'
+$repoVersion = ([System.IO.File]::ReadAllText((Join-Path $repo 'VERSION'), [System.Text.UTF8Encoding]::new($false, $true))).Trim()
+$skillVersion = ([System.IO.File]::ReadAllText((Join-Path $skillRoot 'VERSION'), [System.Text.UTF8Encoding]::new($false, $true))).Trim()
+Assert-Equal $repoVersion $skillVersion 'Repository and installed-skill VERSION files match'
+$forbiddenSkillFiles = @(Get-ChildItem -LiteralPath $skillRoot -Recurse -File -Force | Where-Object {
+    $_.Name -match '(?i)(secrets\.local|data\.key|usage\.sqlite|\.env$|\.log$)' -or
+    $_.Extension -in @('.exe', '.db', '.sqlite', '.zip')
+})
+Assert-Equal 0 $forbiddenSkillFiles.Count 'Skill package contains runtime, secret, or binary files'
+
+$skill = Get-Content -LiteralPath (Join-Path $skillRoot 'SKILL.md') -Raw -Encoding UTF8
+Assert-True ($skill -match '(?s)^---\s*\r?\nname:\s*cpa-safe-upgrade\s*\r?\ndescription:\s*.+?\r?\n---') 'SKILL.md frontmatter is valid'
+Assert-True ($skill.Length -lt 20000) 'SKILL.md remains concise'
+Assert-False ($skill.Contains('& "$PSScriptRoot\scripts\cpa-stack.ps1"')) 'Interactive examples do not use PSScriptRoot as the skill root'
+Assert-True ($skill.Contains('$skillRoot = Split-Path -Parent')) 'SKILL.md derives an explicit skill root from its own path'
+$skillEntry = '& (Join-Path $skillRoot ''scripts\cpa-stack.ps1'')'
+Assert-Equal 6 ([regex]::Matches($skill, [regex]::Escape($skillEntry)).Count) 'Every interactive command uses the explicit skill root'
+
+$initialize = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts\Initialize-CpaStack.ps1') -Raw -Encoding UTF8
+Assert-False ($initialize -match 'legacyStartScriptSha256\s*=\s*Get-CpaStackFileHash\s+-Path\s+\$LegacyStartScript') 'Legacy start script hash is not computed unconditionally'
+Assert-True ($initialize -match 'legacyStartScriptSha256\s*=\s*if\s*\(\[string\]::IsNullOrWhiteSpace\(\$LegacyStartScript\)\)') 'Legacy start script hash is guarded for an empty path'
+Assert-True ([regex]::Matches($initialize, 'Assert-CpaStackLegacyCpaSource').Count -ge 3) 'Initialization gates the legacy source before journaling, copying, and recovery'
+Assert-True ($initialize -match '\$cpaCandidate\s*=\s*Invoke-InProcessPowerShellJson') 'Initialization captures the completed CPA candidate result'
+Assert-True ($initialize -match 'targetCpaRuntimeManifestSha256\s*=\s*\[string\]\$cpaCandidate\.runtimeManifestSha256') 'Initialization journals the post-candidate runtime digest'
+Assert-True ($initialize -match 'Set-InitializeJournalPhase[\s\S]+Protect-CpaStackSecretFile\s+-Path\s+\$initializeJournalPath') 'Initialization re-protects the journal after every candidate binding update'
+Assert-True ($initialize -match 'ExpectedTargetRuntimeManifestSha256') 'Initialization passes the existing candidate digest into the switch'
+Assert-True ($initialize.LastIndexOf('$result | ConvertTo-Json', [System.StringComparison]::Ordinal) -lt $initialize.LastIndexOf('if (-not $result.success)', [System.StringComparison]::Ordinal)) 'Initialization emits its structured result before a non-zero exit'
+
+$start = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\Start-CPA-Stack.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
+Assert-False ($start -match '\[switch\]\$OperationLockHeld') 'Canonical start has no public lock-bypass switch'
+Assert-True ($start -match '\[System\.IO\.FileStream\]\$OperationLockHandle') 'Recovery start requires a live file-lock capability'
+Assert-True ($start -match '\-RecoveryMode requires a live in-process operation lock handle') 'Recovery mode fails closed without the lock capability'
+Assert-True ($start -match 'LocalAddresses\s*=\s*\$addresses') 'Canonical start retains every listener address'
+Assert-True ($start.IndexOf('Assert-TrustedListener -Listener $listener', [System.StringComparison]::Ordinal) -lt $start.IndexOf('$lastProbe = Get-CpaHealth', [System.StringComparison]::Ordinal)) 'Canonical start validates the CPA listener before sending its API key'
+Assert-True ($start -match 'function Start-ManagedProcess') 'Canonical services start with a controlled environment'
+Assert-False ($start -match 'Start-Process\s+-FilePath\s+\$Settings\.(?:Cpa|Manager)\.Executable') 'Canonical services do not inherit the full parent environment'
+
+$cli = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\cpa-stack.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
+Assert-True ($cli -match 'trustedStartScript\s*=\s*Join-Path\s+\$PSScriptRoot\s+''Start-CPA-Stack\.ps1''') 'Public start executes the bundled trusted launcher'
+
+$common = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\CpaStack.Common.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
+Assert-True ($common -match '&\s+\$gh\.Source\s+api\s+--hostname\s+github\.com') 'GitHub CLI release queries are pinned to github.com'
+Assert-True ($common -match 'maximumReleaseJsonBytes\s*=\s*4194304') 'GitHub release JSON has a 4 MiB safety limit'
+Assert-True ($common.Contains('Invoke-CpaStackSecureDownload -Uri "https://api.github.com/repos/$Repository/releases/latest" -Destination $temp -MaximumBytes $maximumReleaseJsonBytes')) 'Direct GitHub release JSON downloads enforce the streaming limit'
+Assert-True ($common -match 'AllowAutoRedirect\s*=\s*\$false') 'Downloads disable automatic redirects for per-hop validation'
+Assert-True ($common -match 'Copy-CpaStackBoundedStream.+?-MaximumBytes\s+\$MaximumBytes') 'Downloads enforce their byte limit while streaming'
+Assert-True ($common -match "\.partial-'\s*\+\s*\[guid\]") 'Downloads use a unique partial file'
+Assert-True ($common -match 'Remove-Item\s+-LiteralPath\s+\$partial') 'Failed downloads remove their partial file'
+$downloadStart = $common.IndexOf('function Invoke-CpaStackSecureDownload', [System.StringComparison]::Ordinal)
+$downloadEnd = $common.IndexOf('function Assert-CpaStackGitHubRepository', [System.StringComparison]::Ordinal)
+Assert-True ($downloadStart -ge 0 -and $downloadEnd -gt $downloadStart) 'Secure downloader source boundaries are present'
+$downloadSource = $common.Substring($downloadStart, $downloadEnd - $downloadStart)
+Assert-False ($downloadSource -match 'Invoke-WebRequest|curl\.exe') 'Secure downloads have no unvalidated fallback transport'
+Assert-True ($common -match 'function Read-CpaStackSecretJson') 'Secrets use a dedicated fixed-error JSON reader'
+Assert-True ($common -match 'function Wait-CpaStackTrustedListener') 'Credentialed probes have a trusted-listener gate'
+Assert-True ($common -match 'function Sync-CpaStackCanonicalLauncher') 'Updater refreshes the canonical desktop launcher target'
+Assert-True ($common -match '\[switch\]\$MinimalEnvironment') 'Candidate process launcher supports a minimal environment'
+Assert-True ($common -match 'function Get-CpaStackWindowsPowerShellModulePath') 'Windows PowerShell child processes use deterministic compatible module paths'
+Assert-True ($common -match '\$proxyUri\.UserInfo') 'Managed process proxy URLs reject embedded credentials'
+Assert-True ($common -match 'function Protect-CpaStackPrivateTree') 'CPA auth trees receive recursive ACL and reparse protection'
+Assert-True ($common -match 'function Assert-CpaStackPrivateTree') 'Executable plugin trees receive recursive owner and ACL validation'
+Assert-True ($common -match 'function Copy-CpaStackPluginTree') 'Plugin copies use a fail-closed protected-tree helper'
+Assert-True ($common -match 'function Assert-CpaStackLegacyCpaSource') 'Legacy sensitive trees have a read-compatible mutable-access gate'
+Assert-True ($common -match 'function Assert-CpaStackLegacyAncestorAcl') 'Legacy source ancestors are checked for subtree replacement rights'
+Assert-True ($common -match 'function Get-CpaStackTreeManifest') 'Candidate runtimes have a recursive content manifest'
+
+$stateScript = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\Get-CpaStackState.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
+Assert-True ([regex]::Matches($stateScript, 'LocalAddresses\s*=\s*@\(\$_\.LocalAddresses\)').Count -ge 2) 'Status preserves CPA and Manager listener addresses'
+Assert-True ($stateScript -match '\$listenerTrusted\s*=\s*\(\$pathMatches\s+-and\s+\$addressMatches\s+-and\s+\$hashMatches\)') 'Canonical status listener trust includes path, address, and current hash'
+Assert-True ($stateScript -match 'SecretsState\.Safe\.Ready\s+-and\s+\$listenerTrusted') 'Canonical status validates listener trust before credentialed probes'
+Assert-True ($stateScript -match "migrationStatus\s+-in\s+@\('ready', 'migrated'\)") 'Status accepts the latest Manager completed-migration state'
+Assert-True ($stateScript -match "runtime\\cli-proxy-api\\plugins") 'Status recursively includes the optional CPA plugins tree in root security'
+Assert-True ($stateScript -match '\$privateTreePaths\s+-icontains\s+\$path') 'Status rejects inherited ACLs inside auth and plugins trees'
+Assert-True ($start -match "migrationStatus\s+-in\s+@\('ready', 'migrated'\)") 'Canonical start accepts the latest Manager completed-migration state'
+Assert-True ($start -match 'Assert-PrivateCpaTree\s+-Root\s+\$pluginsRoot') 'Canonical start validates optional plugins before launching CPA'
+
+$testCpaCandidate = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\Test-CpaCandidate.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
+Assert-True ($testCpaCandidate.IndexOf('Wait-CpaStackTrustedListener', [System.StringComparison]::Ordinal) -lt $testCpaCandidate.IndexOf('Get-CpaStackSecrets', [System.StringComparison]::Ordinal)) 'CPA candidate listener is trusted before secrets are loaded and sent'
+Assert-True ($testCpaCandidate -match 'Start-CpaStackProcess.+-MinimalEnvironment') 'CPA candidate receives only the approved environment allowlist'
+Assert-True ($testCpaCandidate.IndexOf('WaitForExit(10000)', [System.StringComparison]::Ordinal) -lt $testCpaCandidate.IndexOf('Get-CpaStackTreeManifest -Root $CandidateRuntime', [System.StringComparison]::Ordinal)) 'Candidate manifest is captured only after its process exits'
+
+$testManagerCandidate = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\Test-ManagerCandidate.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
+Assert-True ($testManagerCandidate.IndexOf('    Assert-FormalManagerListener', [System.StringComparison]::Ordinal) -lt $testManagerCandidate.IndexOf('$formalBaseline = Get-CpaStackManagerSetupBaseline', [System.StringComparison]::Ordinal)) 'Formal Manager listener is trusted before its baseline credential is sent'
+Assert-True ($testManagerCandidate.IndexOf('Wait-CpaStackTrustedListener -Port $TempPort', [System.StringComparison]::Ordinal) -lt $testManagerCandidate.IndexOf('Set-CpaStackManagerCollector -ManagerPort $TempPort', [System.StringComparison]::Ordinal)) 'Manager candidate listener is trusted before setup secrets are sent'
+Assert-True ($testManagerCandidate -match 'Start-CpaStackProcess.+-MinimalEnvironment') 'Manager candidate receives only the approved environment allowlist'
+
+$switchCpa = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\Switch-CpaRuntime.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
+Assert-True ($switchCpa.IndexOf('Wait-CpaStackTrustedListener', [System.StringComparison]::Ordinal) -lt $switchCpa.IndexOf('Get-CpaStackSecrets', [System.StringComparison]::Ordinal)) 'Formal CPA listener is trusted before switch validation sends secrets'
+Assert-True ($switchCpa -match 'Start-CpaStackProcess.+-MinimalEnvironment') 'Formal CPA does not inherit unrelated parent secrets'
+Assert-True ($switchCpa -match 'Assert-CpaStackPrivateTree\s+-Root\s+\$sourcePlugins') 'CPA switch validates preserved plugins before stopping the source service'
+Assert-True ($switchCpa -match 'A non-in-place CPA migration must start the exact candidate runtime that was tested') 'Non-in-place switching requires CandidatePackageRoot to equal TargetRuntime'
+Assert-True ([regex]::Matches($switchCpa, 'Get-CpaStackTreeManifest\s+-Root\s+\$TargetRuntime').Count -ge 2) 'Non-in-place switching checks the target manifest before and after stopping legacy CPA'
+Assert-False ($switchCpa -match 'Copy-Item\s+-LiteralPath\s+\$SourceConfig\s+-Destination\s+\$targetConfig') 'Non-in-place switching never recopies the untested legacy config'
+Assert-False ($switchCpa -match 'Copy-CpaStackAuthTree\s+-Source\s+\(Join-Path\s+\$SourceRuntime') 'Non-in-place switching never recopies live legacy auth'
+Assert-False ($switchCpa -match 'Copy-CpaStackPluginTree\s+-Source\s+\$sourcePlugins') 'Non-in-place switching never recopies live legacy plugins'
+
+$switchManager = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\Switch-ManagerRuntime.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
+Assert-True ($switchManager.IndexOf('Wait-CpaStackTrustedListener -Port $ManagerPort', [System.StringComparison]::Ordinal) -lt $switchManager.IndexOf('Invoke-CpaStackHttpJson -Uri "http://127.0.0.1:$ManagerPort/usage-service/info"', [System.StringComparison]::Ordinal)) 'Formal Manager listener is trusted before switch validation sends secrets'
+Assert-True ($switchManager -match 'Start-CpaStackProcess.+-MinimalEnvironment') 'Formal Manager does not inherit unrelated parent secrets'
+
+$upgrade = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\Invoke-CpaStackUpgrade.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
+Assert-True ($upgrade -match 'DeferFinalCommit') 'Upgrade defers switch journal cleanup until current state is committed'
+Assert-True ($upgrade -match 'AllowUnknownVersionReplacement') 'Unknown-version replacement is explicit'
+Assert-True ($upgrade.IndexOf('Set-UpgradeJournalPhase -Phase "testing-manager"', [System.StringComparison]::Ordinal) -lt $upgrade.IndexOf('Set-UpgradeJournalPhase -Phase "switching-cpa"', [System.StringComparison]::Ordinal)) 'Both component candidates are tested before the first formal switch'
+Assert-True ($upgrade -match 'Immediate switch recovery failed') 'Outer switch failures attempt immediate in-process recovery before returning'
+Assert-True ($upgrade -match 'Copy-CpaStackPluginTree\s+-Source\s+\$plugins') 'CPA candidate preparation copies plugins through the protected-tree helper'
+Assert-True ($upgrade -match 'Assert-CpaStackPrivateTree\s+-Root\s+\$activePlugins') 'Top-level upgrade fails closed on an unsafe preserved plugins tree'
+Assert-False ($upgrade -match 'Protect-CpaStackPrivateTree\s+-Root\s+\$activePlugins') 'Top-level upgrade does not erase evidence of an unsafe plugins ACL'
+Assert-True ($upgrade.LastIndexOf('$result | ConvertTo-Json', [System.StringComparison]::Ordinal) -lt $upgrade.LastIndexOf('if (-not $result.success)', [System.StringComparison]::Ordinal)) 'Upgrade emits its structured result before a non-zero exit'
+foreach ($journalScript in @('Adopt-CpaStackLegacyCanonical.ps1', 'Initialize-CpaStack.ps1', 'Invoke-CpaStackUpgrade.ps1', 'Switch-CpaRuntime.ps1', 'Switch-ManagerRuntime.ps1')) {
+    $journalText = [System.IO.File]::ReadAllText((Join-Path $skillRoot ('scripts\' + $journalScript)), [System.Text.UTF8Encoding]::new($false, $true))
+    Assert-True ($journalText -match 'instanceId') "$journalScript binds state or journals to the instance marker"
+}
+$adoption = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\Adopt-CpaStackLegacyCanonical.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
+Assert-True ($adoption -match 'adopt\.pending\.json') 'Legacy canonical adoption is journaled'
+Assert-True ($adoption -match 'Assert-LegacyCanonicalLayout') 'Legacy canonical adoption validates fixed paths and hashes'
+Assert-True ($adoption -match 'Protect-CpaStackPrivateTree\s+-Root\s+\$layout\.auth') 'Legacy canonical adoption hardens the full CPA auth tree'
+Assert-True ($adoption -match 'Protect-CpaStackPrivateTree\s+-Root\s+\$layout\.plugins') 'Legacy canonical adoption hardens the optional CPA plugins tree'
+Assert-True ($adoption.LastIndexOf('$result | ConvertTo-Json', [System.StringComparison]::Ordinal) -lt $adoption.LastIndexOf('if (-not $result.success)', [System.StringComparison]::Ordinal)) 'Adoption emits its structured result before a non-zero exit'
+
+$agent = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'agents\openai.yaml'), [System.Text.UTF8Encoding]::new($false, $true))
+Assert-True ($agent -match '\$cpa-safe-upgrade') 'openai.yaml default prompt names the skill'
+
+$installer = [System.IO.File]::ReadAllText((Join-Path $repo 'install.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
+Assert-True ($installer -match 'stableCliPath') 'Installer returns the stable human CLI path'
+Assert-True ($installer -match 'stableUninstallPath') 'Installer returns an installed uninstall path'
+
+$workflow = [System.IO.File]::ReadAllText((Join-Path $repo '.github\workflows\ci.yml'), [System.Text.UTF8Encoding]::new($false, $true))
+Assert-True ($workflow -match "tags:\s*\['v\*'\]") 'CI runs for release tags'
+Assert-True ($workflow -match 'actions/setup-python@') 'CI installs a pinned Python runtime'
+
+$testAll = [System.IO.File]::ReadAllText((Join-Path $repo 'tools\Test-All.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
+Assert-True ($testAll -match 'Get-Command\s+python\s+-ErrorAction\s+Stop') 'Full tests fail when Python is unavailable'
+
+'Static tests passed.'

@@ -1,0 +1,32 @@
+# CPA runtime and private data
+**/secrets.local.json
+**/data.key
+**/*.sqlite
+**/*.sqlite-wal
+**/*.sqlite-shm
+**/auth/
+**/logs/
+**/work/
+**/rollback/
+**/runtime/
+**/releases/
+
+# Downloaded or generated artifacts
+*.exe
+*.zip
+*.tar.gz
+*.log
+*.tmp
+*.bak
+*.previous
+artifacts/
+dist/
+
+# Tooling
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Version contract
+        shell: pwsh
+        run: .\tools\Test-ReleaseVersion.ps1
+
+      - name: Windows PowerShell 5.1
+        shell: powershell
+        run: .\tools\Test-All.ps1
+
+      - name: PowerShell 7
+        shell: pwsh
+        run: .\tools\Test-All.ps1

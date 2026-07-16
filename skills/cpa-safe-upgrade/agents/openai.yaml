@@ -1,0 +1,4 @@
+interface:
+  display_name: "CPA Safe Upgrade"
+  short_description: "安全迁移并自动升级 CPA 与 Manager Plus"
+  default_prompt: "使用 $cpa-safe-upgrade 发现我的 CPA 安装，并执行可回滚的安全自动升级。"
