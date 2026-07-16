@@ -1,5 +1,9 @@
 # 更新记录
 
+## 0.1.3 - 2026-07-16
+
+- 修复已登记 canonical root 位于普通开发目录时无法更新 Skill 的问题。canonical 更新继续逐项校验 root、state、launcher 的 owner/ACL 与 reparse 属性，不再把 root 之外的父目录 ACL 当作安装门禁；legacy 迁移来源的祖先检查保持不变。
+
 ## 0.1.2 - 2026-07-16
 
 - 修复长驻 CPA/Manager 继承嵌套 PowerShell 输出管道的问题；托管进程以无控制台窗口方式启动，且只继承指向 Windows `NUL` 的 stdin/stdout/stderr，升级结果不再等待正式服务退出才返回。

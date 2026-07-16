@@ -201,29 +201,6 @@ try {
         Protect-CpaStackSecretFile -Path $protectedFile
     }
 
-    $stackParent = Split-Path -Parent $customStackRoot
-    Protect-CpaStackPrivateDirectory -Path $stackParent
-    $stackParentSddl = (Get-Acl -LiteralPath $stackParent).Sddl
-    $installedHashBeforeAncestorDrift = Get-CpaStackFileHash -Path (Join-Path $installed 'SKILL.md')
-    try {
-        $driftedParentAcl = Get-Acl -LiteralPath $stackParent
-        $parentReplacementRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-            [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'),
-            [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles,
-            [System.Security.AccessControl.AccessControlType]::Allow
-        )
-        [void]$driftedParentAcl.AddAccessRule($parentReplacementRule)
-        Set-Acl -LiteralPath $stackParent -AclObject $driftedParentAcl
-        Assert-ThrowsMatch {
-            & $installScript -CodexHome $temp
-        } 'replace descendants' 'Parameterless update rejects a parent ACL that lets Everyone replace the canonical root'
-        Assert-Equal $installedHashBeforeAncestorDrift (Get-CpaStackFileHash -Path (Join-Path $installed 'SKILL.md')) 'Ancestor ACL preflight failure leaves the installed skill unchanged'
-    } finally {
-        $restoredParentAcl = Get-Acl -LiteralPath $stackParent
-        $restoredParentAcl.SetSecurityDescriptorSddlForm($stackParentSddl)
-        Set-Acl -LiteralPath $stackParent -AclObject $restoredParentAcl
-    }
-
     $installedHashBeforeAclDrift = Get-CpaStackFileHash -Path (Join-Path $installed 'SKILL.md')
     $opsPath = Join-Path $customStackRoot 'ops'
     $driftedOpsAcl = Get-Acl -LiteralPath $opsPath

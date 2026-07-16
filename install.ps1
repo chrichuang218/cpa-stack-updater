@@ -458,7 +458,6 @@ function Assert-AdoptedCanonicalInstallRoot {
     param([Parameter(Mandatory = $true)][string]$ControlRoot)
 
     $root = Assert-CpaStackSecureLocalRoot -Path $ControlRoot
-    Assert-CpaStackLegacyAncestorAcl -Path $root -Description 'Canonical stack ancestor'
     $opsPath = Join-Path $root 'ops'
     $statePath = Join-Path $root 'state'
     $markerPath = Join-Path $root '.cpa-stack-instance.json'
