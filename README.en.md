@@ -117,7 +117,7 @@ Example prompt:
 
 The Skill calls the same `cpa-stack.ps1` interface as human users. It does not improvise stop/copy/start commands.
 
-To update the updater, download a newer Release and run `install.ps1` again; the installer atomically replaces the same stable path. The original ZIP is not needed for uninstall:
+To update the updater, download a newer Release and run `install.ps1` again; the installer atomically replaces the same stable path. If it reports that the Skill directory is in use, close editors viewing the installed `SKILL.md` or terminals whose working directory is inside that Skill, then retry. The installer never terminates those processes and preserves the current Skill and rollback slot on failure. A result with `success=true` and `complete=false` means the new Skill was committed but launcher, root-locator, or old-slot cleanup returned explicit `postCommitWarnings`; resolve that lock or ACL issue and run the installer again. The original ZIP is not needed for uninstall:
 
 ```powershell
 $uninstaller = Join-Path $codexHome 'skills\cpa-safe-upgrade\scripts\Uninstall-CpaSafeUpgrade.ps1'

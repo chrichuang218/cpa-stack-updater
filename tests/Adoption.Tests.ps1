@@ -1,21 +1,25 @@
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'TestHelpers.ps1')
 
-$repo = Split-Path -Parent $PSScriptRoot
-$commonPath = Join-Path $repo 'skills\cpa-safe-upgrade\scripts\CpaStack.Common.ps1'
-. $commonPath
-
+$sourceRepo = Split-Path -Parent $PSScriptRoot
 $temp = Join-Path ([System.IO.Path]::GetTempPath()) ('cpa-adoption-tests-' + [guid]::NewGuid().ToString('N'))
+$fixtureRepo = Join-Path $temp 'repository'
+$fixtureLocalAppData = Join-Path $temp 'local-app-data'
 $harness = Join-Path $temp 'harness'
 $root = Join-Path $temp 'legacy canonical root'
-$locatorPath = Get-CpaStackRootLocatorPath
-$locatorExisted = Test-Path -LiteralPath $locatorPath -PathType Leaf
-$locatorBytes = if ($locatorExisted) { [System.IO.File]::ReadAllBytes($locatorPath) } else { $null }
-$locatorSddl = if ($locatorExisted) { (Get-Acl -LiteralPath $locatorPath).Sddl } else { $null }
 $previousFixtureRoot = [Environment]::GetEnvironmentVariable('CPA_STACK_ADOPTION_TEST_ROOT', 'Process')
 $pluginRootJunction = $null
 $authRootJunction = $null
 try {
+    New-Item -ItemType Directory -Force -Path $temp | Out-Null
+    $fixture = New-CpaStackUpdaterTestFixture -SourceRepository $sourceRepo -DestinationRepository $fixtureRepo -LocalAppDataRoot $fixtureLocalAppData
+    $repo = $fixture.Repository
+    $commonPath = Join-Path $repo 'skills\cpa-safe-upgrade\scripts\CpaStack.Common.ps1'
+    . $commonPath
+    $locatorPath = Get-CpaStackRootLocatorPath
+    $productionLocatorPath = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'CPAStack\root.json'
+    Assert-False ([string]::Equals($locatorPath, $productionLocatorPath, [System.StringComparison]::OrdinalIgnoreCase)) 'Adoption tests never use the production root locator'
+    Assert-True ([System.IO.Path]::GetFullPath($locatorPath).StartsWith($fixture.LocalAppData + '\', [System.StringComparison]::OrdinalIgnoreCase)) 'Adoption tests keep the root locator inside isolated LocalApplicationData'
     New-Item -ItemType Directory -Force -Path $harness | Out-Null
     foreach ($name in @('CpaStack.Common.ps1', 'Adopt-CpaStackLegacyCanonical.ps1', 'Start-CPA-Stack.ps1')) {
         Copy-Item -LiteralPath (Join-Path $repo ('skills\cpa-safe-upgrade\scripts\' + $name)) -Destination $harness
@@ -207,15 +211,7 @@ exit 1
             [System.IO.Directory]::Delete($junction.FullName)
         }
     }
-    if ($locatorExisted) {
-        [System.IO.File]::WriteAllBytes($locatorPath, $locatorBytes)
-        $restoredAcl = Get-Acl -LiteralPath $locatorPath
-        $restoredAcl.SetSecurityDescriptorSddlForm($locatorSddl)
-        Set-Acl -LiteralPath $locatorPath -AclObject $restoredAcl
-    } elseif (Test-Path -LiteralPath $locatorPath -PathType Leaf) {
-        Remove-Item -LiteralPath $locatorPath -Force
-    }
-    if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Recurse -Force }
+    if (Test-Path -LiteralPath $temp) { Remove-TestPathWithRetry -Path $temp }
 }
 
 'Adoption tests passed.'

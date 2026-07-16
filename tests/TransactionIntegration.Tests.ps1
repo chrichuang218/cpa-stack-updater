@@ -17,7 +17,8 @@ $commonScript = Join-Path $scriptRoot 'CpaStack.Common.ps1'
 $switchCpaScript = Join-Path $scriptRoot 'Switch-CpaRuntime.ps1'
 $testCpaScript = Join-Path $scriptRoot 'Test-CpaCandidate.ps1'
 $switchManagerScript = Join-Path $scriptRoot 'Switch-ManagerRuntime.ps1'
-$startStackScript = Join-Path $scriptRoot 'Start-CPA-Stack.ps1'
+$isolatedStartStackScript = $null
+$isolatedLocalAppData = $null
 
 . $commonScript
 
@@ -772,7 +773,7 @@ function Invoke-PendingJournalStartupGateTest {
     Copy-Item -LiteralPath $OldBinary -Destination $managerExe
     Write-CpaConfig -Path (Join-Path $cpaRuntime 'config.yaml') -Port $cpaPort
     Write-StackConfig -Path (Join-Path $root 'config\stack.psd1') -CpaPort $cpaPort -ManagerPort $managerPort
-    Copy-Item -LiteralPath $startStackScript -Destination (Join-Path $root 'ops\Start-CPA-Stack.ps1')
+    Copy-Item -LiteralPath $isolatedStartStackScript -Destination (Join-Path $root 'ops\Start-CPA-Stack.ps1')
     [void](Write-TestSecrets -ControlRoot $root -Protect)
     Write-CpaStackJson -Value ([ordered]@{
         schemaVersion = 1
@@ -810,16 +811,24 @@ function Invoke-PendingJournalStartupGateTest {
 
     $failure = $null
     try {
-        & $startStackScript -ConfigPath (Join-Path $root 'config\stack.psd1') -SecretsPath (Join-Path $root 'config\secrets.local.json') -NoBrowser -InProcess | Out-Null
+        & $isolatedStartStackScript -ConfigPath (Join-Path $root 'config\stack.psd1') -SecretsPath (Join-Path $root 'config\secrets.local.json') -NoBrowser -InProcess | Out-Null
     } catch {
         $failure = $_.Exception.Message
     }
     Assert-True -Condition ($failure -match 'interrupted CPA stack transaction') -Message "standalone startup should refuse a pending transaction journal. Failure=[$failure]"
+    Assert-True -Condition (Test-Path -LiteralPath (Join-Path $isolatedLocalAppData 'CPAStack\locks\CPAStackSafeOperation.lock') -PathType Leaf) -Message 'pending journal startup gate should use the isolated operation lock'
     Assert-True -Condition ($null -eq (Get-CpaStackListener -Port $cpaPort)) -Message 'pending journal gate should not start CPA'
     Assert-True -Condition ($null -eq (Get-CpaStackListener -Port $managerPort)) -Message 'pending journal gate should not start Manager'
 }
 
 try {
+    New-Item -ItemType Directory -Force -Path $testRunRoot | Out-Null
+    $transactionFixture = New-CpaStackUpdaterTestFixture `
+        -SourceRepository $repo `
+        -DestinationRepository (Join-Path $testRunRoot 'repository') `
+        -LocalAppDataRoot (Join-Path $testRunRoot 'local-app-data')
+    $isolatedStartStackScript = Join-Path $transactionFixture.Repository 'skills\cpa-safe-upgrade\scripts\Start-CPA-Stack.ps1'
+    $isolatedLocalAppData = $transactionFixture.LocalAppData
     New-Item -ItemType Directory -Force -Path $compileRoot | Out-Null
     $oldBinary = Join-Path $compileRoot 'fixture-old.exe'
     $newBinary = Join-Path $compileRoot 'fixture-new.exe'

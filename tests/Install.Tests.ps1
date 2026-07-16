@@ -1,20 +1,26 @@
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'TestHelpers.ps1')
 
-$repo = Split-Path -Parent $PSScriptRoot
-$installScript = Join-Path $repo 'install.ps1'
-$uninstallScript = Join-Path $repo 'uninstall.ps1'
-$expectedVersion = (Get-Content -Raw -LiteralPath (Join-Path $repo 'VERSION')).Trim()
-$commonPath = Join-Path $repo 'skills\cpa-safe-upgrade\scripts\CpaStack.Common.ps1'
-. $commonPath
-
+$sourceRepo = Split-Path -Parent $PSScriptRoot
+$expectedVersion = (Get-Content -Raw -LiteralPath (Join-Path $sourceRepo 'VERSION')).Trim()
 $temp = Join-Path ([System.IO.Path]::GetTempPath()) ('cpa-install-tests-' + [guid]::NewGuid().ToString('N'))
-$locatorPath = Get-CpaStackRootLocatorPath
-$locatorExisted = Test-Path -LiteralPath $locatorPath -PathType Leaf
-$locatorBytes = if ($locatorExisted) { [System.IO.File]::ReadAllBytes($locatorPath) } else { $null }
-$locatorSddl = if ($locatorExisted) { (Get-Acl -LiteralPath $locatorPath).Sddl } else { $null }
+$stackTestParent = Join-Path $HOME ('.cpa-stack-install-tests-' + [guid]::NewGuid().ToString('N'))
+$fixtureRepo = Join-Path $temp 'repository'
+$fixtureLocalAppData = Join-Path $temp 'local-app-data'
+$codexHomeJunction = $null
 try {
     New-Item -ItemType Directory -Force -Path $temp | Out-Null
+    $fixture = New-CpaStackUpdaterTestFixture -SourceRepository $sourceRepo -DestinationRepository $fixtureRepo -LocalAppDataRoot $fixtureLocalAppData
+    $repo = $fixture.Repository
+    $installScript = Join-Path $repo 'install.ps1'
+    $uninstallScript = Join-Path $repo 'uninstall.ps1'
+    $commonPath = Join-Path $repo 'skills\cpa-safe-upgrade\scripts\CpaStack.Common.ps1'
+    . $commonPath
+    $locatorPath = Get-CpaStackRootLocatorPath
+    $productionLocatorPath = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'CPAStack\root.json'
+    Assert-False ([string]::Equals($locatorPath, $productionLocatorPath, [System.StringComparison]::OrdinalIgnoreCase)) 'Install tests never use the production root locator'
+    Assert-True ([System.IO.Path]::GetFullPath($locatorPath).StartsWith($fixture.LocalAppData + '\', [System.StringComparison]::OrdinalIgnoreCase)) 'Install tests keep the root locator inside isolated LocalApplicationData'
+    Protect-CpaStackPrivateDirectory -Path $stackTestParent
     $usedRoots = @(Get-PSDrive -PSProvider FileSystem | ForEach-Object { $_.Name.ToUpperInvariant() })
     $unusedLetter = @('Q', 'Y', 'X', 'W') | Where-Object { $usedRoots -notcontains $_ } | Select-Object -First 1
     if ($unusedLetter) {
@@ -24,7 +30,50 @@ try {
         } 'Installer rejects a missing target drive before swapping the skill'
         Assert-False (Test-Path -LiteralPath (Join-Path $invalidHome 'skills\cpa-safe-upgrade')) 'Failed root validation leaves no installed skill'
     }
-    $customStackRoot = Join-Path $temp 'managed stack root'
+
+    $lockedHome = Join-Path $temp 'locked-legacy-home'
+    $lockedSkillsRoot = Join-Path $lockedHome 'skills'
+    $lockedInstalled = Join-Path $lockedSkillsRoot 'cpa-safe-upgrade'
+    $lockedPrevious = Join-Path $lockedSkillsRoot 'cpa-safe-upgrade.previous'
+    $sourceSkill = Join-Path $repo 'skills\cpa-safe-upgrade'
+    New-Item -ItemType Directory -Force -Path $lockedSkillsRoot | Out-Null
+    Copy-Item -LiteralPath $sourceSkill -Destination $lockedInstalled -Recurse
+    Copy-Item -LiteralPath $sourceSkill -Destination $lockedPrevious -Recurse
+    Write-CpaStackJson -Value ([ordered]@{
+        schemaVersion = 1
+        product = 'cpa-stack-updater'
+        skill = 'cpa-safe-upgrade'
+        updaterVersion = $expectedVersion
+        installedAt = [DateTimeOffset]::Now.ToString('o')
+    }) -Path (Join-Path $lockedPrevious '.cpa-stack-updater-installed.json')
+    $previousSentinel = Join-Path $lockedPrevious 'previous-sentinel.txt'
+    Set-Content -LiteralPath $previousSentinel -Value 'preserve-existing-previous' -Encoding ASCII
+
+    $legacyLock = [System.IO.File]::Open(
+        (Join-Path $lockedInstalled 'SKILL.md'),
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        [System.IO.FileShare]::Read
+    )
+    try {
+        Assert-ThrowsMatch {
+            & $installScript -CodexHome $lockedHome -StackRoot (Join-Path $temp 'locked managed root')
+        } 'Close editors or terminals' 'Installer gives actionable guidance when an editor prevents replacing the legacy skill'
+        Assert-False (Test-Path -LiteralPath (Join-Path $lockedInstalled '.cpa-stack-updater-installed.json')) 'A failed locked legacy install leaves no ownership marker behind'
+        Assert-True (Test-Path -LiteralPath $previousSentinel -PathType Leaf) 'A failed locked legacy install preserves the existing previous slot'
+        Assert-Equal 'preserve-existing-previous' (Get-Content -Raw -LiteralPath $previousSentinel).Trim() 'The existing previous slot is not changed before the installed skill can move'
+    } finally {
+        $legacyLock.Dispose()
+    }
+
+    $unlockedResult = (& $installScript -CodexHome $lockedHome -StackRoot (Join-Path $temp 'locked managed root')) | ConvertFrom-Json
+    Assert-True ([bool]$unlockedResult.success) 'Installer succeeds after the editor lock is released'
+    Assert-True (Test-Path -LiteralPath (Join-Path $lockedInstalled '.cpa-stack-updater-installed.json') -PathType Leaf) 'Successful retry installs an owned skill'
+    Assert-True (Test-Path -LiteralPath (Join-Path $lockedPrevious '.cpa-stack-updater-installed.json') -PathType Leaf) 'Successful retry claims the retired legacy skill only after it moved'
+    $leftoverTransactionSlots = @(Get-ChildItem -LiteralPath $lockedSkillsRoot -Directory -Force | Where-Object { $_.Name -match '^cpa-safe-upgrade\.(?:staging|retained|retiring)-' })
+    Assert-Equal 0 $leftoverTransactionSlots.Count 'Successful retry leaves no transaction directories'
+
+    $customStackRoot = Join-Path $stackTestParent 'managed stack root'
     $resultText = & $installScript -CodexHome $temp -StackRoot $customStackRoot
     $result = $resultText | ConvertFrom-Json
     Assert-True ([bool]$result.success) 'Installer reports success'
@@ -44,6 +93,59 @@ try {
     Assert-Equal 'cpa-stack-updater' $marker.product 'Ownership marker names the product'
     Assert-Equal 'cpa-safe-upgrade' $marker.skill 'Ownership marker names the skill'
     Assert-Equal $expectedVersion $marker.updaterVersion 'Ownership marker records the updater version'
+
+    $staleRetained = Join-Path $temp 'skills\cpa-safe-upgrade.retained-00000000000000000000000000000001'
+    New-Item -ItemType Directory -Path $staleRetained | Out-Null
+    foreach ($item in Get-ChildItem -LiteralPath $installed -Force) {
+        Copy-Item -LiteralPath $item.FullName -Destination (Join-Path $staleRetained $item.Name) -Recurse -Force
+    }
+    $staleMarkerPath = Join-Path $staleRetained '.cpa-stack-updater-installed.json'
+    Assert-True (Test-Path -LiteralPath $staleMarkerPath -PathType Leaf) 'Synthetic retained slot copies its ownership marker'
+    $staleMarker = Read-CpaStackJson -Path $staleMarkerPath
+    Assert-Equal 'cpa-stack-updater' $staleMarker.product 'Synthetic retained slot has a valid product marker'
+    Assert-Equal 'cpa-safe-upgrade' $staleMarker.skill 'Synthetic retained slot has a valid skill marker'
+    $installedHashBeforeStaleCleanup = Get-CpaStackFileHash -Path (Join-Path $installed 'SKILL.md')
+    $staleRetainedLock = [System.IO.File]::Open(
+        (Join-Path $staleRetained 'SKILL.md'),
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        [System.IO.FileShare]::Read
+    )
+    try {
+        Assert-ThrowsMatch {
+            & $installScript -CodexHome $temp -StackRoot $customStackRoot
+        } 'stale retained transaction directory' 'Installer blocks before swap when an older retained slot is still locked'
+    } finally {
+        $staleRetainedLock.Dispose()
+    }
+    Assert-Equal $installedHashBeforeStaleCleanup (Get-CpaStackFileHash -Path (Join-Path $installed 'SKILL.md')) 'Failed stale-slot cleanup leaves the active skill unchanged'
+    Assert-False (Test-Path -LiteralPath (Join-Path $temp 'skills\cpa-safe-upgrade.previous')) 'Failed stale-slot cleanup does not rotate the rollback slot'
+    Assert-True (Test-Path -LiteralPath $staleMarkerPath -PathType Leaf) 'Partial stale-slot cleanup preserves ownership evidence for a safe retry'
+    $staleCleanupRetry = (& $installScript -CodexHome $temp -StackRoot $customStackRoot) | ConvertFrom-Json
+    Assert-True ([bool]$staleCleanupRetry.success) 'Retry succeeds after the stale retained slot is unlocked'
+    Assert-True ([bool]$staleCleanupRetry.complete) 'Retry reports complete only after all stale retained slots are gone'
+    Assert-False (Test-Path -LiteralPath $staleRetained) 'Retry removes the stale retained slot'
+
+    $emptyRetained = Join-Path $temp 'skills\cpa-safe-upgrade.retained-00000000000000000000000000000003'
+    New-Item -ItemType Directory -Path $emptyRetained | Out-Null
+    foreach ($item in Get-ChildItem -LiteralPath $installed -Force) {
+        Copy-Item -LiteralPath $item.FullName -Destination (Join-Path $emptyRetained $item.Name) -Recurse -Force
+    }
+    $installedHashBeforeDirectoryLock = Get-CpaStackFileHash -Path (Join-Path $installed 'SKILL.md')
+    $retainedDirectoryHandle = Open-TestDirectoryWithoutDeleteShare -Path $emptyRetained
+    try {
+        Assert-ThrowsMatch {
+            & $installScript -CodexHome $temp -StackRoot $customStackRoot
+        } 'stale retained transaction directory' 'Installer reports a directory-handle cleanup failure before swap'
+    } finally {
+        $retainedDirectoryHandle.Dispose()
+    }
+    Assert-Equal $installedHashBeforeDirectoryLock (Get-CpaStackFileHash -Path (Join-Path $installed 'SKILL.md')) 'Directory-handle cleanup failure leaves the active skill unchanged'
+    Assert-True (Test-Path -LiteralPath $emptyRetained -PathType Container) 'Locked transaction root remains for retry'
+    Assert-Equal 0 (@(Get-ChildItem -LiteralPath $emptyRetained -Force).Count) 'Failed final directory removal leaves only an empty fixed transaction root'
+    $emptyCleanupRetry = (& $installScript -CodexHome $temp -StackRoot $customStackRoot) | ConvertFrom-Json
+    Assert-True ([bool]$emptyCleanupRetry.complete) 'Retry safely removes an empty fixed transaction root'
+    Assert-False (Test-Path -LiteralPath $emptyRetained) 'Empty transaction root is gone after retry'
 
     $unprotectedLocatorAcl = Get-Acl -LiteralPath $locatorPath
     $unprotectedLocatorAcl.SetAccessRuleProtection($false, $true)
@@ -88,6 +190,56 @@ try {
         canonicalRoot = $customStackRoot
     }) -Path (Join-Path $customStackRoot 'state\current.json')
 
+    Protect-CpaStackPrivateDirectory -Path $customStackRoot
+    Protect-CpaStackPrivateDirectory -Path (Join-Path $customStackRoot 'ops')
+    Protect-CpaStackPrivateDirectory -Path (Join-Path $customStackRoot 'state')
+    foreach ($protectedFile in @(
+        (Join-Path $customStackRoot '.cpa-stack-instance.json'),
+        (Join-Path $customStackRoot 'state\current.json'),
+        (Join-Path $customStackRoot 'ops\Start-CPA-Stack.ps1')
+    )) {
+        Protect-CpaStackSecretFile -Path $protectedFile
+    }
+
+    $stackParent = Split-Path -Parent $customStackRoot
+    Protect-CpaStackPrivateDirectory -Path $stackParent
+    $stackParentSddl = (Get-Acl -LiteralPath $stackParent).Sddl
+    $installedHashBeforeAncestorDrift = Get-CpaStackFileHash -Path (Join-Path $installed 'SKILL.md')
+    try {
+        $driftedParentAcl = Get-Acl -LiteralPath $stackParent
+        $parentReplacementRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'),
+            [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles,
+            [System.Security.AccessControl.AccessControlType]::Allow
+        )
+        [void]$driftedParentAcl.AddAccessRule($parentReplacementRule)
+        Set-Acl -LiteralPath $stackParent -AclObject $driftedParentAcl
+        Assert-ThrowsMatch {
+            & $installScript -CodexHome $temp
+        } 'replace descendants' 'Parameterless update rejects a parent ACL that lets Everyone replace the canonical root'
+        Assert-Equal $installedHashBeforeAncestorDrift (Get-CpaStackFileHash -Path (Join-Path $installed 'SKILL.md')) 'Ancestor ACL preflight failure leaves the installed skill unchanged'
+    } finally {
+        $restoredParentAcl = Get-Acl -LiteralPath $stackParent
+        $restoredParentAcl.SetSecurityDescriptorSddlForm($stackParentSddl)
+        Set-Acl -LiteralPath $stackParent -AclObject $restoredParentAcl
+    }
+
+    $installedHashBeforeAclDrift = Get-CpaStackFileHash -Path (Join-Path $installed 'SKILL.md')
+    $opsPath = Join-Path $customStackRoot 'ops'
+    $driftedOpsAcl = Get-Acl -LiteralPath $opsPath
+    $unexpectedRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'),
+        [System.Security.AccessControl.FileSystemRights]::ReadAndExecute,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    )
+    [void]$driftedOpsAcl.AddAccessRule($unexpectedRule)
+    Set-Acl -LiteralPath $opsPath -AclObject $driftedOpsAcl
+    Assert-ThrowsMatch {
+        & $installScript -CodexHome $temp
+    } 'unexpected identity' 'Parameterless update rejects canonical ops ACL drift before swapping the skill'
+    Assert-Equal $installedHashBeforeAclDrift (Get-CpaStackFileHash -Path (Join-Path $installed 'SKILL.md')) 'ACL preflight failure leaves the installed skill unchanged'
+    Protect-CpaStackPrivateDirectory -Path $opsPath
+
     $updateResult = (& $installScript -CodexHome $temp) | ConvertFrom-Json
     Assert-True ([bool]$updateResult.success) 'Installer can atomically update an owned skill'
     Assert-Equal ([System.IO.Path]::GetFullPath($customStackRoot).TrimEnd('\')) ([System.IO.Path]::GetFullPath([string]$updateResult.registeredRoot).TrimEnd('\')) 'A later parameterless install keeps using the protected registered root'
@@ -95,11 +247,81 @@ try {
     Assert-Equal (Get-CpaStackFileHash -Path (Join-Path $installed 'scripts\Start-CPA-Stack.ps1')) (Get-CpaStackFileHash -Path (Join-Path $customStackRoot 'ops\Start-CPA-Stack.ps1')) 'Canonical launcher matches the newly installed skill'
     Assert-True (Test-Path -LiteralPath (Join-Path $temp 'skills\cpa-safe-upgrade.previous\.cpa-stack-updater-installed.json') -PathType Leaf) 'Atomic update retains one owned previous skill'
 
+    $installedSkillPath = Join-Path $installed 'SKILL.md'
+    $oldInstalledText = [System.IO.File]::ReadAllText($installedSkillPath, [System.Text.UTF8Encoding]::new($false, $true)) + "`r`n# synthetic previous skill`r`n"
+    [System.IO.File]::WriteAllText($installedSkillPath, $oldInstalledText, [System.Text.UTF8Encoding]::new($false))
+    $oldInstalledHash = Get-CpaStackFileHash -Path $installedSkillPath
+    $canonicalLauncher = Join-Path $customStackRoot 'ops\Start-CPA-Stack.ps1'
+    Set-Content -LiteralPath $canonicalLauncher -Value '# stale before post-commit locator failure' -Encoding ASCII
+    Protect-CpaStackSecretFile -Path $canonicalLauncher
+    $locatorBeforeLockedUpdate = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($locatorPath))
+    $locatorLock = [System.IO.File]::Open(
+        $locatorPath,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        [System.IO.FileShare]::Read
+    )
+    try {
+        $lockedLocatorResult = (& $installScript -CodexHome $temp -StackRoot $customStackRoot) | ConvertFrom-Json
+    } finally {
+        $locatorLock.Dispose()
+    }
+    Assert-True ([bool]$lockedLocatorResult.success) 'Locator write failure does not roll back the committed skill'
+    Assert-False ([bool]$lockedLocatorResult.complete) 'Locator write failure reports an incomplete post-commit result'
+    Assert-True ([bool]$lockedLocatorResult.coreCommitted) 'Locator write failure reports that the core skill commit succeeded'
+    Assert-True ([bool]$lockedLocatorResult.launcherSynchronized) 'Launcher synchronization completes before the locked locator update'
+    Assert-False ([bool]$lockedLocatorResult.registrationUpdated) 'Locked locator reports that registration was not updated'
+    Assert-True (@($lockedLocatorResult.postCommitWarnings | Where-Object { $_.step -ceq 'registration' }).Count -eq 1) 'Locked locator returns a structured registration warning'
+    Assert-Equal (Get-CpaStackFileHash -Path (Join-Path $repo 'skills\cpa-safe-upgrade\SKILL.md')) (Get-CpaStackFileHash -Path $installedSkillPath) 'Core commit leaves the newly installed skill active'
+    Assert-Equal $oldInstalledHash (Get-CpaStackFileHash -Path (Join-Path $temp 'skills\cpa-safe-upgrade.previous\SKILL.md')) 'Previous slot contains the skill that was active before the core commit'
+    Assert-Equal (Get-CpaStackFileHash -Path (Join-Path $installed 'scripts\Start-CPA-Stack.ps1')) (Get-CpaStackFileHash -Path $canonicalLauncher) 'Post-commit launcher matches the new skill even when registration fails'
+    Assert-Equal $locatorBeforeLockedUpdate ([Convert]::ToBase64String([System.IO.File]::ReadAllBytes($locatorPath))) 'Locked locator content remains unchanged'
+
+    $junctionTargetHome = Join-Path $temp 'junction-target-home'
+    $junctionInstalled = Join-Path $junctionTargetHome 'skills\cpa-safe-upgrade'
+    New-Item -ItemType Directory -Force -Path $junctionInstalled | Out-Null
+    foreach ($item in Get-ChildItem -LiteralPath $installed -Force) {
+        Copy-Item -LiteralPath $item.FullName -Destination (Join-Path $junctionInstalled $item.Name) -Recurse -Force
+    }
+    $junctionMarkerHash = Get-CpaStackFileHash -Path (Join-Path $junctionInstalled '.cpa-stack-updater-installed.json')
+    $junctionHome = Join-Path $stackTestParent 'junction-codex-home'
+    $codexHomeJunction = New-Item -ItemType Junction -Path $junctionHome -Target $junctionTargetHome
+    Assert-ThrowsMatch {
+        & $installScript -CodexHome $junctionHome -StackRoot $customStackRoot
+    } 'reparse point' 'Installer rejects a CodexHome path that crosses an ancestor junction before writing'
+    Assert-ThrowsMatch {
+        & $uninstallScript -CodexHome $junctionHome -Yes
+    } 'reparse point' 'Uninstaller rejects a CodexHome path that crosses an ancestor junction before deleting'
+    Assert-Equal $junctionMarkerHash (Get-CpaStackFileHash -Path (Join-Path $junctionInstalled '.cpa-stack-updater-installed.json')) 'Junction rejection preserves the external target byte-for-byte'
+    [System.IO.Directory]::Delete($codexHomeJunction.FullName)
+    $codexHomeJunction = $null
+
+    $uninstallRetained = Join-Path $temp 'skills\cpa-safe-upgrade.retained-00000000000000000000000000000002'
+    New-Item -ItemType Directory -Path $uninstallRetained | Out-Null
+    foreach ($item in Get-ChildItem -LiteralPath $installed -Force) {
+        Copy-Item -LiteralPath $item.FullName -Destination (Join-Path $uninstallRetained $item.Name) -Recurse -Force
+    }
     $stableUninstall = Join-Path $installed 'scripts\Uninstall-CpaSafeUpgrade.ps1'
+    $uninstallLock = [System.IO.File]::Open(
+        (Join-Path $uninstallRetained 'SKILL.md'),
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        [System.IO.FileShare]::Read
+    )
+    try {
+        Assert-ThrowsMatch {
+            & $stableUninstall -CodexHome $temp -Yes
+        } 'Close editors or terminals' 'Uninstaller refuses a locked transaction slot before deleting any owned directory'
+    } finally {
+        $uninstallLock.Dispose()
+    }
+    Assert-True (Test-Path -LiteralPath $markerPath -PathType Leaf) 'Failed uninstall preflight preserves the active skill marker'
+    Assert-True (Test-Path -LiteralPath (Join-Path $uninstallRetained '.cpa-stack-updater-installed.json') -PathType Leaf) 'Failed uninstall preflight preserves the retained marker'
     $uninstallText = & $stableUninstall -CodexHome $temp -Yes
     $uninstall = $uninstallText | ConvertFrom-Json
     Assert-True ([bool]$uninstall.success) 'Uninstaller reports success'
     Assert-False (Test-Path -LiteralPath $installed) 'Skill is removed'
+    Assert-False (Test-Path -LiteralPath $uninstallRetained) 'Uninstaller removes an owned retained transaction slot'
     Assert-False ([bool]$uninstall.stackDataTouched) 'Uninstaller never touches stack data'
 
     New-Item -ItemType Directory -Force -Path $installed | Out-Null
@@ -129,16 +351,51 @@ try {
     Assert-True (Test-Path -LiteralPath $sentinel -PathType Leaf) 'Installer preserves a rejected unowned directory'
     Remove-Item -LiteralPath $installed -Recurse -Force
 
-    $fixtureRepo = Join-Path $temp 'unsafe-source-fixture'
-    New-Item -ItemType Directory -Force -Path $fixtureRepo | Out-Null
-    Copy-Item -LiteralPath $installScript -Destination (Join-Path $fixtureRepo 'install.ps1')
-    Copy-Item -LiteralPath (Join-Path $repo 'VERSION') -Destination (Join-Path $fixtureRepo 'VERSION')
-    Copy-Item -LiteralPath (Join-Path $repo 'skills') -Destination (Join-Path $fixtureRepo 'skills') -Recurse
-    $unsafeAuth = Join-Path $fixtureRepo 'skills\cpa-safe-upgrade\auth'
+    $recoveryFixture = New-CpaStackUpdaterTestFixture `
+        -SourceRepository $sourceRepo `
+        -DestinationRepository (Join-Path $temp 'recovery-fixture') `
+        -LocalAppDataRoot (Join-Path $temp 'recovery-local-app-data')
+    $recoveryInstall = Join-Path $recoveryFixture.Repository 'install.ps1'
+    $recoveryHome = Join-Path $temp 'recovery-home'
+    $recoveryRoot = Join-Path $stackTestParent 'recovery managed root'
+    [void]((& $recoveryInstall -CodexHome $recoveryHome -StackRoot $recoveryRoot) | ConvertFrom-Json)
+    $recoveryInstalled = Join-Path $recoveryHome 'skills\cpa-safe-upgrade'
+    [System.IO.File]::AppendAllText((Join-Path $recoveryInstalled 'SKILL.md'), "`r`n# synthetic first generation`r`n", [System.Text.UTF8Encoding]::new($false))
+    [void]((& $recoveryInstall -CodexHome $recoveryHome -StackRoot $recoveryRoot) | ConvertFrom-Json)
+    $recoveryPrevious = Join-Path $recoveryHome 'skills\cpa-safe-upgrade.previous'
+    [System.IO.File]::AppendAllText((Join-Path $recoveryInstalled 'SKILL.md'), "`r`n# synthetic second generation`r`n", [System.Text.UTF8Encoding]::new($false))
+    $expectedInstalledHash = Get-CpaStackFileHash -Path (Join-Path $recoveryInstalled 'SKILL.md')
+    $expectedPreviousHash = Get-CpaStackFileHash -Path (Join-Path $recoveryPrevious 'SKILL.md')
+    $failureNeedle = '    Move-SkillDirectoryWithRetry -SourcePath $staging -SourceKind Staging -DestinationPath $installed -DestinationKind Installed'
+    $failureInstallerText = [System.IO.File]::ReadAllText($recoveryInstall, [System.Text.UTF8Encoding]::new($false, $true))
+    Assert-Equal 1 ([regex]::Matches($failureInstallerText, [regex]::Escape($failureNeedle)).Count) 'Failure injection targets exactly one pre-core-commit seam'
+    $failureReplacement = "    if (`$env:CPA_STACK_TEST_FAIL_BEFORE_CORE_COMMIT -ceq '1') { throw 'synthetic pre-core-commit failure' }`r`n$failureNeedle"
+    $failureInstallerText = $failureInstallerText.Replace($failureNeedle, $failureReplacement)
+    [System.IO.File]::WriteAllText($recoveryInstall, $failureInstallerText, [System.Text.UTF8Encoding]::new($false))
+    $previousFailurePoint = [Environment]::GetEnvironmentVariable('CPA_STACK_TEST_FAIL_BEFORE_CORE_COMMIT', 'Process')
+    try {
+        [Environment]::SetEnvironmentVariable('CPA_STACK_TEST_FAIL_BEFORE_CORE_COMMIT', '1', 'Process')
+        Assert-ThrowsMatch {
+            & $recoveryInstall -CodexHome $recoveryHome -StackRoot $recoveryRoot
+        } 'synthetic pre-core-commit failure' 'Failure injection reaches the installed/previous/retained recovery branch'
+    } finally {
+        [Environment]::SetEnvironmentVariable('CPA_STACK_TEST_FAIL_BEFORE_CORE_COMMIT', $previousFailurePoint, 'Process')
+    }
+    Assert-Equal $expectedInstalledHash (Get-CpaStackFileHash -Path (Join-Path $recoveryInstalled 'SKILL.md')) 'Recovery restores the previously active installed slot byte-for-byte'
+    Assert-Equal $expectedPreviousHash (Get-CpaStackFileHash -Path (Join-Path $recoveryPrevious 'SKILL.md')) 'Recovery restores the previous rollback slot byte-for-byte'
+    $recoveryTransactionSlots = @(Get-ChildItem -LiteralPath (Join-Path $recoveryHome 'skills') -Directory -Force | Where-Object { $_.Name -match '^cpa-safe-upgrade\.(?:staging|retained|retiring)-' })
+    Assert-Equal 0 $recoveryTransactionSlots.Count 'Successful recovery leaves no transaction directories'
+
+    $unsafeSourceRepo = Join-Path $temp 'unsafe-source-fixture'
+    New-Item -ItemType Directory -Force -Path $unsafeSourceRepo | Out-Null
+    Copy-Item -LiteralPath $installScript -Destination (Join-Path $unsafeSourceRepo 'install.ps1')
+    Copy-Item -LiteralPath (Join-Path $repo 'VERSION') -Destination (Join-Path $unsafeSourceRepo 'VERSION')
+    Copy-Item -LiteralPath (Join-Path $repo 'skills') -Destination (Join-Path $unsafeSourceRepo 'skills') -Recurse
+    $unsafeAuth = Join-Path $unsafeSourceRepo 'skills\cpa-safe-upgrade\auth'
     New-Item -ItemType Directory -Force -Path $unsafeAuth | Out-Null
     Set-Content -LiteralPath (Join-Path $unsafeAuth 'credentials.json') -Value '{"credential":"synthetic-test-value"}' -Encoding ASCII
     Assert-ThrowsMatch {
-        & (Join-Path $fixtureRepo 'install.ps1') -CodexHome (Join-Path $temp 'unsafe-source-home')
+        & (Join-Path $unsafeSourceRepo 'install.ps1') -CodexHome (Join-Path $temp 'unsafe-source-home')
     } 'forbidden runtime or secret files' 'Installer rejects credentials hidden under a sensitive directory segment'
 
     $sharedLock = Enter-CpaStackOperationLock
@@ -154,15 +411,11 @@ try {
         Exit-CpaStackOperationLock -Mutex $sharedLock
     }
 } finally {
-    if ($locatorExisted) {
-        [System.IO.File]::WriteAllBytes($locatorPath, $locatorBytes)
-        $restoredAcl = Get-Acl -LiteralPath $locatorPath
-        $restoredAcl.SetSecurityDescriptorSddlForm($locatorSddl)
-        Set-Acl -LiteralPath $locatorPath -AclObject $restoredAcl
-    } elseif (Test-Path -LiteralPath $locatorPath -PathType Leaf) {
-        Remove-Item -LiteralPath $locatorPath -Force
+    if ($codexHomeJunction -and (Test-Path -LiteralPath $codexHomeJunction.FullName)) {
+        [System.IO.Directory]::Delete($codexHomeJunction.FullName)
     }
-    if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Recurse -Force }
+    if (Test-Path -LiteralPath $temp) { Remove-TestPathWithRetry -Path $temp }
+    if (Test-Path -LiteralPath $stackTestParent) { Remove-TestPathWithRetry -Path $stackTestParent }
 }
 
 'Install tests passed.'

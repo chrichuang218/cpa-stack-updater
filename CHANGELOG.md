@@ -1,5 +1,13 @@
 # 更新记录
 
+## 0.1.1 - 2026-07-16
+
+- 修复编辑器或终端占用已安装 Skill 时的更新事务：有限重试后给出明确提示，不结束用户进程。
+- 旧 Skill 成功移入事务槽后才写 ownership marker；失败会恢复原 `installed` 与已有 `previous`，不留下假拥有标记或丢失回滚槽。
+- adopted root 会在 swap 前校验自身与父链 ACL；Skill core commit 后的 launcher、locator 和旧槽清理失败改为结构化 warning，不再回滚成新旧混合状态。
+- 重跑安装会在 swap 前安全收敛遗留的 owned `staging-*` / `retained-*`，包括最终删除失败留下的空固定槽；卸载会先无路径变更地检查全部目标是否可删除，锁冲突时不删除任何 owned 目录。
+- 安装、adoption、路径与启动恢复测试改用独立 LocalAppData fixture，不再读写真实 root locator 或 operation lock，并增加中途失败后的双槽恢复回归。
+
 ## 0.1.0 - 2026-07-16
 
 - 将 CPA 迁移与升级流程抽成独立开源项目。

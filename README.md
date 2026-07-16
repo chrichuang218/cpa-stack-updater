@@ -115,7 +115,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli upgrade -Json
 
 Skill 只调用统一的 `cpa-stack.ps1`，不会临时手写停止、复制和启动命令。
 
-更新 updater 时，下载新 Release 并再次运行 `install.ps1`；安装器会原子替换同一个稳定路径。卸载无需保留原 ZIP：
+更新 updater 时，下载新 Release 并再次运行 `install.ps1`；安装器会原子替换同一个稳定路径。如果提示 Skill 目录被占用，请关闭正在查看已安装 `SKILL.md` 的编辑器或工作目录位于该 Skill 下的终端，再重试。安装器不会结束这些进程，失败时会保留当前 Skill 与已有回滚槽。如果结果为 `success=true`、`complete=false`，表示新 Skill 已提交，但 launcher、root locator 或旧槽清理存在明确的 `postCommitWarnings`；处理对应占用或 ACL 问题后再次运行安装器即可。卸载无需保留原 ZIP：
 
 ```powershell
 $uninstaller = Join-Path $codexHome 'skills\cpa-safe-upgrade\scripts\Uninstall-CpaSafeUpgrade.ps1'

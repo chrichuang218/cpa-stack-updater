@@ -1,14 +1,16 @@
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'TestHelpers.ps1')
 
-$repo = Split-Path -Parent $PSScriptRoot
-$commonPath = Join-Path $repo 'skills\cpa-safe-upgrade\scripts\CpaStack.Common.ps1'
-. $commonPath
-
+$sourceRepo = Split-Path -Parent $PSScriptRoot
 $temp = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('cpa-stack-tests-' + [guid]::NewGuid().ToString('N'))
 $pluginRootJunction = $null
 try {
     New-Item -ItemType Directory -Force -Path $temp | Out-Null
+    $fixture = New-CpaStackUpdaterTestFixture `
+        -SourceRepository $sourceRepo `
+        -DestinationRepository (Join-Path $temp 'repository') `
+        -LocalAppDataRoot (Join-Path $temp 'local-app-data')
+    . (Join-Path $fixture.Repository 'skills\cpa-safe-upgrade\scripts\CpaStack.Common.ps1')
     $cjkSuffix = -join @([char]0x6D4B, [char]0x8BD5)
     $safeRoot = Join-Path $temp ('CPA Stack ' + $cjkSuffix)
     New-Item -ItemType Directory -Force -Path $safeRoot | Out-Null

@@ -592,7 +592,10 @@ function Get-CpaStackTreeItemsNoReparse {
 }
 
 function Assert-CpaStackPathNoReparseAncestors {
-    param([Parameter(Mandatory = $true)][string]$Path)
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string]$Description = 'Legacy CPA source'
+    )
 
     $cursor = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
     $filesystemRoot = [System.IO.Path]::GetPathRoot($cursor).TrimEnd('\')
@@ -600,7 +603,7 @@ function Assert-CpaStackPathNoReparseAncestors {
         if (Test-Path -LiteralPath $cursor) {
             $item = Get-Item -Force -LiteralPath $cursor
             if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-                throw "Legacy CPA source must not be or cross a reparse point: $cursor"
+                throw "$Description must not be or cross a reparse point: $cursor"
             }
         }
         $parent = Split-Path -Parent $cursor

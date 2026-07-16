@@ -31,9 +31,9 @@ if ($pythonExitCode -ne 0 -or
     $pythonHexVersion -lt 0x030A00F0) {
     throw "Python 3.10 or newer is required for tests. HexVersion=$pythonHexVersionText"
 }
-& $python.Source -m py_compile (Join-Path $repo 'skills\cpa-safe-upgrade\scripts\backup_sqlite.py')
+& $python.Source -c 'import ast, pathlib, sys; path = pathlib.Path(sys.argv[1]); ast.parse(path.read_bytes(), filename=str(path))' (Join-Path $repo 'skills\cpa-safe-upgrade\scripts\backup_sqlite.py')
 if ($LASTEXITCODE -ne 0) { throw 'Python syntax validation failed.' }
-& $python.Source -m unittest discover -s (Join-Path $repo 'tests') -p 'test_*.py' -v
+& $python.Source -B -m unittest discover -s (Join-Path $repo 'tests') -p 'test_*.py' -v
 if ($LASTEXITCODE -ne 0) { throw 'Python regression tests failed.' }
 
 Write-Host 'All tests passed.'

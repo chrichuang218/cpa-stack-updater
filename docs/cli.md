@@ -67,7 +67,7 @@ Secrets 文件必须分别包含 `cpaClientApiKey`、`cpaManagementKey` 和 `man
 ```json
 {
   "schemaVersion": 1,
-  "updaterVersion": "0.1.0",
+  "updaterVersion": "0.1.1",
   "command": "upgrade",
   "success": true,
   "changed": true,
