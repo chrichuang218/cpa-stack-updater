@@ -9,6 +9,7 @@ $temp = Join-Path ([System.IO.Path]::GetTempPath()) ('cpa-secret-env-tests-' + [
 $sentinel = 'SYNTHETIC_SECRET_SENTINEL_42'
 $previousSynthetic = [Environment]::GetEnvironmentVariable('CPA_STACK_SYNTHETIC_SECRET', 'Process')
 $previousHttpsProxy = [Environment]::GetEnvironmentVariable('HTTPS_PROXY', 'Process')
+$process = $null
 try {
     New-Item -ItemType Directory -Force -Path (Join-Path $temp 'config') | Out-Null
     $badSecrets = Join-Path $temp 'config\secrets.local.json'
@@ -39,7 +40,9 @@ param([string]$OutputPath)
     $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
     $arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -OutputPath "{1}"' -f $captureScript, $capturePath
     $process = Start-CpaStackProcess -FilePath $powershell -Arguments $arguments -WorkingDirectory $temp -Environment @{ CPA_STACK_EXPLICIT_VALUE = 'allowed-override' } -MinimalEnvironment
-    Assert-True ($process.WaitForExit(15000)) 'Minimal-environment child exits within the test timeout'
+    $processExited = $process.WaitForExit(15000)
+    Assert-True $processExited 'Minimal-environment child exits within the test timeout'
+    $process.WaitForExit()
     Assert-Equal 0 $process.ExitCode 'Minimal-environment child exits successfully'
     $captured = Get-Content -Raw -LiteralPath $capturePath | ConvertFrom-Json
     Assert-False ([bool]$captured.syntheticPresent) 'Unrelated parent secrets are not inherited by candidates'
@@ -47,9 +50,19 @@ param([string]$OutputPath)
     Assert-Equal 'allowed-override' $captured.explicitValue 'Explicit candidate environment values are preserved'
     Assert-True ([bool]$captured.systemRootPresent) 'Required Windows environment values are preserved'
 } finally {
+    if ($null -ne $process) {
+        try {
+            if (-not $process.HasExited) {
+                $process.Kill()
+                [void]$process.WaitForExit(5000)
+            }
+        } finally {
+            $process.Dispose()
+        }
+    }
     [Environment]::SetEnvironmentVariable('CPA_STACK_SYNTHETIC_SECRET', $previousSynthetic, 'Process')
     [Environment]::SetEnvironmentVariable('HTTPS_PROXY', $previousHttpsProxy, 'Process')
-    if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Recurse -Force }
+    Remove-TestPathWithRetry -Path $temp
 }
 
 'Secret and environment tests passed.'

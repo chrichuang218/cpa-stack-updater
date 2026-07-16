@@ -36,3 +36,22 @@ function Assert-ThrowsMatch {
     }
     throw "Assertion failed: $Message. Expected an exception."
 }
+
+function Remove-TestPathWithRetry {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [int]$Attempts = 10,
+        [int]$DelayMilliseconds = 250
+    )
+
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        if (-not (Test-Path -LiteralPath $Path)) { return }
+        try {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+            return
+        } catch {
+            if ($attempt -eq $Attempts) { throw }
+            Start-Sleep -Milliseconds $DelayMilliseconds
+        }
+    }
+}
