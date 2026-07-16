@@ -219,7 +219,12 @@ function Assert-UpgradeTemporaryPortsFree {
 }
 
 function Assert-SwitchedServicesHealthy {
-    $state = Invoke-ChildPowerShellJson -Script (Join-Path $PSScriptRoot 'Get-CpaStackState.ps1') -Arguments @('-ControlRoot', $ControlRoot) -AllowNonZero
+    param([ValidateSet('cpa', 'manager')][string]$PendingSwitchComponent)
+
+    $state = Invoke-ChildPowerShellJson -Script (Join-Path $PSScriptRoot 'Get-CpaStackState.ps1') -Arguments @(
+        '-ControlRoot', $ControlRoot,
+        '-PendingSwitchComponent', $PendingSwitchComponent
+    ) -AllowNonZero
     if (-not $state.Cpa.Healthy -or -not $state.Manager.Healthy) {
         throw 'A switched component did not preserve the health of both formal services.'
     }
@@ -923,7 +928,7 @@ try {
             "-DeferFinalCommit"
         )
         $result.cpa = Read-CpaStackJson -Path $cpaSwitchPath
-        Assert-SwitchedServicesHealthy
+        Assert-SwitchedServicesHealthy -PendingSwitchComponent cpa
     }
     Set-CurrentComponentState -Component cpa -Package $cpaPackage -Runtime $cpaRuntime -ConfigPath $cpaConfig
     if ($cpaNeedsUpgrade) {
@@ -947,7 +952,7 @@ try {
         Set-UpgradeJournalPhase -Phase "switching-manager"
         Invoke-SwitchScript -Script (Join-Path $PSScriptRoot "Switch-ManagerRuntime.ps1") -Arguments $managerSwitchArguments
         $result.manager = Read-CpaStackJson -Path $managerSwitchPath
-        Assert-SwitchedServicesHealthy
+        Assert-SwitchedServicesHealthy -PendingSwitchComponent manager
     }
     Set-CurrentComponentState -Component manager -Package $managerPackage -Runtime $managerRuntime -DataPath $managerData
     if ($managerNeedsUpgrade) {

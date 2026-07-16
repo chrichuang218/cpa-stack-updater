@@ -1,5 +1,9 @@
 # 更新记录
 
+## 0.1.4 - 2026-07-16
+
+- 修复两阶段正式切换在提交 `current.json` 前用旧 hash 执行稳态健康检查、从而必然误判新 runtime 不健康的问题。过渡期检查现在只接受绑定当前 instance、路径和 old/new hash 的 `runtime-verified` switch journal；CPA 与 Manager 均通过正式健康探测后才提交新状态，真实失败仍按旧状态自动回滚。
+
 ## 0.1.3 - 2026-07-16
 
 - 修复已登记 canonical root 位于普通开发目录时无法更新 Skill 的问题。canonical 更新继续逐项校验 root、state、launcher 的 owner/ACL 与 reparse 属性，不再把 root 之外的父目录 ACL 当作安装门禁；legacy 迁移来源的祖先检查保持不变。

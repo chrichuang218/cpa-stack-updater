@@ -2,7 +2,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('All', 'CpaSuccess', 'CpaRollback', 'CpaHangCleanup', 'ManagerRollback', 'ManagerMigrationRollback', 'ManagerMigrationTamper', 'ManagerRecoveryGate', 'PendingGate')]
+    [ValidateSet('All', 'CpaSuccess', 'CpaRollback', 'CpaHangCleanup', 'ManagerRollback', 'ManagerMigrationRollback', 'ManagerMigrationTamper', 'ManagerRecoveryGate', 'TransitionHealth', 'PendingGate')]
     [string]$Case = 'All'
 )
 
@@ -17,6 +17,7 @@ $commonScript = Join-Path $scriptRoot 'CpaStack.Common.ps1'
 $switchCpaScript = Join-Path $scriptRoot 'Switch-CpaRuntime.ps1'
 $testCpaScript = Join-Path $scriptRoot 'Test-CpaCandidate.ps1'
 $switchManagerScript = Join-Path $scriptRoot 'Switch-ManagerRuntime.ps1'
+$stateScript = Join-Path $scriptRoot 'Get-CpaStackState.ps1'
 $isolatedStartStackScript = $null
 $isolatedLocalAppData = $null
 
@@ -261,7 +262,7 @@ public static class Program
                 stream,
                 "200 OK",
                 "application/json",
-                "{\"configured\":true,\"adminReady\":true,\"dataKeyReady\":true," +
+                "{\"configured\":true,\"adminReady\":true,\"projectInitialized\":true,\"dataKeyReady\":true," +
                 "\"setupRequired\":false,\"migrationStatus\":\"ready\",\"hasHistoricalData\":false}"
             );
             return;
@@ -481,10 +482,11 @@ function Stop-OwnedFixturePort {
     if (-not $executable.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "Fixture cleanup refused an unexpected listener on port $Port."
     }
-    Stop-Process -Id $listener.ProcessId -Force -ErrorAction Stop
-    $deadline = [DateTime]::UtcNow.AddSeconds(5)
-    while ([DateTime]::UtcNow -lt $deadline -and (Get-Process -Id $listener.ProcessId -ErrorAction SilentlyContinue)) {
-        Start-Sleep -Milliseconds 100
+    $fixedProcess = Get-CpaStackFixedListenerProcess -Listener $listener -ExpectedPath $executable
+    try {
+        Stop-CpaStackPort -Port $Port -ExpectedPath $executable -ExpectedProcess $fixedProcess -RequireExecutableWriteAccess
+    } finally {
+        if ($fixedProcess -is [System.IDisposable]) { $fixedProcess.Dispose() }
     }
 }
 
@@ -947,6 +949,141 @@ function Invoke-ManagerRecoverySourceGateTest {
     } 'executable changed' 'Manager recovery rejects a changed executable before execution'
 }
 
+function Invoke-TransitionHealthTest {
+    param([string]$OldBinary, [string]$NewBinary)
+
+    $fixture = New-ManagedRoot -Name 'transition-health'
+    $root = $fixture.Root
+    $cpaPort = Get-UnusedLoopbackPort
+    $managerPort = Get-UnusedLoopbackPort
+    $cpaRuntime = Join-Path $root 'runtime\cli-proxy-api'
+    $managerRuntime = Join-Path $root 'runtime\manager-plus'
+    $managerData = Join-Path $root 'data\manager-plus'
+    $cpaExe = Join-Path $cpaRuntime 'cli-proxy-api.exe'
+    $managerExe = Join-Path $managerRuntime 'cpa-manager-plus.exe'
+    $currentPath = Join-Path $root 'state\current.json'
+    $cpaJournalPath = Join-Path $root 'state\switch-cpa.pending.json'
+    $managerJournalPath = Join-Path $root 'state\switch-manager.pending.json'
+    New-Item -ItemType Directory -Force -Path $cpaRuntime, (Join-Path $cpaRuntime 'auth'), $managerRuntime, $managerData, (Join-Path $root 'ops') | Out-Null
+    Copy-Item -LiteralPath $OldBinary -Destination $cpaExe
+    Copy-Item -LiteralPath $OldBinary -Destination $managerExe
+    Write-Utf8Text -Path (Join-Path $cpaRuntime 'behavior.txt') -Value 'good'
+    Write-Utf8Text -Path (Join-Path $managerRuntime 'behavior.txt') -Value 'good'
+    Write-Utf8Text -Path (Join-Path $managerRuntime 'cpa-port.txt') -Value ([string]$cpaPort)
+    Write-Utf8Text -Path (Join-Path $managerData 'data.key') -Value 'fixture-data-key'
+    Write-Utf8Text -Path (Join-Path $managerData 'collector-state.txt') -Value 'true'
+    New-SqliteFixture -Path (Join-Path $managerData 'usage.sqlite')
+    Write-CpaConfig -Path (Join-Path $cpaRuntime 'config.yaml') -Port $cpaPort
+    Write-StackConfig -Path (Join-Path $root 'config\stack.psd1') -CpaPort $cpaPort -ManagerPort $managerPort
+    Copy-Item -LiteralPath $isolatedStartStackScript -Destination (Join-Path $root 'ops\Start-CPA-Stack.ps1')
+    [void](Write-TestSecrets -ControlRoot $root -Protect)
+
+    $oldCpaHash = Get-CpaStackFileHash -Path $cpaExe
+    $oldManagerHash = Get-CpaStackFileHash -Path $managerExe
+    $current = [ordered]@{
+        schemaVersion = 1
+        instanceId = [string]$fixture.Marker.instanceId
+        canonicalRoot = $root
+        cpa = [ordered]@{ version = 'fixture-old'; executable = $cpaExe; sha256 = $oldCpaHash }
+        manager = [ordered]@{ version = 'fixture-old'; executable = $managerExe; sha256 = $oldManagerHash }
+    }
+    Write-CpaStackJson -Value $current -Path $currentPath
+    foreach ($criticalDirectory in @(
+        (Join-Path $root 'config'),
+        (Join-Path $root 'ops'),
+        (Join-Path $root 'state')
+    )) {
+        Protect-CpaStackPrivateDirectory -Path $criticalDirectory
+    }
+    foreach ($criticalPath in @(
+        (Join-Path $root '.cpa-stack-instance.json'),
+        $currentPath,
+        (Join-Path $root 'config\stack.psd1'),
+        (Join-Path $root 'ops\Start-CPA-Stack.ps1'),
+        (Join-Path $cpaRuntime 'config.yaml'),
+        $cpaExe,
+        $managerExe
+    )) {
+        Protect-CpaStackSecretFile -Path $criticalPath
+    }
+    Protect-CpaStackPrivateTree -Root (Join-Path $root 'runtime')
+    Protect-CpaStackPrivateTree -Root (Join-Path $root 'data')
+
+    $invokeState = {
+        param([string]$ProbeRoot, [string]$TransitionComponent)
+        $arguments = @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $stateScript, '-ControlRoot', $ProbeRoot)
+        if (-not [string]::IsNullOrWhiteSpace($TransitionComponent)) {
+            $arguments += @('-PendingSwitchComponent', $TransitionComponent)
+        }
+        $output = @(& powershell.exe @arguments 2>&1)
+        $exitCode = $LASTEXITCODE
+        $json = (($output | ForEach-Object { [string]$_ }) -join [Environment]::NewLine) | ConvertFrom-Json
+        return [pscustomobject]@{ ExitCode = $exitCode; State = $json }
+    }
+
+    try {
+        [void](Start-CpaFixture -Executable $cpaExe -Runtime $cpaRuntime -Config (Join-Path $cpaRuntime 'config.yaml') -Port $cpaPort)
+        [void](Start-ManagerFixture -Executable $managerExe -Runtime $managerRuntime -Data $managerData -Port $managerPort)
+        $steady = & $invokeState $root $null
+        $steadyDetails = $steady.State | ConvertTo-Json -Depth 10 -Compress
+        Assert-Equal -Expected 0 -Actual $steady.ExitCode -Message "fixture stack should begin healthy. State=[$steadyDetails]"
+
+        Stop-OwnedFixturePort -Port $cpaPort -ManagedRoot $root
+        Copy-Item -LiteralPath $NewBinary -Destination $cpaExe -Force
+        Protect-CpaStackSecretFile -Path $cpaExe
+        $newCpaHash = Get-CpaStackFileHash -Path $cpaExe
+        [void](Start-CpaFixture -Executable $cpaExe -Runtime $cpaRuntime -Config (Join-Path $cpaRuntime 'config.yaml') -Port $cpaPort)
+        Write-CpaStackJson -Value ([ordered]@{
+            operation = 'switch-cpa'
+            operationId = [guid]::NewGuid().ToString('N')
+            instanceId = [string]$fixture.Marker.instanceId
+            phase = 'runtime-verified'
+            targetRuntime = $cpaRuntime
+            oldHash = $oldCpaHash
+            newHash = $newCpaHash
+        }) -Path $cpaJournalPath
+        Protect-CpaStackSecretFile -Path $cpaJournalPath
+
+        $steadyDuringCpa = & $invokeState $root $null
+        Assert-False -Condition ([bool]$steadyDuringCpa.State.Security.Integrity.Ready) -Message 'steady status should reject a pre-commit CPA hash'
+        $cpaTransition = & $invokeState $root 'cpa'
+        Assert-True -Condition ([bool]$cpaTransition.State.Security.Integrity.Ready) -Message 'CPA transition should accept the journal-bound new hash'
+        Assert-True -Condition ([bool]$cpaTransition.State.Cpa.Healthy -and [bool]$cpaTransition.State.Manager.Healthy) -Message 'CPA transition should probe both formal services before current commits'
+
+        $current.cpa.sha256 = $newCpaHash
+        $current.cpa.version = 'fixture-new'
+        Write-CpaStackJson -Value $current -Path $currentPath
+        Protect-CpaStackSecretFile -Path $currentPath
+        Remove-Item -LiteralPath $cpaJournalPath -Force
+
+        Stop-OwnedFixturePort -Port $managerPort -ManagedRoot $root
+        Copy-Item -LiteralPath $NewBinary -Destination $managerExe -Force
+        Protect-CpaStackSecretFile -Path $managerExe
+        $newManagerHash = Get-CpaStackFileHash -Path $managerExe
+        [void](Start-ManagerFixture -Executable $managerExe -Runtime $managerRuntime -Data $managerData -Port $managerPort)
+        Write-CpaStackJson -Value ([ordered]@{
+            operation = 'switch-manager'
+            operationId = [guid]::NewGuid().ToString('N')
+            instanceId = [string]$fixture.Marker.instanceId
+            phase = 'runtime-verified'
+            targetRuntime = $managerRuntime
+            targetData = $managerData
+            oldHash = $oldManagerHash
+            newHash = $newManagerHash
+        }) -Path $managerJournalPath
+        Protect-CpaStackSecretFile -Path $managerJournalPath
+
+        $steadyDuringManager = & $invokeState $root $null
+        Assert-False -Condition ([bool]$steadyDuringManager.State.Security.Integrity.Ready) -Message 'steady status should reject a pre-commit Manager hash'
+        $managerTransition = & $invokeState $root 'manager'
+        Assert-True -Condition ([bool]$managerTransition.State.Security.Integrity.Ready) -Message 'Manager transition should accept the journal-bound new hash'
+        Assert-True -Condition ([bool]$managerTransition.State.Cpa.Healthy -and [bool]$managerTransition.State.Manager.Healthy) -Message 'Manager transition should probe both formal services before current commits'
+    } finally {
+        Stop-OwnedFixturePort -Port $cpaPort -ManagedRoot $root
+        Stop-OwnedFixturePort -Port $managerPort -ManagedRoot $root
+    }
+}
+
 function Invoke-PendingJournalStartupGateTest {
     param([string]$OldBinary)
 
@@ -1049,6 +1186,9 @@ try {
     }
     if ($Case -in @('All', 'ManagerRecoveryGate')) {
         Invoke-ManagerRecoverySourceGateTest -OldBinary $oldBinary
+    }
+    if ($Case -in @('All', 'TransitionHealth')) {
+        Invoke-TransitionHealthTest -OldBinary $oldBinary -NewBinary $newBinary
     }
     if ($Case -in @('All', 'PendingGate')) {
         Invoke-PendingJournalStartupGateTest -OldBinary $oldBinary

@@ -131,6 +131,10 @@ $stateScript = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\Get-
 Assert-True ([regex]::Matches($stateScript, 'LocalAddresses\s*=\s*@\(\$_\.LocalAddresses\)').Count -ge 2) 'Status preserves CPA and Manager listener addresses'
 Assert-True ($stateScript -match '\$listenerTrusted\s*=\s*\(\$pathMatches\s+-and\s+\$addressMatches\s+-and\s+\$hashMatches\)') 'Canonical status listener trust includes path, address, and current hash'
 Assert-True ($stateScript -match 'SecretsState\.Safe\.Ready\s+-and\s+\$listenerTrusted') 'Canonical status validates listener trust before credentialed probes'
+Assert-True ($stateScript -match 'ValidateSet\(''cpa'', ''manager''\)\]\[string\]\$PendingSwitchComponent') 'Transition health checks select exactly one pending component'
+Assert-True ($stateScript -match '\[string\]\$journal\.phase\s+-cne\s+''runtime-verified''') 'Transition health checks require a fully verified switched runtime'
+Assert-True ($stateScript -match '\[string\]\$journal\.instanceId\s+-cne\s+\[string\]\$current\.instanceId') 'Transition health checks remain bound to the current stack instance'
+Assert-True ($stateScript -match '\[string\]\$componentState\.sha256\s+-cne\s+\(\[string\]\$journal\.oldHash\)\.ToUpperInvariant\(\)') 'Transition health checks bind the pending old hash to current state'
 foreach ($criticalParent in @('runtime\cli-proxy-api', 'runtime\manager-plus', 'data\manager-plus')) {
     Assert-True ($stateScript.Contains($criticalParent)) "Canonical status checks critical parent path $criticalParent"
 }
@@ -177,6 +181,9 @@ $upgrade = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\Invoke-C
 Assert-True ($upgrade -match 'DeferFinalCommit') 'Upgrade defers switch journal cleanup until current state is committed'
 Assert-True ($upgrade -match 'AllowUnknownVersionReplacement') 'Unknown-version replacement is explicit'
 Assert-True ($upgrade.IndexOf('Set-UpgradeJournalPhase -Phase "testing-manager"', [System.StringComparison]::Ordinal) -lt $upgrade.IndexOf('Set-UpgradeJournalPhase -Phase "switching-cpa"', [System.StringComparison]::Ordinal)) 'Both component candidates are tested before the first formal switch'
+Assert-True ($upgrade.IndexOf('Assert-SwitchedServicesHealthy -PendingSwitchComponent cpa', [System.StringComparison]::Ordinal) -lt $upgrade.IndexOf('Set-CurrentComponentState -Component cpa', [System.StringComparison]::Ordinal)) 'CPA transition health is verified before current state commits the new hash'
+Assert-True ($upgrade.IndexOf('Assert-SwitchedServicesHealthy -PendingSwitchComponent manager', [System.StringComparison]::Ordinal) -lt $upgrade.IndexOf('Set-CurrentComponentState -Component manager', [System.StringComparison]::Ordinal)) 'Manager transition health is verified before current state commits the new hash'
+Assert-False (([System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\cpa-stack.ps1'), [System.Text.UTF8Encoding]::new($false, $true))) -match 'PendingSwitchComponent') 'The public CLI does not expose the internal transition health mode'
 Assert-True ($upgrade -match 'Immediate switch recovery failed') 'Outer switch failures attempt immediate in-process recovery before returning'
 Assert-True ($upgrade -match 'Copy-CpaStackPluginTree\s+-Source\s+\$plugins') 'CPA candidate preparation copies plugins through the protected-tree helper'
 Assert-True ($upgrade -match 'Assert-CpaStackPrivateTree\s+-Root\s+\$activePlugins') 'Top-level upgrade fails closed on an unsafe preserved plugins tree'

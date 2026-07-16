@@ -18,7 +18,8 @@ JSON document and exit 1.
 param(
     [string]$ConfigPath,
     [string]$SecretsPath,
-    [string]$ControlRoot
+    [string]$ControlRoot,
+    [ValidateSet('cpa', 'manager')][string]$PendingSwitchComponent
 )
 
 Set-StrictMode -Version Latest
@@ -486,7 +487,10 @@ function Get-ManagerDataSecurityState {
 }
 
 function Get-CurrentIntegrityState {
-    param([string]$StackRoot)
+    param(
+        [string]$StackRoot,
+        [System.Collections.IDictionary]$ExpectedExecutableHashes = @{}
+    )
 
     $issues = @()
     $markerPath = Join-Path $StackRoot '.cpa-stack-instance.json'
@@ -514,8 +518,12 @@ function Get-CurrentIntegrityState {
             foreach ($component in @('cpa', 'manager')) {
                 $entry = $current.$component
                 if ($entry -and [string]$entry.executable -and [string]$entry.sha256) {
+                    $expectedHash = [string]$entry.sha256
+                    if ($ExpectedExecutableHashes.Contains($component)) {
+                        $expectedHash = [string]$ExpectedExecutableHashes[$component]
+                    }
                     $actual = Get-CpaStackFileHash -Path ([string]$entry.executable)
-                    if ($actual -ne ([string]$entry.sha256).ToUpperInvariant()) {
+                    if ($actual -ne $expectedHash.ToUpperInvariant()) {
                         $issues += "$component executable hash mismatch."
                     }
                 }
@@ -539,6 +547,63 @@ function Get-CurrentIntegrityState {
         CurrentPresent = $currentPresent
         Issues = @($issues)
     }
+}
+
+function Get-PendingSwitchProbeContext {
+    param(
+        [string]$StackRoot,
+        [string]$Component,
+        $Settings
+    )
+
+    $expectedHashes = @{}
+    if ([string]::IsNullOrWhiteSpace($Component)) {
+        return [pscustomobject]@{ ExpectedHashes = $expectedHashes }
+    }
+
+    $journalPath = Join-Path $StackRoot ("state\switch-$Component.pending.json")
+    if (-not (Test-Path -LiteralPath $journalPath -PathType Leaf)) {
+        throw "Pending $Component switch health validation requires its journal."
+    }
+
+    $otherComponent = if ($Component -eq 'cpa') { 'manager' } else { 'cpa' }
+    $otherJournalPath = Join-Path $StackRoot ("state\switch-$otherComponent.pending.json")
+    if (Test-Path -LiteralPath $otherJournalPath -PathType Leaf) {
+        throw 'Pending switch health validation requires exactly one component journal.'
+    }
+
+    $journal = Read-CpaStackJson -Path $journalPath
+    $current = Read-CpaStackJson -Path (Join-Path $StackRoot 'state\current.json')
+    $marker = Read-CpaStackJson -Path (Join-Path $StackRoot '.cpa-stack-instance.json')
+    $expectedOperation = "switch-$Component"
+    if ([string]$journal.operation -cne $expectedOperation -or
+        [string]$journal.phase -cne 'runtime-verified' -or
+        [string]$journal.operationId -notmatch '^[0-9a-fA-F]{32}$') {
+        throw "Pending $Component switch journal is not ready for transition health validation."
+    }
+    if ([string]$journal.instanceId -notmatch '^[0-9a-fA-F]{32}$' -or
+        [string]$journal.instanceId -cne [string]$current.instanceId -or
+        [string]$journal.instanceId -cne [string]$marker.instanceId) {
+        throw "Pending $Component switch journal belongs to a different stack instance."
+    }
+
+    $componentState = $current.$Component
+    if ([string]$journal.oldHash -notmatch '^[0-9A-Fa-f]{64}$' -or
+        [string]$journal.newHash -notmatch '^[0-9A-Fa-f]{64}$' -or
+        [string]$componentState.sha256 -cne ([string]$journal.oldHash).ToUpperInvariant()) {
+        throw "Pending $Component switch hashes do not match the recorded transition."
+    }
+
+    $expectedRuntime = if ($Component -eq 'cpa') { [string]$Settings.Cpa.WorkingDirectory } else { [string]$Settings.Manager.WorkingDirectory }
+    if (-not (Test-PathEqual -Left ([string]$journal.targetRuntime) -Right $expectedRuntime)) {
+        throw "Pending $Component switch targets an unexpected runtime."
+    }
+    if ($Component -eq 'manager' -and -not (Test-PathEqual -Left ([string]$journal.targetData) -Right ([string]$Settings.Manager.DataDirectory))) {
+        throw 'Pending manager switch targets an unexpected data directory.'
+    }
+
+    $expectedHashes[$Component] = ([string]$journal.newHash).ToUpperInvariant()
+    return [pscustomobject]@{ ExpectedHashes = $expectedHashes }
 }
 
 function Invoke-JsonProbe {
@@ -1063,7 +1128,8 @@ try {
     $pendingOperations = @($pendingState.Paths)
     $rootSecurity = Get-RootSecurityState -StackRoot $settings.StackRoot
     $managerDataSecurity = Get-ManagerDataSecurityState -DataRoot $settings.Manager.DataDirectory
-    $integrity = Get-CurrentIntegrityState -StackRoot $settings.StackRoot
+    $pendingSwitchProbe = Get-PendingSwitchProbeContext -StackRoot $settings.StackRoot -Component $PendingSwitchComponent -Settings $settings
+    $integrity = Get-CurrentIntegrityState -StackRoot $settings.StackRoot -ExpectedExecutableHashes $pendingSwitchProbe.ExpectedHashes
     $trustStateReady = [bool]($rootSecurity.Protected -and $managerDataSecurity.Protected -and $integrity.Ready)
     $secretsState = Get-SecretsState -Path $SecretsPath
     $currentForProbe = $null
@@ -1072,6 +1138,8 @@ try {
     $currentManager = Get-JsonPropertyValue -Object $currentForProbe -Name 'manager'
     $expectedCpaHash = [string](Get-JsonPropertyValue -Object $currentCpa -Name 'sha256')
     $expectedManagerHash = [string](Get-JsonPropertyValue -Object $currentManager -Name 'sha256')
+    if ($pendingSwitchProbe.ExpectedHashes.Contains('cpa')) { $expectedCpaHash = [string]$pendingSwitchProbe.ExpectedHashes['cpa'] }
+    if ($pendingSwitchProbe.ExpectedHashes.Contains('manager')) { $expectedManagerHash = [string]$pendingSwitchProbe.ExpectedHashes['manager'] }
     $cpa = Get-CpaStatus -Settings $settings -SecretsState $secretsState -ExpectedHash $expectedCpaHash -TrustStateReady $trustStateReady
     $manager = Get-ManagerStatus -Settings $settings -SecretsState $secretsState -ExpectedHash $expectedManagerHash -TrustStateReady $trustStateReady
     $overallHealthy = ($secretsState.Safe.Ready -and $rootSecurity.Protected -and $managerDataSecurity.Protected -and $integrity.Ready -and $cpa.Healthy -and $manager.Healthy -and $pendingOperations.Count -eq 0)
