@@ -6,7 +6,7 @@
 
 [English](README.en.md)
 
-面向 Windows 的 CLIProxyAPI/CPA 与 CPA Manager Plus 安全迁移、恢复和升级工具。推荐直接告诉 Codex 你的目标，不需要记 PowerShell 命令；发现、ACL、SQLite 快照、候选验证、切换和回滚由工具自动完成。
+面向 Windows 本地部署的 CLIProxyAPI（CPA）与 CPA Manager Plus 安全迁移、恢复和升级工具。推荐直接告诉 Codex 你的目标，不需要记 PowerShell 命令；发现、ACL、SQLite 快照、候选验证、切换和回滚由工具自动完成。
 
 > 本项目是社区工具，与两个上游项目不存在官方隶属或背书关系。
 
