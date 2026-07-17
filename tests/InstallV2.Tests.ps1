@@ -207,7 +207,7 @@ function Get-ProductionExecutableSnapshot {
 }
 
 function Get-ProductionControlFileSnapshot {
-    param([Parameter(Mandatory = $true)][string[]]$ProductionRoot)
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$ProductionRoot)
 
     $paths = New-Object 'System.Collections.Generic.List[string]'
     foreach ($root in $ProductionRoot) {
