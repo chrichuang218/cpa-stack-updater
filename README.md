@@ -233,7 +233,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File $uninstaller -Yes
 
 请按 [SECURITY.md](SECURITY.md) 私下报告漏洞。Issue 中不要上传 key、`data.key`、SQLite、auth、完整配置或原始请求日志。
 
-**致谢**
+## 🙏 致谢
 
 感谢 [LINUX DO](https://linux.do/) 社区的支持与讨论
 
