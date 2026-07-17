@@ -11,12 +11,17 @@ param(
     [switch]$RequireV111Schema,
     [int]$ManagerPort = 18317,
     [int]$CpaPort = 8317,
+    [ValidatePattern('^[0-9A-Fa-f]{32}$')][string]$ParentOperationId,
     [switch]$DeferFinalCommit,
+    [scriptblock]$StartedProcessRegistration,
     [switch]$InProcess
 )
 
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "CpaStack.Common.ps1")
+if ($null -ne $StartedProcessRegistration -and -not $InProcess) {
+    throw '-StartedProcessRegistration is reserved for in-process callers.'
+}
 
 $sourceExe = Join-Path $SourceRuntime "cpa-manager-plus.exe"
 $targetExe = Join-Path $TargetRuntime "cpa-manager-plus.exe"
@@ -33,7 +38,14 @@ $journalPath = Join-Path $ControlRoot "state\switch-manager.pending.json"
 $journal = $null
 $snapshotStaging = $null
 $result = [ordered]@{
+    schemaVersion    = 1
+    operation        = "switch-manager"
+    operationId      = $null
+    parentOperationId = $ParentOperationId
+    instanceId       = $null
     component       = "Manager Plus"
+    managerPort     = $ManagerPort
+    cpaPort         = $CpaPort
     success         = $false
     rolledBack      = $false
     sourcePath      = $sourceExe
@@ -82,7 +94,7 @@ function Start-ManagerFormal {
         USAGE_DB_PATH        = (Join-Path $Data "usage.sqlite")
         CPA_MANAGER_ADMIN_KEY = [string]$secrets.managerAdminKey
     }
-    return Start-CpaStackProcess -FilePath $Exe -WorkingDirectory $Runtime -Environment $environment -RemoveEnvironment @("PANEL_PATH") -MinimalEnvironment
+    return Start-CpaStackProcess -FilePath $Exe -WorkingDirectory $Runtime -Environment $environment -RemoveEnvironment @("PANEL_PATH") -MinimalEnvironment -StartedProcessRegistration $StartedProcessRegistration
 }
 
 function Test-ManagerFormal {
@@ -175,6 +187,7 @@ function Assert-HistoryPreserved {
 
 try {
     $instanceMarker = Ensure-CpaStackInstanceMarker -ControlRoot $ControlRoot
+    $result.instanceId = [string]$instanceMarker.instanceId
     Assert-CpaStackPath -Path $SourceRuntime
     Assert-CpaStackPath -Path $SourceData
     Assert-CpaStackPath -Path $sourceExe -PathType Leaf
@@ -208,6 +221,7 @@ try {
 
     $formalBaseline = Get-CpaStackManagerSetupBaseline -ManagerPort $ManagerPort -ManagerAdminKey $secrets.managerAdminKey
     $operationId = [guid]::NewGuid().ToString("N")
+    $result.operationId = $operationId
     if ($sameRuntime -and $sameData) {
         $snapshotStaging = Join-Path $ControlRoot ("rollback\staging-manager-" + $operationId)
         $pending = Join-Path $ControlRoot ("rollback\pending-manager-" + $operationId)
@@ -224,8 +238,10 @@ try {
     }
     Assert-CpaStackChildPath -Root $ControlRoot -Path $journalPath
     $journal = [ordered]@{
+        schemaVersion = 1
         operation = "switch-manager"
         operationId = $operationId
+        parentOperationId = $ParentOperationId
         instanceId = [string]$instanceMarker.instanceId
         phase = "prepared"
         createdAt = (Get-Date).ToString("o")
@@ -233,6 +249,8 @@ try {
         sourceData = $SourceData
         targetRuntime = $TargetRuntime
         targetData = $TargetData
+        managerPort = $ManagerPort
+        cpaPort = $CpaPort
         pendingPath = $null
         oldHash = $result.oldHash
         newHash = $result.newHash

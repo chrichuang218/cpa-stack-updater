@@ -95,6 +95,18 @@ function New-CpaStackUpdaterTestFixture {
     if ($changedFiles -eq 0) {
         throw 'The test fixture did not isolate any LocalApplicationData lookup.'
     }
+    foreach ($relativePath in @(
+        'install.ps1',
+        'skills\cpa-safe-upgrade\scripts\CpaStack.Common.ps1',
+        'skills\cpa-safe-upgrade\scripts\Start-CPA-Stack.ps1'
+    )) {
+        $statefulPath = Join-Path $destinationFull $relativePath
+        $statefulContent = [System.IO.File]::ReadAllText($statefulPath, $strictUtf8)
+        if ($statefulContent.IndexOf($folderLookup, [System.StringComparison]::Ordinal) -ge 0 -or
+            $statefulContent.IndexOf($replacement, [System.StringComparison]::Ordinal) -lt 0) {
+            throw "The test fixture did not structurally isolate state-home access in '$relativePath'."
+        }
+    }
 
     return [pscustomobject]@{
         Repository = $destinationFull

@@ -21,10 +21,37 @@ try {
     Assert-Equal ([System.IO.Path]::GetFullPath($safeRoot).TrimEnd('\')) (Assert-CpaStackSecureLocalRoot -Path $safeRoot) 'Dedicated local root is accepted'
 
     Protect-CpaStackPrivateDirectory -Path $safeRoot
-    $acl = Get-Acl -LiteralPath $safeRoot
+    $acl = Get-CpaStackFileSystemAcl -Path $safeRoot
     Assert-True $acl.AreAccessRulesProtected 'Managed root ACL inheritance is disabled'
-    $ownerSid = [System.Security.Principal.NTAccount]::new([string]$acl.Owner).Translate([System.Security.Principal.SecurityIdentifier]).Value
+    $ownerSid = Get-CpaStackAclOwnerSid -Acl $acl
     Assert-Equal ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value) $ownerSid 'Managed root owner is the current Windows user'
+
+    $idempotentRoot = Join-Path $temp 'idempotent-root'
+    Protect-CpaStackPrivateDirectory -Path $idempotentRoot
+    $idempotentSecret = Join-Path $idempotentRoot 'idempotent-secret.txt'
+    Set-Content -LiteralPath $idempotentSecret -Value 'protected fixture' -Encoding ASCII
+    Protect-CpaStackSecretFile -Path $idempotentSecret
+    $scopedAclWriter = (Get-Command Set-CpaStackFileSystemAcl -CommandType Function).ScriptBlock
+    function Set-Acl { throw 'Idempotent ACL protection attempted a second write through Set-Acl.' }
+    function Set-CpaStackFileSystemAcl { throw 'Idempotent ACL protection attempted a second write through the scoped ACL writer.' }
+    try {
+        Protect-CpaStackPrivateDirectory -Path $idempotentRoot
+        Protect-CpaStackSecretFile -Path $idempotentSecret
+    } finally {
+        Remove-Item -LiteralPath Function:\Set-Acl -ErrorAction SilentlyContinue
+        Set-Item -LiteralPath Function:\Set-CpaStackFileSystemAcl -Value $scopedAclWriter
+    }
+
+    $daclOnlyRoot = Join-Path $temp 'dacl-only-root'
+    function Set-Acl { throw 'DACL-only protection must not call the Set-Acl cmdlet.' }
+    try {
+        Protect-CpaStackPrivateDirectory -Path $daclOnlyRoot
+        $daclOnlySecret = Join-Path $daclOnlyRoot 'secret.txt'
+        Set-Content -LiteralPath $daclOnlySecret -Value 'DACL-only fixture' -Encoding ASCII
+        Protect-CpaStackSecretFile -Path $daclOnlySecret
+    } finally {
+        Remove-Item -LiteralPath Function:\Set-Acl -ErrorAction SilentlyContinue
+    }
 
     $pluginSource = Join-Path $temp 'plugin-source'
     $pluginNested = Join-Path $pluginSource 'nested'
@@ -49,26 +76,26 @@ try {
 
     $untrustedSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0')
     $pluginFile = Join-Path $pluginDestination 'plugin.ps1'
-    $fileAcl = Get-Acl -LiteralPath $pluginFile
+    $fileAcl = Get-CpaStackFileSystemAcl -Path $pluginFile
     [void]$fileAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
         $untrustedSid,
         [System.Security.AccessControl.FileSystemRights]::Write,
         [System.Security.AccessControl.AccessControlType]::Allow
     ))
-    Set-Acl -LiteralPath $pluginFile -AclObject $fileAcl
+    Set-CpaStackFileSystemAcl -Path $pluginFile -Acl $fileAcl
     Assert-ThrowsMatch {
         Assert-CpaStackPrivateTree -Root $pluginDestination -Description 'Test plugins'
     } 'unexpected identity' 'An explicit untrusted write ACE on a plugin file is rejected'
 
     Protect-CpaStackPrivateTree -Root $pluginDestination
     $pluginSubdirectory = Join-Path $pluginDestination 'nested'
-    $directoryAcl = Get-Acl -LiteralPath $pluginSubdirectory
+    $directoryAcl = Get-CpaStackFileSystemAcl -Path $pluginSubdirectory
     [void]$directoryAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
         $untrustedSid,
         [System.Security.AccessControl.FileSystemRights]::Write,
         [System.Security.AccessControl.AccessControlType]::Allow
     ))
-    Set-Acl -LiteralPath $pluginSubdirectory -AclObject $directoryAcl
+    Set-CpaStackFileSystemAcl -Path $pluginSubdirectory -Acl $directoryAcl
     Assert-ThrowsMatch {
         Assert-CpaStackPrivateTree -Root $pluginDestination -Description 'Test plugins'
     } 'unexpected identity' 'An explicit untrusted write ACE on a plugin subdirectory is rejected'
@@ -90,7 +117,7 @@ try {
     foreach ($name in @('usage.sqlite', 'data.key', 'usage.sqlite-wal', 'usage.sqlite-shm')) {
         Set-Content -LiteralPath (Join-Path $managerData $name) -Value 'manager data fixture' -Encoding ASCII
     }
-    $walAcl = Get-Acl -LiteralPath (Join-Path $managerData 'usage.sqlite-wal')
+    $walAcl = Get-CpaStackFileSystemAcl -Path (Join-Path $managerData 'usage.sqlite-wal')
     Assert-False $walAcl.AreAccessRulesProtected 'Manager WAL inherits the protected data-root ACL'
     Assert-CpaStackPrivateTree -Root $managerData -Description 'Manager data fixture' -AllowInheritedDescendants
     Assert-ThrowsMatch {
@@ -102,7 +129,7 @@ try {
         [System.Security.AccessControl.FileSystemRights]::Write,
         [System.Security.AccessControl.AccessControlType]::Allow
     ))
-    Set-Acl -LiteralPath (Join-Path $managerData 'usage.sqlite-wal') -AclObject $walAcl
+    Set-CpaStackFileSystemAcl -Path (Join-Path $managerData 'usage.sqlite-wal') -Acl $walAcl
     Assert-ThrowsMatch {
         Assert-CpaStackPrivateTree -Root $managerData -Description 'Manager data fixture' -AllowInheritedDescendants
     } 'unexpected identity' 'Manager WAL rejects an explicit untrusted write ACE'
@@ -130,13 +157,13 @@ try {
     Protect-CpaStackPrivateTree -Root $legacyManagerRuntime
     Protect-CpaStackPrivateTree -Root $legacyManagerData
     Assert-CpaStackLegacyManagerSource -Runtime $legacyManagerRuntime -Data $legacyManagerData
-    $legacyManagerParentAcl = Get-Acl -LiteralPath $legacyManagerParent
+    $legacyManagerParentAcl = Get-CpaStackFileSystemAcl -Path $legacyManagerParent
     [void]$legacyManagerParentAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
         $untrustedSid,
         [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles,
         [System.Security.AccessControl.AccessControlType]::Allow
     ))
-    Set-Acl -LiteralPath $legacyManagerParent -AclObject $legacyManagerParentAcl
+    Set-CpaStackFileSystemAcl -Path $legacyManagerParent -Acl $legacyManagerParentAcl
     Assert-ThrowsMatch {
         Assert-CpaStackLegacyManagerSource -Runtime $legacyManagerRuntime -Data $legacyManagerData
     } 'replace descendants' 'Legacy Manager rejects DELETE_CHILD on the runtime/data parent'
@@ -149,7 +176,7 @@ try {
     New-Item -ItemType Directory -Force -Path $legacyParent | Out-Null
     Protect-CpaStackPrivateDirectory -Path $legacyParent
     $usersSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')
-    $legacyParentAcl = Get-Acl -LiteralPath $legacyParent
+    $legacyParentAcl = Get-CpaStackFileSystemAcl -Path $legacyParent
     [void]$legacyParentAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
         $usersSid,
         [System.Security.AccessControl.FileSystemRights]::ReadAndExecute,
@@ -157,85 +184,85 @@ try {
         [System.Security.AccessControl.PropagationFlags]::None,
         [System.Security.AccessControl.AccessControlType]::Allow
     ))
-    Set-Acl -LiteralPath $legacyParent -AclObject $legacyParentAcl
+    Set-CpaStackFileSystemAcl -Path $legacyParent -Acl $legacyParentAcl
     $legacyRuntime = Join-Path $legacyParent 'runtime'
     $legacyAuth = Join-Path $legacyRuntime 'auth'
     $legacyPlugins = Join-Path $legacyRuntime 'plugins'
     New-Item -ItemType Directory -Force -Path $legacyAuth, $legacyPlugins | Out-Null
     Set-Content -LiteralPath (Join-Path $legacyRuntime 'cli-proxy-api.exe') -Value 'legacy executable fixture' -Encoding ASCII
-    Set-Content -LiteralPath (Join-Path $legacyRuntime 'config.yaml') -Value "host: `"127.0.0.1`"`r`nport: 8317" -Encoding ASCII
+    Set-Content -LiteralPath (Join-Path $legacyRuntime 'config.yaml') -Value "host: `"127.0.0.1`"`r`nport: 28317" -Encoding ASCII
     $legacyAuthFile = Join-Path $legacyAuth 'account.json'
     $legacyPluginFile = Join-Path $legacyPlugins 'plugin.ps1'
     Set-Content -LiteralPath $legacyAuthFile -Value '{}' -Encoding ASCII
     Set-Content -LiteralPath $legacyPluginFile -Value '# legacy plugin' -Encoding ASCII
     $currentUserSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
     foreach ($legacyPath in @($legacyRuntime, $legacyAuth, $legacyPlugins, (Join-Path $legacyRuntime 'cli-proxy-api.exe'), (Join-Path $legacyRuntime 'config.yaml'), $legacyAuthFile, $legacyPluginFile)) {
-        $legacyAcl = Get-Acl -LiteralPath $legacyPath
+        $legacyAcl = Get-CpaStackFileSystemAcl -Path $legacyPath
         $legacyAcl.SetOwner($currentUserSid)
-        Set-Acl -LiteralPath $legacyPath -AclObject $legacyAcl
+        Set-CpaStackFileSystemAcl -Path $legacyPath -Acl $legacyAcl
     }
-    $inheritedUsersRead = @(Get-Acl -LiteralPath $legacyAuthFile).Access | Where-Object {
+    $inheritedUsersRead = @(Get-CpaStackAclAccessRules -Acl (Get-CpaStackFileSystemAcl -Path $legacyAuthFile)) | Where-Object {
         $_.IsInherited -and $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -eq $usersSid.Value
     }
     Assert-True (@($inheritedUsersRead).Count -gt 0) 'Legacy fixture has an inherited Users read ACE'
     Assert-CpaStackLegacyCpaSource -Runtime $legacyRuntime -ConfigPath (Join-Path $legacyRuntime 'config.yaml')
 
-    $legacyPluginAcl = Get-Acl -LiteralPath $legacyPluginFile
+    $legacyPluginAcl = Get-CpaStackFileSystemAcl -Path $legacyPluginFile
     [void]$legacyPluginAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
         $untrustedSid,
         [System.Security.AccessControl.FileSystemRights]::Write,
         [System.Security.AccessControl.AccessControlType]::Allow
     ))
-    Set-Acl -LiteralPath $legacyPluginFile -AclObject $legacyPluginAcl
+    Set-CpaStackFileSystemAcl -Path $legacyPluginFile -Acl $legacyPluginAcl
     Assert-ThrowsMatch {
         Assert-CpaStackLegacyCpaSource -Runtime $legacyRuntime -ConfigPath (Join-Path $legacyRuntime 'config.yaml')
     } 'mutable access' 'Legacy plugins reject a non-trusted write ACE without laundering it'
     Protect-CpaStackSecretFile -Path $legacyPluginFile
 
-    $legacyAuthAcl = Get-Acl -LiteralPath $legacyAuthFile
+    $legacyAuthAcl = Get-CpaStackFileSystemAcl -Path $legacyAuthFile
     [void]$legacyAuthAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
         $untrustedSid,
         [System.Security.AccessControl.FileSystemRights]::Modify,
         [System.Security.AccessControl.AccessControlType]::Allow
     ))
-    Set-Acl -LiteralPath $legacyAuthFile -AclObject $legacyAuthAcl
+    Set-CpaStackFileSystemAcl -Path $legacyAuthFile -Acl $legacyAuthAcl
     Assert-ThrowsMatch {
         Assert-CpaStackLegacyCpaSource -Runtime $legacyRuntime -ConfigPath (Join-Path $legacyRuntime 'config.yaml')
     } 'mutable access' 'Legacy auth rejects a non-trusted mutable ACE without laundering it'
     Protect-CpaStackSecretFile -Path $legacyAuthFile
 
-    $legacyRuntimeAcl = Get-Acl -LiteralPath $legacyRuntime
+    $legacyRuntimeAcl = Get-CpaStackFileSystemAcl -Path $legacyRuntime
     [void]$legacyRuntimeAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
         $untrustedSid,
         ([System.Security.AccessControl.FileSystemRights]::CreateDirectories -bor [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles),
         [System.Security.AccessControl.AccessControlType]::Allow
     ))
-    Set-Acl -LiteralPath $legacyRuntime -AclObject $legacyRuntimeAcl
+    Set-CpaStackFileSystemAcl -Path $legacyRuntime -Acl $legacyRuntimeAcl
     Assert-ThrowsMatch {
         Assert-CpaStackLegacyCpaSource -Runtime $legacyRuntime -ConfigPath (Join-Path $legacyRuntime 'config.yaml')
     } 'mutable access' 'Legacy runtime parent rejects non-trusted child replacement rights'
     Protect-CpaStackPrivateDirectory -Path $legacyRuntime
     Assert-CpaStackLegacyCpaSource -Runtime $legacyRuntime -ConfigPath (Join-Path $legacyRuntime 'config.yaml')
 
-    $legacyParentAcl = Get-Acl -LiteralPath $legacyParent
+    $legacyParentAcl = Get-CpaStackFileSystemAcl -Path $legacyParent
     [void]$legacyParentAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
         $untrustedSid,
         [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles,
         [System.Security.AccessControl.AccessControlType]::Allow
     ))
-    Set-Acl -LiteralPath $legacyParent -AclObject $legacyParentAcl
+    Set-CpaStackFileSystemAcl -Path $legacyParent -Acl $legacyParentAcl
     Assert-ThrowsMatch {
         Assert-CpaStackLegacyCpaSource -Runtime $legacyRuntime -ConfigPath (Join-Path $legacyRuntime 'config.yaml')
     } 'replace descendants' 'Legacy source rejects DELETE_CHILD on its immediate parent'
     Protect-CpaStackPrivateDirectory -Path $legacyParent
 
-    $legacyGrandparentAcl = Get-Acl -LiteralPath $legacyGrandparent
+    $legacyGrandparentAcl = Get-CpaStackFileSystemAcl -Path $legacyGrandparent
     [void]$legacyGrandparentAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
         $untrustedSid,
         [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles,
         [System.Security.AccessControl.AccessControlType]::Allow
     ))
-    Set-Acl -LiteralPath $legacyGrandparent -AclObject $legacyGrandparentAcl
+    Set-CpaStackFileSystemAcl -Path $legacyGrandparent -Acl $legacyGrandparentAcl
     Assert-ThrowsMatch {
         Assert-CpaStackLegacyCpaSource -Runtime $legacyRuntime -ConfigPath (Join-Path $legacyRuntime 'config.yaml')
     } 'replace descendants' 'Legacy source rejects DELETE_CHILD on a higher ancestor'

@@ -6,152 +6,205 @@
 
 [English](README.en.md)
 
-面向 Windows 的 CLIProxyAPI/CPA 与 CPA Manager Plus 安全自动升级工具。
-
-新版本会先从官方 GitHub Release 下载并校验，再在仅本机可访问的临时端口启动候选版本。只有候选验证、SQLite online backup 可生成并重新打开、`quick_check` 和数据兼容检查全部通过后，才切换正式服务；正式切换失败会自动恢复上一个健康版本。
+面向 Windows 的 CLIProxyAPI/CPA 与 CPA Manager Plus 安全迁移、恢复和升级工具。v0.2 将交互收敛为“薄 Skill + 小而稳定的事务执行器”：Skill 只判断该调用哪个公开命令，复杂的发现、ACL、SQLite 快照、候选验证、切换和回滚都封装在 bundled PowerShell 中。
 
 > 本项目是社区工具，与两个上游项目不存在官方隶属或背书关系。
 
-## 解决什么问题
-
-手工升级经常留下多个运行目录、旧 ZIP、测试数据库、备份目录和启动脚本，最终不知道哪一份才是正式数据。本工具将其收敛成一个 canonical root：
+## v0.2 架构
 
 ```text
-发现 -> 计划 -> 下载校验 -> 候选验证 -> SQLite 快照
-     -> 原子切换 -> 正式验证 -> 提交
-                           \-> 失败自动恢复
+status（只读）
+  ├─ requiredOperation=recover ──> recover
+  ├─ requiredOperation=migrate ──> migrate
+  └─ canonical healthy ──────────> upgrade
+
+shortcut / lan / start / Skill installer 均为独立操作
 ```
 
-旧安装可以在 C、D、E 任意盘，也可以包含空格和中文。迁移时只接管当前正在运行的程序、配置、认证文件和正式 Manager 数据，不导入旧日志、历史下载和测试数据库。
+`upgrade` 不会隐式迁移、恢复、修改快捷方式或启用 LAN。每个有状态操作都必须单独执行，授权和失败范围清晰。
 
 ## 安全保证
 
-- 8318/18318 候选端口只绑定 `127.0.0.1`。
-- 校验官方压缩包和 checksum 的 SHA256。
-- 解压前检查路径穿越、文件数量和总大小。
-- Manager 数据使用 SQLite online backup。
-- 同一 Windows 账户跨登录会话文件锁阻止并发升级、安装和卸载。
-- pending journal 支持硬中断恢复，绑定实例 ID 且不保存密钥。
-- 候选测试后、正式切换前再次校验 exe hash。
-- 长驻服务以无控制台窗口方式启动，只继承显式指向 `NUL` 的标准句柄，不会把升级命令的输出管道永久占住。
-- 停服前固定已验证 listener 的 `Process`；即使 listener 提前消失，仍等待同一进程退出和 executable 文件锁释放。updater 启动但未监听的游离候选也按固定进程清理。
-- 整个管理根只允许当前用户、SYSTEM 和 Administrators 访问。
-- runtime 直接父目录和整个 Manager data tree（含 WAL/SHM）都会做 owner、ACL 与 reparse 检查。
-- 非原地回滚在执行旧 Manager 前复核 exe、`data.key`、必需业务表，以及 `usage_events` 的 count/max-id/max-timestamp 水位；升级前存在的 settings/model-price 数据不得减少。
-- SQLite 校验保护业务数据语义，不要求数据库文件 SHA256、大小、页布局、WAL/SHM、checkpoint 或 rollup 绝对一致。
-- 按 Windows PowerShell 5.1 的目录 247 字符、文件 259 字符预算预检所有切换路径；超限会在停服前失败。
-- 不会终止路径不匹配的未知端口进程。
-- 未经单独明确授权，不删除旧安装和历史目录。
+- 候选进程使用动态分配、未占用的高位 loopback 端口；候选端口不是固定用户接口。
+- 正式端口来自 managed stack 配置，不假设盘符或端口。
+- 只从两个硬编码官方上游读取 Release，并校验 HTTPS、checksum 与 SHA256。
+- ZIP 解压前检查路径穿越、文件数量与总大小。
+- Manager 数据使用 SQLite online backup，并验证 `quick_check`、必需业务表和历史水位。
+- pending journal 绑定 instanceId 且不保存 secret，支持硬中断恢复。
+- 停服前固定已验证 listener 的 `Process`；路径/PID 不匹配时绝不终止未知进程。
+- 长驻服务无控制台运行，只继承显式指向 `NUL` 的标准句柄。
+- managed root、runtime、auth/plugins、Manager data 和关键父目录执行 owner、DACL 与 reparse 检查。
+- Windows PowerShell 5.1 路径预算在正式停服前完成。
+- 正式切换失败时自动恢复上一健康 runtime；未经授权不删除 legacy 安装或历史目录。
+- updater installer 只更新 Skill、稳定 launcher 与 root registration，不升级正式 CPA/Manager，也不改变 LAN。
 
-## 环境要求
+完整模型见 [docs/safety-model.md](docs/safety-model.md)。
+
+## 要求
 
 - Windows 10/11 x64
 - Windows PowerShell 5.1 或 PowerShell 7
 - Python 3.10+
-- 本地 NTFS 或 ReFS 磁盘
-- 迁移场景下需要已有 CLIProxyAPI 和 CPA Manager Plus
+- 本地 NTFS 或 ReFS
+- 迁移场景下已有 CLIProxyAPI 与 CPA Manager Plus
 
-普通安装不需要 Git；只有选择克隆仓库参与开发时才需要 Git。
+仓库不包含第三方 exe、真实配置、密钥、数据库或遥测代码。
 
-仓库不包含任何第三方 exe、真实配置、密钥、数据库或遥测代码。
+## 安装或更新 Skill
 
-## 快速开始
-
-从 [Releases](https://github.com/chrichuang218/cpa-stack-updater/releases/latest) 下载最新 `Source code (zip)` 并解压，在解压目录打开 PowerShell，然后运行：
+从 [Releases](https://github.com/chrichuang218/cpa-stack-updater/releases/latest) 下载并解压可信发行包。先做严格只读检查：
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -StackRoot 'E:\CPA-Stack'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 `
+  -Action Check `
+  -StackRoot 'E:\CPA-Stack' `
+  -Json
 ```
 
-`Bypass` 只对这一次安装进程生效，不会修改系统或当前用户的长期执行策略。开发者也可以用 Git 克隆仓库后运行同一命令。
+确认后原子安装或更新：
 
-安装完成后，解压目录可以删除。以后始终使用已安装的稳定 CLI；每次打开新 PowerShell 先定义：
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 `
+  -Action Update `
+  -StackRoot 'E:\CPA-Stack' `
+  -Json
+```
+
+可用 `-CodexHome` 指定非默认 Codex 目录。安装器采用双槽与受保护 journal；并发 Update 只提交一次，硬中断后再次 Update 会先恢复。显式传入全新的空 `StackRoot` 时，安装器会创建受保护 instance marker 与稳定 launcher，使后续显式 `migrate` 能进入同一 root；它不会安装或启动 CPA runtime。稳定 launcher 写入 `<StackRoot>\ops\Start-CPA-Stack.ps1`，且不会创建桌面快捷方式。
+
+`Bypass` 只作用于本次进程，不修改长期执行策略。安装完成后可删除解压目录。
+
+## 使用 v2 CLI
 
 ```powershell
 $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
 $cpaCli = Join-Path $codexHome 'skills\cpa-safe-upgrade\scripts\cpa-stack.ps1'
+$root = 'E:\CPA-Stack'
 ```
 
-`E:` 只是示例；请换成这台电脑真实存在的本地 NTFS/ReFS 目录。安装器会为 Skill 写入所有权标记，卸载时只删除由本工具安装且标记有效的目录，不会触碰 CPA runtime 或数据。
+`E:` 只是示例；C、D、E 盘、空格和非 ASCII 路径均可，目标必须通过本地文件系统安全检查。
 
-先只读查看计划：
+### 1. 只读检查
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli plan -Root 'E:\CPA-Stack' -Json
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli status -Root $root -Json
 ```
 
-确认后迁移并升级。默认不会修改桌面快捷方式；如果旧快捷方式仍指向 legacy launcher，重启或再次点击它可能重新启动旧 runtime/data。首次迁移前，请明确选择一种启动方式：
+`status` 成功完成检查时退出 0；栈不健康会通过 `outcome=Blocked` 表达。检查协议本身失败时 `success=false` 且退出非零。查看 `requiredOperation` 决定下一条命令。
 
-- 如果允许工具把发现到的 CPA 桌面快捷方式更新为 canonical launcher，请执行：
+### 2. 显式恢复或迁移
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli upgrade -Root 'E:\CPA-Stack' -UpdateDesktopShortcut -Json
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli recover -Root $root -Json
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli migrate -Root $root -Json
 ```
 
-  更新后的 `.lnk` 会通过 `powershell.exe -NonInteractive -WindowStyle Hidden` 启动 canonical launcher，双击时不显示 PowerShell 窗口。直接在终端运行 CLI 时仍保留正常输出，内部 bundled PowerShell 复用当前控制台，不会另开窗口。
+仅执行 `status` 要求且用户已授权的操作。自动发现不唯一时，用 `-RequestPath` 提供显式迁移 request；request 只保存来源路径、secrets 文件路径和可选正式端口，不保存 secret 值。格式见 [migration-request.md](skills/cpa-safe-upgrade/references/migration-request.md)。
 
-- 如果不授权修改快捷方式，请执行不带该开关的升级；以后不要再使用旧快捷方式，统一通过 canonical CLI 启动：
+### 3. 升级健康 canonical stack
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli upgrade -Root 'E:\CPA-Stack' -Json
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli start -Root 'E:\CPA-Stack'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli upgrade -Root $root -Json
 ```
 
-如果旧二进制没有可靠版本信息，工具会先阻断，避免把 nightly/预发布版误降级到 latest stable。理解风险并明确决定替换未知版本后，再使用：
+未知版本默认阻断，避免把预发布版误降到 latest stable。用户理解并再次明确接受后才使用：
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli upgrade -Root 'E:\CPA-Stack' -AllowUnknownVersionReplacement -Json
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli upgrade `
+  -Root $root `
+  -AllowUnknownVersionReplacement `
+  -Json
 ```
 
-首次成功后会登记根目录，以后可以直接：
+### 4. 启动
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli status -Json
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli start
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli upgrade -Json
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli start -Root $root -NoBrowser
 ```
 
-如果目标目录来自本工具的早期版本、已有 canonical runtime/data 但还没有 `instanceId` marker，`upgrade` 会先验证固定路径、运行进程和已记录 hash，再用无密钥 journal 原地接管并加固 ACL；不会重新复制或清空 Manager 数据。
+`start` 不会隐式恢复 pending transaction。
 
-## Codex Skill
+## 桌面快速启动
 
-`install.ps1` 会把 `cpa-safe-upgrade` 安装到 `$CODEX_HOME\skills`；如果没有设置 `CODEX_HOME`，则安装到 `$HOME\.codex\skills`。
+installer 首次生成稳定 launcher；桌面快捷方式由独立命令管理。先检查，首次不存在或后续 drift 时再 Ensure：
 
-示例：
+```powershell
+$shortcut = Join-Path ([Environment]::GetFolderPath('Desktop')) 'CPA 本地启动（新版）.lnk'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli shortcut `
+  -Action Check -Root $root -ShortcutPath $shortcut -Json
 
-> 使用 $cpa-safe-upgrade，发现我当前的 CPA，把它迁移到 E:\CPA-Stack，然后安全升级 CPA 和 Manager Plus。
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli shortcut `
+  -Action Ensure -Root $root -ShortcutPath $shortcut -Json
+```
 
-Skill 只调用统一的 `cpa-stack.ps1`，不会临时手写停止、复制和启动命令。
+识别到可接管的旧快捷方式时，只有明确授权后才添加 `-AdoptExisting`。未知冲突不会被覆盖。
 
-更新 updater 时，下载新 Release 并再次运行 `install.ps1`；安装器会原子替换同一个稳定路径。如果提示 Skill 目录被占用，请关闭正在查看已安装 `SKILL.md` 的编辑器或工作目录位于该 Skill 下的终端，再重试。安装器不会结束这些进程，失败时会保留当前 Skill 与已有回滚槽。如果结果为 `success=true`、`complete=false`，表示新 Skill 已提交，但 launcher、root locator 或旧槽清理存在明确的 `postCommitWarnings`；处理对应占用或 ACL 问题后再次运行安装器即可。卸载无需保留原 ZIP：
+## LAN 暴露
+
+LAN 是独立高风险操作。解释风险并得到明确授权后才切换：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli lan -Action Set -Mode Lan -Root $root -Json
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli lan -Action Set -Mode Loopback -Root $root -Json
+```
+
+候选验证始终只允许 loopback。
+
+## JSON 契约
+
+所有公开命令返回 schema v2 envelope：
+
+```json
+{
+  "schemaVersion": 2,
+  "operation": "upgrade",
+  "success": true,
+  "outcome": "Changed",
+  "changed": true,
+  "rolledBack": false,
+  "recovered": false,
+  "root": "E:\\CPA-Stack",
+  "before": null,
+  "after": null,
+  "warnings": [],
+  "error": null,
+  "updaterVersion": "0.2.0"
+}
+```
+
+`error` 非空时稳定包含 `code` 与 `message`。操作专属详情用于诊断；不要依赖未文档化的内部 journal 或动态候选端口。
+
+完整语法见 [docs/cli.md](docs/cli.md)。
+
+## 卸载
 
 ```powershell
 $uninstaller = Join-Path $codexHome 'skills\cpa-safe-upgrade\scripts\Uninstall-CpaSafeUpgrade.ps1'
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File $uninstaller -Yes
 ```
 
-卸载只移除带有效所有权 marker 的 Skill 与上一版本副本，不触碰 CPA runtime 或 Manager 数据。
+卸载只移除带有效 ownership marker 的 Skill 与回滚槽，不触碰 CPA runtime、Manager 数据或 legacy 安装。
 
-## 任意目录
+## 根目录
 
-根目录优先级：
+优先级：
 
-1. 命令行 `-Root`
-2. 环境变量 `CPA_STACK_ROOT`
-3. 上次初始化成功后保存的受保护 locator
+1. `-Root`
+2. `CPA_STACK_ROOT`
+3. 受保护 root locator
 4. `%LOCALAPPDATA%\CPAStack`
 
-以下位置会被拒绝：盘符根目录、UNC、exFAT、Git 工作区、Windows/Program Files 子树和用户主目录本身。默认的 `%LOCALAPPDATA%\CPAStack` 专用子目录仍可使用。
+盘符根、UNC、Git worktree、Windows/Program Files 子树、用户主目录本身和不受支持的文件系统会被拒绝。
 
-详细命令见 [docs/cli.md](docs/cli.md)，安全模型见 [docs/safety-model.md](docs/safety-model.md)。
+## 测试与发布
 
-## 发布阶段
+测试使用隔离 root/state/lock、动态高位 loopback 端口和 `KILL_ON_JOB_CLOSE` Job Object；正式端口、正式 PID、正式 root 与控制文件是发布阻断保护项。CI 在 Windows PowerShell 5.1 和 PowerShell 7 运行完整套件。
 
-`v0.1.x` 是公开加固阶段，真实验证按 5 台、20 台、100 台逐步扩展。没有真实恢复证据前，不宣称已经覆盖所有 Windows 环境。
+v0.2.0 是架构与事务接口重构版；真实环境仍应逐步扩展验证，不宣称覆盖所有 Windows 配置。
 
 ## 安全反馈
 
-请按 [SECURITY.md](SECURITY.md) 私下报告漏洞。Issue 中不要上传 key、`data.key`、SQLite、auth 文件、完整配置或原始请求日志。
+请按 [SECURITY.md](SECURITY.md) 私下报告漏洞。Issue 中不要上传 key、`data.key`、SQLite、auth、完整配置或原始请求日志。
 
 ## License
 

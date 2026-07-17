@@ -1,160 +1,121 @@
 ---
 name: cpa-safe-upgrade
-description: 在 Windows 上安全发现、迁移、启动、恢复和自动升级 CLIProxyAPI/CPA 与 CPA Manager Plus。仅当用户明确要求升级 CPA、升级 CLIProxyAPI、升级 CPA Manager Plus、把已有安装迁移到任意盘的统一 CPA Stack、恢复中断升级，或显式调用 cpa-safe-upgrade 时使用。用户只是询问端口、监控、管理页面或普通启动问题时不要触发，除非同时明确要求升级、迁移或恢复。
+description: 在 Windows 上安全检查、迁移、恢复、启动或升级 CLIProxyAPI/CPA 与 CPA Manager Plus，并从用户已提供的可信本地发行目录原子检查或更新本 Skill、管理 CPA 桌面快捷方式或显式切换 LAN。仅当用户明确要求升级、迁移、恢复、更新 cpa-safe-upgrade、生成或修复 CPA 快捷方式、改变 LAN 暴露，或显式调用 cpa-safe-upgrade 时使用；普通端口查询、监控页面问题和未伴随上述目标的日常启动不要触发。
 ---
 
 # CPA Safe Upgrade
 
-只使用 bundled `scripts/cpa-stack.ps1` 作为公开执行入口。它把发现、SQLite 快照、候选验证、正式切换、中断恢复和结构化结果封装成稳定命令。
+## 执行边界
 
-不要临时重写迁移或切换脚本。不要直接调用 `Test-*` 或 `Switch-*` 内部脚本。
+只使用 bundled `scripts/cpa-stack.ps1` 处理 CPA/Manager runtime。不要直接调用内部 `Test-*`、`Switch-*`、初始化或启动脚本，也不要临时重写停止、复制、迁移、切换或恢复逻辑。
 
-读取本文件后，先用实际 `SKILL.md` 绝对路径确定 skill 根目录。交互式 shell 中的 `$PSScriptRoot` 不是 skill 根目录，不能用它定位入口：
+更新 updater/Skill 时，只运行用户已提供并明确指出的可信本地发行目录中的 `install.ps1`。禁止本 Skill 下载、管道执行或在线替换自身代码；找不到本地 installer 时停止并请求其路径。在线查询与下载只允许由 runtime 事务执行器用于两个官方 CPA/Manager Release。
 
-```powershell
-$skillRoot = Split-Path -Parent ((Resolve-Path -LiteralPath '<本次实际读取的 SKILL.md 绝对路径>').Path)
-```
+不要输出 secret、auth、完整配置、数据库、长日志或完整 HTML。未经明确授权，不删除 legacy 安装、历史目录或备份。
 
-## 根目录解析
+## 定位入口
 
-按以下优先级确定 managed root：
-
-1. 用户明确指定的路径，通过 `-Root` 传入。
-2. `CPA_STACK_ROOT`。
-3. 上次成功初始化写入的受保护 root locator。
-4. `%LOCALAPPDATA%\CPAStack`。
-
-绝不能假设盘符。C/D/E 盘、空格和非 ASCII 路径均可使用，但目标必须位于本地 NTFS 或 ReFS。
-
-## 只读发现
-
-任何有状态操作前先执行：
+从本次实际读取的 `SKILL.md` 绝对路径计算 skill 根目录；交互式 shell 中的 `$PSScriptRoot` 不是 skill 根目录：
 
 ```powershell
-& (Join-Path $skillRoot 'scripts\cpa-stack.ps1') status -Root '<用户指定根目录>' -Json
+$skillRoot = Split-Path -Parent ((Resolve-Path -LiteralPath '<实际 SKILL.md 绝对路径>').Path)
+$cpaCli = Join-Path $skillRoot 'scripts\cpa-stack.ps1'
 ```
 
-只有用户没有指定目录时才省略 `-Root`。
+managed root 优先使用用户明确给出的 `-Root`，否则让 CLI 按 `CPA_STACK_ROOT`、受保护 locator、默认 LocalAppData 专用目录解析。绝不假设盘符。
 
-需要预览时执行：
+## v2 意图映射
+
+用户只要求检查、审计或查看是否需要操作时，执行只读状态：
 
 ```powershell
-& (Join-Path $skillRoot 'scripts\cpa-stack.ps1') plan -Root '<用户指定根目录>' -Json
+& $cpaCli status -Root '<managed root>' -Json
 ```
 
-`plan` 必须保持完全只读。
-
-## 自动升级
-
-只有收到明确升级授权后才执行：
+用户已经明确要求恢复、迁移或升级时，不要先重复执行完整 `status`；直接调用对应事务一次：
 
 ```powershell
-& (Join-Path $skillRoot 'scripts\cpa-stack.ps1') upgrade -Root '<用户指定根目录>' -Json
+& $cpaCli recover -Root '<managed root>' -Json
+& $cpaCli migrate -Root '<managed root>' -Json
+& $cpaCli upgrade -Root '<managed root>' -Json
 ```
 
-如果 `status` 表明需要首次迁移，且发现了仍指向 legacy launcher 的 CPA 桌面快捷方式，执行前必须向用户说明：默认不会修改该快捷方式；迁移后再次使用它可能重新启动旧 runtime/data。只有用户明确授权更新快捷方式后，才在上述升级命令的 `-Json` 前加入 `-UpdateDesktopShortcut`。
+只依据 v2 envelope 决定下一步：
 
-获准刷新的 canonical 快捷方式必须由 updater 生成并通过 `powershell.exe -NonInteractive -WindowStyle Hidden` 启动；不要手工拼接或降级为可见 PowerShell 窗口。手工运行 CLI 时保留调用方终端输出；bundled PowerShell 必须复用同一控制台，不要另开可见窗口，也不要给直接 CLI 添加隐藏参数。
+1. `success=true`：报告结果，不追加无关检查或操作。
+2. `outcome=RecoveryRequired`：对同一 root 自动执行一次 `recover`；恢复成功后只重试一次原命令。再次要求恢复或返回 `ManualRecoveryRequired` 时停止。
+3. `error.code=MigrationRequired`：停止并说明需要用户单独授权迁移/接管；升级授权不等于迁移授权。
+4. 其他 `success=false`：停止并报告 `error.code`；不要用升级、启动或默认值掩盖故障。
 
-如果用户不授权，不得添加该开关；迁移完成后必须明确要求用户停用旧快捷方式，并统一使用下文“恢复和启动”中的 canonical `start` 命令。
+CLI 内部的恢复、迁移和升级 interface 互不隐式调用；上面的单次恢复重试只是薄 Skill 对已授权用户意图的有限编排。
 
-统一入口会完成：
-
-- 根据 8317/18317 正式监听进程和启动入口发现真实安装。
-- 有 pending journal 时优先恢复中断事务。
-- 对早期版本已有 canonical runtime/data、但缺少实例 marker 的根目录，验证固定路径、正式进程和记录 hash 后，用无密钥 journal 原地接管并加固 ACL；不重新复制数据。
-- 未接管但来源唯一且健康时，先用当前版本迁入 canonical root。
-- 在线查询两个官方 GitHub Release。
-- 校验 SHA256，并在解压前检查 ZIP 路径和大小边界。
-- 在仅回环可访问的临时端口验证 CPA 和 Manager 候选。
-- 为 Manager 创建 SQLite online backup。
-- 原子切换正式 runtime。
-- 正式切换失败时，在返回前恢复旧的健康 runtime。
-
-发现、密钥、文件系统、Python、磁盘空间、下载、checksum 或候选验证失败时，不得停止正式服务。
-
-如果结果提示无法证明版本单调，说明当前二进制版本不可可靠识别。先向用户明确解释“latest stable 可能低于本机预发布版”的风险；只有用户明确同意替换未知版本后，才重试：
+自动发现不唯一时，读取 [migration-request.md](references/migration-request.md)，生成不含 secret 值的临时 request JSON，再执行：
 
 ```powershell
-& (Join-Path $skillRoot 'scripts\cpa-stack.ps1') upgrade `
-  -Root '<用户指定根目录>' `
-  -AllowUnknownVersionReplacement `
-  -Json
+& $cpaCli migrate -Root '<managed root>' -RequestPath '<request.json>' -Json
 ```
 
-不得自行推断或静默添加这个开关。
+临时 request 只保存路径；使用后删除本次创建的 request。不要删除用户提供的 secrets 文件。
 
-## 显式迁移来源
-
-如果进程和启动信息无法唯一定位来源，显式传入：
+如果结果为未知版本替换阻断，先解释 latest stable 可能低于本机预发布版。只有用户再次明确接受后执行：
 
 ```powershell
-& (Join-Path $skillRoot 'scripts\cpa-stack.ps1') init `
-  -Root 'E:\CPA-Stack' `
-  -SourceCpaRuntime 'E:\apps\cpa' `
-  -SourceCpaConfig 'E:\config\cpa.yaml' `
-  -SourceManagerRuntime 'E:\apps\manager-plus' `
-  -SourceManagerData 'E:\data\manager-plus' `
-  -SecretsInputPath "$HOME\cpa-secrets.json" `
-  -Json
+& $cpaCli upgrade -Root '<managed root>' -AllowUnknownVersionReplacement -Json
 ```
 
-Secrets input 必须分别包含三个非空字段：
-
-```json
-{
-  "cpaClientApiKey": "...",
-  "cpaManagementKey": "...",
-  "managerAdminKey": "..."
-}
-```
-
-禁止输出或转述它们的值。初始化器不会擅自删除用户提供的 secrets 文件。
-
-只有用户明确授权修改桌面快捷方式时才传 `-UpdateDesktopShortcut`；未授权时，最终报告必须提示停用旧快捷方式并改用 canonical `start`。只有解释局域网暴露风险并得到明确授权后才传 `-ExposeToLan`；候选端口始终只允许 loopback。
-
-## 恢复和启动
-
-如果 status 报告 pending journal，不要直接运行 canonical launcher。调用 upgrade 入口，让恢复流程先收敛事务。
-
-启动已接管栈：
+`start` 只启动已接管且无 pending 的栈，不会隐式恢复：
 
 ```powershell
-& (Join-Path $skillRoot 'scripts\cpa-stack.ps1') start -Root '<用户指定根目录>' -NoBrowser
+& $cpaCli start -Root '<managed root>' -NoBrowser
 ```
 
-## 安全边界
+## 独立可选操作
 
-- 要求专用本地 NTFS/ReFS 根目录；拒绝 UNC、盘符根、Windows/Program Files 子树、用户主目录本身、Git worktree 和 reparse traversal。默认的 LocalAppData 专用子目录仍受支持。
-- managed root 只允许当前用户、SYSTEM 和本地 Administrators。
-- 在停止正式服务或禁用 Manager collector 前，必须让统一入口按 Windows PowerShell 5.1 的目录 247 字符、文件 259 字符预算检查投影树和事务后缀；不要绕过超限阻断。
-- CPA `auth`、可选 `plugins` 和整个 Manager data tree（含 WAL/SHM）递归拒绝 reparse point，并校验 owner 与 ACL；runtime/data 直接父目录也属于信任边界。
-- 首次迁移允许 legacy 源保留普通只读权限，但拒绝非受信主体修改或替换 runtime/config/auth/plugins；候选退出后用递归 manifest、config hash 与 host 绑定正式 target，不再从在线 legacy 源二次复制。
-- Manager online backup 必须可生成、可重新打开并通过 `quick_check`。非原地回滚保留 exe 与 `data.key` hash 校验，并要求必需业务表存在、`usage_events` 的 count/max-id/max-timestamp 水位不低于回滚基线；不要求 SQLite 文件 SHA256、大小、页布局、WAL/SHM、checkpoint 或 rollup 绝对一致。
-- marker、current 与所有 pending journal 必须绑定同一个 instanceId；缺失或冲突时停止恢复。
-- 迁移时以正式监听进程作为最强来源证据。
-- 即使三个 key 当前相同，也必须保持三个变量和用途分离。
-- 未经明确授权，不删除旧安装、日志、仓库或备份。
-- 只有端口 owner 的路径与当前事务预期一致时才允许固定其 `Process`；停服时必须使用该固定进程，即使 listener 提前消失也不能改按现场 PID 猜测。
-- updater 启动但未监听的游离候选必须按其固定 `Process` 清理；停止后必须等待同一进程完全退出、端口释放且 executable 可替换，新 owner 抢占时保持停止且不得误杀。
-- 长驻 CPA/Manager 必须以无控制台窗口方式启动，只能继承指向 `NUL` 的显式标准句柄，不能继承调用 Skill 的 PowerShell 管道或文件句柄。
-- 不以网页版本号或页面文字判断程序版本。
-- 对话中禁止输出 secret、auth 内容、完整配置、数据库、长日志和完整 HTML。
+快捷方式与 LAN 永远不并入 migrate 或 upgrade。
 
-诊断阻断或审查发布时读取 [references/safety-model.md](references/safety-model.md)。只有遇到具体失败时才读取 [references/troubleshooting.md](references/troubleshooting.md)。
+先只读检查明确的桌面快捷方式路径。首次不存在时，或后续检测到 drift 时，只有获得写入/接管授权后才 Ensure；`AdoptExisting` 需要单独明确授权：
+
+```powershell
+& $cpaCli shortcut -Action Check -Root '<managed root>' -ShortcutPath '<desktop .lnk>' -Json
+& $cpaCli shortcut -Action Ensure -Root '<managed root>' -ShortcutPath '<desktop .lnk>' -Json
+```
+
+只有解释局域网暴露风险并得到明确授权后才切到 LAN；恢复 Loopback 也使用同一独立操作：
+
+```powershell
+& $cpaCli lan -Action Set -Mode Lan -Root '<managed root>' -Json
+& $cpaCli lan -Action Set -Mode Loopback -Root '<managed root>' -Json
+```
+
+## 本地更新 updater/Skill
+
+用户提供可信本地发行目录后，先运行严格只读 Check：
+
+```powershell
+& '<local release>\install.ps1' -Action Check -CodexHome '<codex home>' -StackRoot '<managed root>' -Json
+```
+
+只有用户明确授权更新后才运行：
+
+```powershell
+& '<local release>\install.ps1' -Action Update -CodexHome '<codex home>' -StackRoot '<managed root>' -Json
+```
+
+installer 只更新 Skill、稳定 launcher 与 root registration；它不升级正式 CPA/Manager、不改变 LAN，也不生成桌面快捷方式。若存在 installer recovery pending，让同一个本地 installer 的 `Update` 收敛事务，不要手工混合复制目录。
+
+## 安全与诊断
+
+发布审查、ACL/进程/数据安全判断或恢复诊断时读取 [safety-model.md](references/safety-model.md)。只有遇到具体失败时读取 [troubleshooting.md](references/troubleshooting.md)。
+
+候选端口为执行器内部动态高位 loopback 资源，不作为用户接口、报告字段或固定端口假设。正式端口来自 managed stack 配置。
 
 ## 最终报告
 
 简洁报告：
 
-- managed root，以及是否发生迁移；
-- 是否发生旧 canonical 原地接管与 launcher 刷新；
-- 新旧版本和 hash；
-- 候选端口与正式端口结果；
-- SQLite、历史数据水位（空数据库也合法）和 collector 检查；
-- 是否自动回滚；
-- current 与 last-known-good 路径；
-- 用户明确授权的 shortcut 或 LAN 暴露变化；
-- warning 和未完成事项。
+- `operation`、`outcome`、`root`、`changed`、`rolledBack`、`recovered`；
+- 可用的 `before` / `after`、版本与 hash；
+- shortcut 或 LAN 是否发生用户授权的变化；
+- `warnings`、`error.code` 和未完成事项。
 
-不要粘贴长日志或任何 secret。
+不要报告动态候选端口、内部 journal 路径、secret 或长日志。

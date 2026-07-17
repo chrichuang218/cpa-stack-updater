@@ -9,16 +9,22 @@ param(
     [switch]$RequireV111Schema,
     [int]$CpaPort = 8317,
     [int]$FormalPort = 18317,
-    [int]$TempPort = 18318,
+    [Parameter(Mandatory = $true)][ValidateRange(1, 65535)][int]$TempPort,
+    [scriptblock]$StartedProcessRegistration,
     [switch]$InProcess
 )
 
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "CpaStack.Common.ps1")
+if ($null -ne $StartedProcessRegistration -and -not $InProcess) {
+    throw '-StartedProcessRegistration is reserved for in-process callers.'
+}
+
+[void](Assert-CpaStackCandidatePort -Port $TempPort -FormalPort @($CpaPort, $FormalPort))
 
 $candidateExe = Join-Path $CandidateRuntime "cpa-manager-plus.exe"
 $formalExe = Join-Path $FormalRuntime "cpa-manager-plus.exe"
-$testRoot = Join-Path $ControlRoot ("work\manager-18318-" + [guid]::NewGuid().ToString("N"))
+$testRoot = Join-Path $ControlRoot ("work\manager-candidate-" + [guid]::NewGuid().ToString("N"))
 $emptyData = Join-Path $testRoot "empty-data"
 $snapshotData = Join-Path $testRoot "snapshot-data"
 $baselinePath = Join-Path $testRoot "sqlite-baseline.json"
@@ -64,7 +70,7 @@ function Start-ManagerCandidate {
         USAGE_DB_PATH         = (Join-Path $Data "usage.sqlite")
         CPA_MANAGER_ADMIN_KEY = [string]$secrets.managerAdminKey
     }
-    return Start-CpaStackProcess -FilePath $candidateExe -WorkingDirectory $CandidateRuntime -Environment $environment -RemoveEnvironment @("PANEL_PATH") -MinimalEnvironment
+    return Start-CpaStackProcess -FilePath $candidateExe -WorkingDirectory $CandidateRuntime -Environment $environment -RemoveEnvironment @("PANEL_PATH") -MinimalEnvironment -StartedProcessRegistration $StartedProcessRegistration
 }
 
 function Assert-FormalManagerListener {

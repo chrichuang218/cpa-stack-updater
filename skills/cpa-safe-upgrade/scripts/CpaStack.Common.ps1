@@ -271,6 +271,128 @@ function Get-CpaStackListener {
     }
 }
 
+function Get-CpaStackCandidateProtectedPorts {
+    param([int[]]$FormalPort = @())
+
+    $protected = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($port in @(8317, 8318, 18317, 18318) + @($FormalPort)) {
+        if ($port -lt 1 -or $port -gt 65535) {
+            throw "Protected candidate port is outside the valid TCP range: $port"
+        }
+        [void]$protected.Add([int]$port)
+    }
+
+    $configured = [Environment]::GetEnvironmentVariable('CPA_STACK_TEST_PROTECTED_PORTS', 'Process')
+    if (-not [string]::IsNullOrWhiteSpace($configured)) {
+        foreach ($token in @($configured -split '[,;\s]+' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+            $port = 0
+            if (-not [int]::TryParse($token, [ref]$port) -or $port -lt 1 -or $port -gt 65535) {
+                throw "CPA_STACK_TEST_PROTECTED_PORTS contains an invalid TCP port: $token"
+            }
+            [void]$protected.Add($port)
+        }
+    }
+
+    return @($protected | Sort-Object)
+}
+
+function Get-CpaStackActiveListenerPorts {
+    $connections = @(Get-NetTCPConnection -State Listen -ErrorAction Stop)
+    $ports = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($connection in $connections) {
+        if ($null -eq $connection -or $null -eq $connection.PSObject.Properties['LocalPort']) { continue }
+        [void]$ports.Add([int]$connection.LocalPort)
+    }
+    return $ports
+}
+
+function Assert-CpaStackCandidatePort {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][ValidateRange(1, 65535)][int]$Port,
+        [int[]]$FormalPort = @()
+    )
+
+    $protected = @(Get-CpaStackCandidateProtectedPorts -FormalPort $FormalPort)
+    if ($Port -in $protected) {
+        $kind = if ($Port -in @($FormalPort)) { 'formal' } else { 'protected' }
+        throw "Candidate port $Port is a $kind port and cannot be used."
+    }
+    if ($Port -lt 49152) {
+        throw "Candidate port $Port is outside the high dynamic TCP range."
+    }
+    if ($Port -in @(Get-CpaStackActiveListenerPorts)) {
+        throw "Candidate port $Port already has an active listener."
+    }
+    return [pscustomobject]@{
+        Safe = $true
+        BindAddress = '127.0.0.1'
+        Port = $Port
+    }
+}
+
+function New-CpaStackCandidatePortPlan {
+    [CmdletBinding()]
+    param(
+        [int[]]$FormalPort = @(),
+        [string[]]$Name = @('CpaCandidate', 'ManagerCandidate')
+    )
+
+    if (@($Name).Count -lt 1) { throw 'At least one candidate port role is required.' }
+    $seenNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($role in @($Name)) {
+        if ([string]::IsNullOrWhiteSpace($role) -or -not $seenNames.Add($role)) {
+            throw 'Candidate port role names must be non-empty and unique.'
+        }
+    }
+
+    $unavailable = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($port in @(Get-CpaStackCandidateProtectedPorts -FormalPort $FormalPort)) { [void]$unavailable.Add([int]$port) }
+    foreach ($port in @(Get-CpaStackActiveListenerPorts)) { [void]$unavailable.Add([int]$port) }
+
+    $random = [System.Random]::new(([BitConverter]::ToInt32([guid]::NewGuid().ToByteArray(), 0) -band 0x7fffffff))
+    $reservations = [System.Collections.Generic.List[System.Net.Sockets.TcpListener]]::new()
+    $selected = [System.Collections.Generic.List[int]]::new()
+    try {
+        foreach ($role in @($Name)) {
+            $reservation = $null
+            for ($attempt = 0; $attempt -lt 512; $attempt++) {
+                $port = $random.Next(49152, 65536)
+                if ($unavailable.Contains($port)) { continue }
+                $candidate = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $port)
+                $candidate.ExclusiveAddressUse = $true
+                try {
+                    $candidate.Start()
+                    $reservation = $candidate
+                    break
+                } catch [System.Net.Sockets.SocketException] {
+                    $candidate.Stop()
+                    [void]$unavailable.Add($port)
+                }
+            }
+            if ($null -eq $reservation) {
+                throw "Could not reserve a safe high loopback port for candidate role '$role'."
+            }
+            $selectedPort = ([System.Net.IPEndPoint]$reservation.LocalEndpoint).Port
+            $reservations.Add($reservation)
+            $selected.Add($selectedPort)
+            [void]$unavailable.Add($selectedPort)
+        }
+
+        $ports = [ordered]@{}
+        for ($index = 0; $index -lt $Name.Count; $index++) {
+            $ports[[string]$Name[$index]] = [int]$selected[$index]
+        }
+        return [pscustomobject]@{
+            BindAddress = '127.0.0.1'
+            Ports = [pscustomobject]$ports
+            AllPorts = @($selected)
+        }
+    } finally {
+        foreach ($reservation in @($reservations)) { $reservation.Stop() }
+    }
+}
+
 function Wait-CpaStackTrustedListener {
     param(
         [Parameter(Mandatory = $true)][int]$Port,
@@ -613,8 +735,121 @@ function Get-CpaStackPrivateIdentities {
     )
 }
 
+function Get-CpaStackFileSystemAcl {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $item = Get-Item -Force -LiteralPath $Path -ErrorAction Stop
+    $sections = [System.Security.AccessControl.AccessControlSections]::Owner -bor
+        [System.Security.AccessControl.AccessControlSections]::Group -bor
+        [System.Security.AccessControl.AccessControlSections]::Access
+    if ($item.PSIsContainer) {
+        return [System.Security.AccessControl.DirectorySecurity]::new($item.FullName, $sections)
+    }
+    return [System.Security.AccessControl.FileSecurity]::new($item.FullName, $sections)
+}
+
+function Get-CpaStackAclOwnerSid {
+    param([Parameter(Mandatory = $true)][System.Security.AccessControl.FileSystemSecurity]$Acl)
+
+    return $Acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+}
+
+function Get-CpaStackAclAccessRules {
+    param([Parameter(Mandatory = $true)][System.Security.AccessControl.FileSystemSecurity]$Acl)
+
+    return @($Acl.GetAccessRules(
+        $true,
+        $true,
+        [System.Security.Principal.SecurityIdentifier]
+    ))
+}
+
+function Set-CpaStackFileSystemAcl {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][System.Security.AccessControl.FileSystemSecurity]$Acl
+    )
+
+    $item = Get-Item -Force -LiteralPath $Path -ErrorAction Stop
+    $extensions = 'System.IO.FileSystemAclExtensions' -as [type]
+    if ($item.PSIsContainer) {
+        if ($Acl -isnot [System.Security.AccessControl.DirectorySecurity]) {
+            throw "A directory ACL is required for $Path"
+        }
+        if ($null -ne $extensions) {
+            [System.IO.FileSystemAclExtensions]::SetAccessControl(
+                [System.IO.DirectoryInfo]$item,
+                [System.Security.AccessControl.DirectorySecurity]$Acl
+            )
+        } else {
+            ([System.IO.DirectoryInfo]$item).SetAccessControl([System.Security.AccessControl.DirectorySecurity]$Acl)
+        }
+        return
+    }
+
+    if ($Acl -isnot [System.Security.AccessControl.FileSecurity]) {
+        throw "A file ACL is required for $Path"
+    }
+    if ($null -ne $extensions) {
+        [System.IO.FileSystemAclExtensions]::SetAccessControl(
+            [System.IO.FileInfo]$item,
+            [System.Security.AccessControl.FileSecurity]$Acl
+        )
+    } else {
+        ([System.IO.FileInfo]$item).SetAccessControl([System.Security.AccessControl.FileSecurity]$Acl)
+    }
+}
+
+function Test-CpaStackPrivateAcl {
+    param(
+        [Parameter(Mandatory = $true)][System.Security.AccessControl.FileSystemSecurity]$Acl,
+        [switch]$Directory
+    )
+
+    if (-not $Acl.AreAccessRulesProtected) { return $false }
+    try {
+        $ownerSid = $Acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+    } catch {
+        return $false
+    }
+    if ($ownerSid -ne [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value) { return $false }
+
+    $expectedSids = @{}
+    foreach ($identity in Get-CpaStackPrivateIdentities) {
+        $expectedSids[$identity.Value] = $false
+    }
+    $rules = @(Get-CpaStackAclAccessRules -Acl $Acl)
+    if ($rules.Count -ne $expectedSids.Count) { return $false }
+
+    $expectedInheritance = if ($Directory) {
+        [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    } else {
+        [System.Security.AccessControl.InheritanceFlags]::None
+    }
+    foreach ($rule in $rules) {
+        if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
+            $rule.FileSystemRights -ne [System.Security.AccessControl.FileSystemRights]::FullControl -or
+            $rule.InheritanceFlags -ne $expectedInheritance -or
+            $rule.PropagationFlags -ne [System.Security.AccessControl.PropagationFlags]::None -or
+            $rule.IsInherited) {
+            return $false
+        }
+        try {
+            $sid = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        } catch {
+            return $false
+        }
+        if (-not $expectedSids.ContainsKey($sid) -or $expectedSids[$sid]) { return $false }
+        $expectedSids[$sid] = $true
+    }
+    return @($expectedSids.Values | Where-Object { -not $_ }).Count -eq 0
+}
+
 function Protect-CpaStackSecretFile {
     param([Parameter(Mandatory = $true)][string]$Path)
+
+    $current = Get-CpaStackFileSystemAcl -Path $Path
+    if (Test-CpaStackPrivateAcl -Acl $current) { return }
 
     $acl = New-Object System.Security.AccessControl.FileSecurity
     $acl.SetAccessRuleProtection($true, $false)
@@ -627,7 +862,7 @@ function Protect-CpaStackSecretFile {
         )
         [void]$acl.AddAccessRule($rule)
     }
-    Set-Acl -LiteralPath $Path -AclObject $acl
+    Set-CpaStackFileSystemAcl -Path $Path -Acl $acl
 }
 
 function Protect-CpaStackPrivateDirectory {
@@ -636,6 +871,9 @@ function Protect-CpaStackPrivateDirectory {
     if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
         New-Item -ItemType Directory -Force -Path $Path | Out-Null
     }
+    $current = Get-CpaStackFileSystemAcl -Path $Path
+    if (Test-CpaStackPrivateAcl -Acl $current -Directory) { return }
+
     $acl = New-Object System.Security.AccessControl.DirectorySecurity
     $acl.SetAccessRuleProtection($true, $false)
     $acl.SetOwner([System.Security.Principal.WindowsIdentity]::GetCurrent().User)
@@ -649,7 +887,7 @@ function Protect-CpaStackPrivateDirectory {
         )
         [void]$acl.AddAccessRule($rule)
     }
-    Set-Acl -LiteralPath $Path -AclObject $acl
+    Set-CpaStackFileSystemAcl -Path $Path -Acl $acl
 }
 
 function Get-CpaStackTreeItemsNoReparse {
@@ -706,7 +944,7 @@ function Assert-CpaStackLegacySourceAcl {
     if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
         throw "$Description is a reparse point: $($item.FullName)"
     }
-    $acl = Get-Acl -LiteralPath $item.FullName -ErrorAction Stop
+    $acl = Get-CpaStackFileSystemAcl -Path $item.FullName
     $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     $trustedSids = @($currentSid, 'S-1-5-18', 'S-1-5-32-544')
     try {
@@ -714,12 +952,7 @@ function Assert-CpaStackLegacySourceAcl {
         $trustedSids += $trustedInstallerSid
     } catch {}
     try {
-        $ownerText = [string]$acl.Owner
-        $ownerSid = if ($ownerText -match '^S-1-') {
-            [System.Security.Principal.SecurityIdentifier]::new($ownerText).Value
-        } else {
-            [System.Security.Principal.NTAccount]::new($ownerText).Translate([System.Security.Principal.SecurityIdentifier]).Value
-        }
+        $ownerSid = Get-CpaStackAclOwnerSid -Acl $acl
     } catch {
         throw "$Description owner could not be verified: $($item.FullName)"
     }
@@ -735,7 +968,7 @@ function Assert-CpaStackLegacySourceAcl {
         [System.Security.AccessControl.FileSystemRights]::ReadPermissions -bor
         [System.Security.AccessControl.FileSystemRights]::Synchronize
     )
-    foreach ($rule in $acl.Access | Where-Object { $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow }) {
+    foreach ($rule in Get-CpaStackAclAccessRules -Acl $acl | Where-Object { $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow }) {
         try {
             $sid = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
         } catch {
@@ -774,21 +1007,16 @@ function Assert-CpaStackLegacyAncestorAcl {
         if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
             throw "$Description is a reparse point: $($item.FullName)"
         }
-        $acl = Get-Acl -LiteralPath $item.FullName -ErrorAction Stop
+        $acl = Get-CpaStackFileSystemAcl -Path $item.FullName
         try {
-            $ownerText = [string]$acl.Owner
-            $ownerSid = if ($ownerText -match '^S-1-') {
-                [System.Security.Principal.SecurityIdentifier]::new($ownerText).Value
-            } else {
-                [System.Security.Principal.NTAccount]::new($ownerText).Translate([System.Security.Principal.SecurityIdentifier]).Value
-            }
+            $ownerSid = Get-CpaStackAclOwnerSid -Acl $acl
         } catch {
             throw "$Description owner could not be verified: $($item.FullName)"
         }
         if ($trustedSids -notcontains $ownerSid) {
             throw "$Description has an unexpected owner: $($item.FullName)"
         }
-        foreach ($rule in $acl.Access | Where-Object { $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow }) {
+        foreach ($rule in Get-CpaStackAclAccessRules -Acl $acl | Where-Object { $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow }) {
             if (($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) {
                 continue
             }
@@ -959,19 +1187,14 @@ function Assert-CpaStackPrivateTree {
     $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     $allowedSids = @($currentSid, 'S-1-5-18', 'S-1-5-32-544')
     foreach ($item in @(Get-CpaStackTreeItemsNoReparse -Root $Root)) {
-        $acl = Get-Acl -LiteralPath $item.FullName -ErrorAction Stop
+        $acl = Get-CpaStackFileSystemAcl -Path $item.FullName
         $itemFull = [System.IO.Path]::GetFullPath($item.FullName).TrimEnd('\')
         $isRoot = [string]::Equals($itemFull, $rootFull, [System.StringComparison]::OrdinalIgnoreCase)
         if (-not $acl.AreAccessRulesProtected -and ($isRoot -or -not $AllowInheritedDescendants)) {
             throw "$Description ACL inheritance is enabled: $($item.FullName)"
         }
         try {
-            $ownerText = [string]$acl.Owner
-            $ownerSid = if ($ownerText -match '^S-1-') {
-                [System.Security.Principal.SecurityIdentifier]::new($ownerText).Value
-            } else {
-                [System.Security.Principal.NTAccount]::new($ownerText).Translate([System.Security.Principal.SecurityIdentifier]).Value
-            }
+            $ownerSid = Get-CpaStackAclOwnerSid -Acl $acl
         } catch {
             throw "$Description owner could not be verified: $($item.FullName)"
         }
@@ -979,7 +1202,7 @@ function Assert-CpaStackPrivateTree {
         if ($allowedOwnerSids -notcontains $ownerSid) {
             throw "$Description has an unexpected owner: $($item.FullName)"
         }
-        foreach ($rule in $acl.Access | Where-Object { $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow }) {
+        foreach ($rule in Get-CpaStackAclAccessRules -Acl $acl | Where-Object { $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow }) {
             try {
                 $sid = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
             } catch {
@@ -1205,6 +1428,16 @@ namespace CpaStack
 
         public static Process Start(string filePath, string arguments, string workingDirectory, IDictionary environment)
         {
+            return Start(filePath, arguments, workingDirectory, environment, null);
+        }
+
+        public static Process Start(
+            string filePath,
+            string arguments,
+            string workingDirectory,
+            IDictionary environment,
+            Action<Process> registerBeforeResume)
+        {
             if (String.IsNullOrWhiteSpace(filePath) || filePath.IndexOf('"') >= 0)
             {
                 throw new ArgumentException("Managed-process executable path is invalid.", "filePath");
@@ -1229,6 +1462,8 @@ namespace CpaStack
             Process process = null;
             bool processCreated = false;
             bool processResumed = false;
+            bool registrationAttempted = false;
+            bool registrationCompleted = false;
             bool attributeListInitialized = false;
 
             try
@@ -1296,6 +1531,12 @@ namespace CpaStack
                 processCreated = true;
                 process = Process.GetProcessById((int)processInformation.ProcessId);
                 IntPtr processHandle = process.Handle;
+                if (registerBeforeResume != null)
+                {
+                    registrationAttempted = true;
+                    registerBeforeResume(process);
+                    registrationCompleted = true;
+                }
                 if (ResumeThread(processInformation.Thread) == UInt32.MaxValue)
                 {
                     throw new Win32Exception(Marshal.GetLastWin32Error(), "Managed process could not be resumed.");
@@ -1303,7 +1544,7 @@ namespace CpaStack
                 processResumed = true;
                 return process;
             }
-            catch
+            catch (Exception startupError)
             {
                 Exception cleanupError = null;
                 if (processCreated && !processResumed && processInformation.Process != IntPtr.Zero)
@@ -1318,7 +1559,19 @@ namespace CpaStack
                     }
                 }
                 if (process != null) { process.Dispose(); }
-                if (cleanupError != null) { throw cleanupError; }
+                if (cleanupError != null)
+                {
+                    throw new AggregateException(
+                        "Managed-process startup failed and suspended-process cleanup also failed.",
+                        startupError,
+                        cleanupError);
+                }
+                if (registrationAttempted && !registrationCompleted)
+                {
+                    throw new InvalidOperationException(
+                        "Started-process registration failed; the exact suspended process was terminated before it could execute.",
+                        startupError);
+                }
                 throw;
             }
             finally
@@ -1346,7 +1599,8 @@ function Start-CpaStackProcess {
         [Parameter(Mandatory = $true)][string]$WorkingDirectory,
         [hashtable]$Environment = @{},
         [string[]]$RemoveEnvironment = @(),
-        [switch]$MinimalEnvironment
+        [switch]$MinimalEnvironment,
+        [scriptblock]$StartedProcessRegistration
     )
 
     $processEnvironment = @{}
@@ -1393,7 +1647,21 @@ function Start-CpaStackProcess {
     }
 
     Initialize-CpaStackNativeProcessType
-    return [CpaStack.NativeProcessV1]::Start($FilePath, $Arguments, $WorkingDirectory, $processEnvironment)
+    if ($null -eq $StartedProcessRegistration) {
+        return [CpaStack.NativeProcessV1]::Start($FilePath, $Arguments, $WorkingDirectory, $processEnvironment)
+    }
+    $registrationCallback = $StartedProcessRegistration
+    $registrationScript = {
+        param([System.Diagnostics.Process]$Process)
+        & $registrationCallback $Process | Out-Null
+    }.GetNewClosure()
+    $registrationAction = [System.Action[System.Diagnostics.Process]]$registrationScript
+    return [CpaStack.NativeProcessV1]::Start(
+        $FilePath,
+        $Arguments,
+        $WorkingDirectory,
+        $processEnvironment,
+        $registrationAction)
 }
 
 function Stop-CpaStackStartedProcess {
@@ -2181,10 +2449,10 @@ function Assert-CpaStackChildPath {
         '^logs\\[^\\]+(?:\\.*)?$',
         '^ops\\[^\\]+(?:\\.*)?$',
         '^releases\\current(?:\\.*)?$',
-        '^rollback\\(?:last-known-good|legacy-migration|(?:staging|pending)-(?:cpa|manager)-[0-9a-fA-F]{32})(?:\\.*)?$',
+        '^rollback\\(?:last-known-good|legacy-migration|lan\\[0-9a-fA-F]{32}|(?:staging|pending)-(?:cpa|manager)-[0-9a-fA-F]{32})(?:\\.*)?$',
         '^runtime\\(?:cli-proxy-api|manager-plus)(?:\\.*)?$',
         '^state\\[^\\]+(?:\\.*)?$',
-        '^work\\(?:current|cpa-8318-[0-9a-fA-F]{32}|manager-18318-[0-9a-fA-F]{32}|manager-formal-verification-[0-9a-fA-F]{32}|mv-[0-9a-fA-F]{32})(?:\\.*)?$'
+        '^work\\(?:current|cpa-(?:candidate|\d{1,5})-[0-9a-fA-F]{32}|manager-(?:candidate|\d{1,5})-[0-9a-fA-F]{32}|manager-formal-verification-[0-9a-fA-F]{32}|mv-[0-9a-fA-F]{32})(?:\\.*)?$'
     )
     if ($segments.Count -lt 2 -or -not ($allowedPatterns | Where-Object { $relative -match $_ } | Select-Object -First 1)) {
         throw "Managed paths must name a fixed slot below the control root. Path=$Path"

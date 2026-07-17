@@ -12,11 +12,11 @@ CLI 返回 `TargetDriveNotFound` 时，选择真实存在的本地 NTFS/ReFS 盘
 
 ## 找不到旧安装
 
-先让旧 CPA 与 Manager Plus 正常运行，使 8317/18317 暴露 executable path。若仍不能唯一获得 config、data 与 key，显式传 `Source*` 参数和受保护的 `SecretsInputPath`。
+先让旧 CPA 与 Manager Plus 正常运行，再执行 `status`。若仍不能唯一获得 runtime、config、data 与 key，按 [migration-request.md](migration-request.md) 创建显式 request；不要假设正式端口或把 secret 值写进 request。
 
 ## 候选端口被占用
 
-不要自动终止未知进程。先识别 8318/18318 的 owner，适当处理后再重试。
+候选端口由执行器动态分配为未占用的高位 loopback 端口，不存在固定候选端口。不要终止未知进程；保留结构化错误并重试。重复失败时检查系统端口耗尽或安全软件拦截，不要绕过 loopback 门禁。
 
 ## 缺少 Python
 
@@ -24,11 +24,11 @@ CLI 返回 `TargetDriveNotFound` 时，选择真实存在的本地 NTFS/ReFS 盘
 
 ## 更新 Skill 时目录被占用
 
-关闭正在查看已安装 `SKILL.md` 的编辑器，或工作目录位于该 Skill 下的终端，然后重新运行新版 `install.ps1`。安装器只会有限重试，不会结束用户进程；失败时必须保留当前 Skill、已有 `previous` 和未接管的 legacy 状态。若结果是 `success=true`、`complete=false`，新 Skill 已提交；根据 `postCommitWarnings` 解除 launcher、root locator 或 retained slot 的占用/ACL 问题后重试，不要手工混合复制版本。
+关闭正在查看已安装 `SKILL.md` 的编辑器，或工作目录位于该 Skill 下的终端，然后用同一个可信本地发行目录先执行 `install.ps1 -Action Check`，明确授权后再执行 `-Action Update`。安装器不会结束用户进程；失败时保留当前 Skill、`previous` 和受保护 journal。不要手工混合复制版本，也不要从网络管道执行 installer。
 
 ## 报告 pending transaction
 
-不要删除 journal 或手工覆盖 runtime。针对同一 root 再运行 `cpa-stack.ps1 upgrade -Json`，让恢复流程验证 instanceId、路径、exe/`data.key` hash、Manager 数据水位与服务状态。若验证失败，保留 journal 和结构化错误，再处理明确的路径、进程或数据问题。
+不要删除 journal 或手工覆盖 runtime。针对同一 root 显式运行 `cpa-stack.ps1 recover -Json`，让恢复流程验证 instanceId、路径、exe/`data.key` hash、Manager 数据水位与服务状态。若验证失败，保留 journal 和结构化错误，再处理明确的路径、进程或数据问题；`upgrade` 不会隐式恢复。
 
 ## 无法证明版本单调
 
@@ -44,12 +44,12 @@ CLI 返回 `TargetDriveNotFound` 时，选择真实存在的本地 NTFS/ReFS 盘
 
 ## 正式切换发生回滚
 
-确认 8317/18317 健康状态和 last-known-good 路径。自动回滚成功属于受控升级失败，不等于数据丢失。只报告版本、exe hash、检查项和脱敏错误。
+用 `status` 确认 stack config 中的正式端口、健康状态和 last-known-good。自动回滚成功属于受控升级失败，不等于数据丢失。只报告版本、exe hash、检查项和脱敏错误。
 
 ## 升级已经完成但命令长时间不返回
 
-不要并发启动第二个升级，也不要使用递归结束进程的命令。先确认正式端口仍由记录的 executable 占用，再检查 operation lock、pending journal 和 `last-upgrade` 的结构化状态。`v0.1.1` 可能因长驻服务继承输出管道而表现为假卡死；更新到 `v0.1.2` 或更高版本后重试。只有在无 pending、操作锁已释放且正式服务仍健康时，才可单独结束无工作的外层 `cpa-stack.ps1` 进程；不得连带结束正式 CPA 或 Manager。
+不要并发启动第二个升级，也不要使用递归结束进程的命令。先确认配置中的正式端口仍由记录的 executable 占用，再检查 operation lock、pending journal 和结构化状态。只有在无 pending、操作锁已释放且正式服务仍健康时，才可单独结束无工作的外层 `cpa-stack.ps1` 进程；不得连带结束正式 CPA 或 Manager。
 
 ## 双击快捷方式仍弹出 PowerShell 窗口
 
-这通常表示仍在使用 legacy 快捷方式，或快捷方式未由最新版 updater 刷新。不要手工修改目标字符串；确认用户授权后，用最新版执行带 `-UpdateDesktopShortcut` 的升级。canonical `.lnk` 的目标应为 `powershell.exe`，参数契约包含 `-NonInteractive -WindowStyle Hidden`。如果未授权更新，请停用旧快捷方式并通过 canonical CLI 启动。直接 CLI 应保留当前终端，内部 PowerShell 复用同一控制台；不要再用可见的 `Start-Process powershell.exe` 包装它。
+这通常表示仍在使用 legacy 快捷方式，或托管快捷方式发生 drift。不要手工修改目标字符串；先执行 `shortcut -Action Check -ShortcutPath <path> -Json`，确认用户授权后再执行 `shortcut -Action Ensure`。接管可识别的旧快捷方式还需要显式 `-AdoptExisting`。直接 CLI 应保留当前终端，不要用可见的 `Start-Process powershell.exe` 包装它。
