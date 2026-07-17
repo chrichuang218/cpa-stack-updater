@@ -55,7 +55,10 @@ param(
     [System.IO.FileStream]$OperationLockHandle,
     [switch]$RecoveryMode,
     [scriptblock]$StartedProcessRegistration,
-    [switch]$InProcess
+    [switch]$InProcess,
+    [switch]$Fast,
+    [switch]$InteractiveProgress,
+    [switch]$ReturnResult
 )
 
 Set-StrictMode -Version Latest
@@ -63,6 +66,15 @@ $ErrorActionPreference = 'Stop'
 $operationMutex = $null
 $exitCode = 1
 $failureMessage = $null
+
+function Write-CpaStackStartProgress {
+    param([Parameter(Mandatory = $true)][string]$Message)
+
+    if ($InteractiveProgress) {
+        $color = if ($Message -match '^ERROR:') { 'Red' } elseif ($Message -match 'ready:|opened\.$') { 'Green' } else { 'Gray' }
+        Write-Host ('  ' + $Message) -ForegroundColor $color
+    }
+}
 
 function Enter-StartupLock {
     $lockDirectory = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'CPAStack\locks'
@@ -1500,6 +1512,48 @@ function Open-ManagerBrowser {
     }
 }
 
+function Get-CpaStackFastExpectedProcess {
+    param([Parameter(Mandatory = $true)][string]$ExecutablePath)
+
+    $name = [System.IO.Path]::GetFileNameWithoutExtension($ExecutablePath)
+    foreach ($process in @(Get-Process -Name $name -ErrorAction SilentlyContinue)) {
+        try {
+            if ([string]::Equals([System.IO.Path]::GetFullPath($process.Path), [System.IO.Path]::GetFullPath($ExecutablePath), [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $process
+            }
+        } catch {}
+    }
+    return $null
+}
+
+function Ensure-CpaServiceFast {
+    param([Parameter(Mandatory = $true)]$Settings)
+
+    $existing = Get-CpaStackFastExpectedProcess -ExecutablePath $Settings.Cpa.Executable
+    if ($null -ne $existing) {
+        return [pscustomobject]@{ Action = 'Reused'; ProcessId = $existing.Id }
+    }
+    $arguments = '-config "{0}"' -f $Settings.Cpa.Config
+    $process = Start-ManagedProcess -FilePath $Settings.Cpa.Executable -Arguments $arguments `
+        -WorkingDirectory $Settings.Cpa.WorkingDirectory -ProcessRegistration $StartedProcessRegistration
+    return [pscustomobject]@{ Action = 'Started'; ProcessId = $process.Id }
+}
+
+function Ensure-ManagerServiceFast {
+    param(
+        [Parameter(Mandatory = $true)]$Settings,
+        [Parameter(Mandatory = $true)][string]$SecretsPath
+    )
+
+    $existing = Get-CpaStackFastExpectedProcess -ExecutablePath $Settings.Manager.Executable
+    if ($null -ne $existing) {
+        return [pscustomobject]@{ Action = 'Reused'; ProcessId = $existing.Id }
+    }
+    $secrets = Import-ProtectedSecrets -Path $SecretsPath
+    $process = Start-ManagerProcess -Settings $Settings -AdminKey $secrets.managerAdminKey
+    return [pscustomobject]@{ Action = 'Started'; ProcessId = $process.Id }
+}
+
 try {
     $recoveryAuthorized = $false
     if ($null -ne $StartedProcessRegistration -and -not $InProcess) {
@@ -1524,33 +1578,52 @@ try {
         $ConfigPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'config\stack.psd1'
     }
 
+    Write-CpaStackStartProgress -Message 'Validating stack configuration...'
     $settings = Import-StackSettings -Path $ConfigPath
-    Assert-CanonicalInstanceState -Settings $settings
-    if (-not $recoveryAuthorized) {
-        $pending = @(Get-ChildItem -LiteralPath (Join-Path $settings.StackRoot 'state') -File -Filter '*.pending.json' -ErrorAction SilentlyContinue)
-        if ($pending.Count -gt 0) {
-            throw "An interrupted CPA stack transaction must be recovered before startup: $($pending.Name -join ', ')"
+    if (-not $Fast) {
+        Assert-CanonicalInstanceState -Settings $settings
+        if (-not $recoveryAuthorized) {
+            $pending = @(Get-ChildItem -LiteralPath (Join-Path $settings.StackRoot 'state') -File -Filter '*.pending.json' -ErrorAction SilentlyContinue)
+            if ($pending.Count -gt 0) {
+                throw "An interrupted CPA stack transaction must be recovered before startup: $($pending.Name -join ', ')"
+            }
         }
+        Assert-PositiveTimeouts -Settings $settings
+        Assert-RequiredPaths -Settings $settings
+        Assert-CpaConfigPort -Path $settings.Cpa.Config -ExpectedPort $settings.Cpa.Port
     }
-    Assert-PositiveTimeouts -Settings $settings
-    Assert-RequiredPaths -Settings $settings
-    Assert-CpaConfigPort -Path $settings.Cpa.Config -ExpectedPort $settings.Cpa.Port
 
     if ([string]::IsNullOrWhiteSpace($SecretsPath)) {
         $SecretsPath = Join-Path (Split-Path -Parent $settings.ConfigPath) 'secrets.local.json'
     }
     $SecretsPath = [System.IO.Path]::GetFullPath($SecretsPath)
-    $secrets = Import-ProtectedSecrets -Path $SecretsPath
 
-    $cpaResult = Ensure-CpaService -Settings $settings -ApiKey $secrets.cpaClientApiKey
-    $managerResult = Ensure-ManagerService -Settings $settings -Secrets $secrets
+    Write-CpaStackStartProgress -Message $(if ($Fast) { 'Starting CPA API...' } else { 'Checking CPA API...' })
+    if ($Fast) {
+        $cpaResult = Ensure-CpaServiceFast -Settings $settings
+    } else {
+        $secrets = Import-ProtectedSecrets -Path $SecretsPath
+        $cpaResult = Ensure-CpaService -Settings $settings -ApiKey $secrets.cpaClientApiKey
+    }
+    Write-CpaStackStartProgress -Message ("CPA API ready: {0} (port {1})" -f $cpaResult.Action, $settings.Cpa.Port)
+    Write-CpaStackStartProgress -Message $(if ($Fast) { 'Starting Manager...' } else { 'Checking Manager...' })
+    if ($Fast) {
+        $managerResult = Ensure-ManagerServiceFast -Settings $settings -SecretsPath $SecretsPath
+    } else {
+        $managerResult = Ensure-ManagerService -Settings $settings -Secrets $secrets
+    }
+    Write-CpaStackStartProgress -Message ("Manager ready: {0} (port {1})" -f $managerResult.Action, $settings.Manager.Port)
 
     $browserAction = 'Skipped'
     if (-not $NoBrowser) {
         Open-ManagerBrowser -Settings $settings
         $browserAction = 'Opened'
+        Write-CpaStackStartProgress -Message 'Management page opened.'
     }
 
+    $modelCount = if ($Fast) { $null } else { $cpaResult.Health.ModelCount }
+    $collectorEnabled = if ($Fast) { $null } else { $managerResult.Readiness.CollectorEnabled }
+    $collectorState = if ($Fast) { $null } else { $managerResult.Readiness.CollectorState }
     [pscustomobject]@{
         Success = $true
         Cpa = [pscustomobject]@{
@@ -1558,7 +1631,7 @@ try {
             ProcessId = $cpaResult.ProcessId
             Port = $settings.Cpa.Port
             Executable = $settings.Cpa.Executable
-            ModelCount = $cpaResult.Health.ModelCount
+            ModelCount = $modelCount
         }
         Manager = [pscustomobject]@{
             Action = $managerResult.Action
@@ -1566,8 +1639,8 @@ try {
             Port = $settings.Manager.Port
             Executable = $settings.Manager.Executable
             DataDirectory = $settings.Manager.DataDirectory
-            CollectorEnabled = $managerResult.Readiness.CollectorEnabled
-            CollectorState = $managerResult.Readiness.CollectorState
+            CollectorEnabled = $collectorEnabled
+            CollectorState = $collectorState
         }
         Browser = $browserAction
     } | ConvertTo-Json -Depth 6
@@ -1575,6 +1648,7 @@ try {
 }
 catch {
     $failureMessage = $_.Exception.Message
+    Write-CpaStackStartProgress -Message ('ERROR: ' + $failureMessage)
     [pscustomobject]@{
         Success = $false
         Error = [pscustomobject]@{
@@ -1590,6 +1664,9 @@ finally {
     }
 }
 
+if ($ReturnResult) {
+    return
+}
 if ($InProcess) {
     if ($exitCode -ne 0) { throw $failureMessage }
     return

@@ -38,6 +38,7 @@ function Read-TestShortcut {
             WorkingDirectory = [string]$link.WorkingDirectory
             WindowStyle = [int]$link.WindowStyle
             IconLocation = [string]$link.IconLocation
+            Description = [string]$link.Description
         }
     } finally {
         foreach ($comObject in @($link, $shell)) {
@@ -55,7 +56,8 @@ function Write-TestShortcut {
         [string]$Arguments = '',
         [string]$WorkingDirectory = '',
         [int]$WindowStyle = 1,
-        [string]$IconPath = ''
+        [string]$IconPath = '',
+        [string]$Description = ''
     )
 
     $shell = $null
@@ -67,6 +69,7 @@ function Write-TestShortcut {
         $link.Arguments = $Arguments
         $link.WorkingDirectory = $WorkingDirectory
         $link.WindowStyle = $WindowStyle
+        $link.Description = $Description
         if ($IconPath) { $link.IconLocation = $IconPath + ',0' }
         $link.Save()
     } finally {
@@ -395,10 +398,13 @@ try {
     $ops = [System.IO.Path]::GetFullPath((Join-Path $root 'ops')).TrimEnd('\')
     $managedIcon = [System.IO.Path]::GetFullPath((Join-Path $root 'assets\cpa-shortcut.ico'))
     $link = Read-TestShortcut -Path $shortcut
-    Assert-Equal ([System.IO.Path]::GetFullPath((Get-Command powershell.exe -ErrorAction Stop).Source)) ([System.IO.Path]::GetFullPath($link.TargetPath)) 'Managed shortcut targets Windows PowerShell'
-    Assert-Equal ('-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $launcher) $link.Arguments 'Managed shortcut uses the hidden canonical launcher contract'
+    $preferredPowerShell = Get-Command pwsh.exe -ErrorAction SilentlyContinue
+    if ($null -eq $preferredPowerShell) { $preferredPowerShell = Get-Command powershell.exe -ErrorAction Stop }
+    Assert-Equal ([System.IO.Path]::GetFullPath($preferredPowerShell.Source)) ([System.IO.Path]::GetFullPath($link.TargetPath)) 'Managed shortcut prefers PowerShell 7 and falls back to Windows PowerShell'
+    Assert-Equal ('-NoLogo -NoProfile -NoExit -ExecutionPolicy Bypass -File "{0}"' -f $launcher) $link.Arguments 'Managed shortcut keeps the visible launcher open for execution status'
     Assert-Equal $ops ([System.IO.Path]::GetFullPath($link.WorkingDirectory).TrimEnd('\')) 'Managed shortcut uses the canonical ops working directory'
-    Assert-Equal 7 $link.WindowStyle 'Managed shortcut minimizes the shell bootstrap'
+    Assert-Equal 1 $link.WindowStyle 'Managed shortcut opens a normal visible launcher window'
+    Assert-Equal 'Quick-start CPA and Manager with visible status' $link.Description 'Managed shortcut describes its visible quick-start behavior'
     Assert-True (Test-Path -LiteralPath $managedIcon -PathType Leaf) 'Legacy icon is copied into the managed root'
     Assert-Equal (Get-FileHash -Algorithm SHA256 -LiteralPath $legacyIcon).Hash (Get-FileHash -Algorithm SHA256 -LiteralPath $managedIcon).Hash 'Managed icon preserves the legacy icon bytes'
     Assert-True ($link.IconLocation.StartsWith($managedIcon + ',', [System.StringComparison]::OrdinalIgnoreCase)) 'Final shortcut uses the managed icon copy'
@@ -411,7 +417,7 @@ try {
     Assert-Equal 1 ([int]$ownership.schemaVersion) 'Ownership state uses schema version 1'
     Assert-Equal $instanceId ([string]$ownership.instanceId) 'Ownership state is bound to the stack instance'
     Assert-Equal ([System.IO.Path]::GetFullPath($shortcut)) ([string]$ownership.path) 'Ownership state records the managed desktop shortcut'
-    Assert-Equal 1 ([int]$ownership.contractVersion) 'Ownership state records shortcut contract version 1'
+    Assert-Equal 3 ([int]$ownership.contractVersion) 'Ownership state records shortcut contract version 3'
     Assert-True ([string]$ownership.fingerprint -match '^[0-9A-F]{64}$') 'Ownership state records a SHA256 contract fingerprint'
     Assert-True ([bool](Get-TestFileAcl -Path $ownershipPath).AreAccessRulesProtected) 'Ownership state has a protected DACL'
 
@@ -432,6 +438,15 @@ try {
     Assert-Equal $shortcutWriteBefore (Get-Item -LiteralPath $shortcut).LastWriteTimeUtc.Ticks 'Second Ensure preserves shortcut mtime'
     Assert-Equal $ownershipHashBefore (Get-FileHash -Algorithm SHA256 -LiteralPath $ownershipPath).Hash 'Second Ensure preserves ownership hash'
     Assert-Equal $ownershipWriteBefore (Get-Item -LiteralPath $ownershipPath).LastWriteTimeUtc.Ticks 'Second Ensure preserves ownership mtime'
+
+    $priorOwnership = [System.IO.File]::ReadAllText($ownershipPath, [System.Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json
+    $priorOwnership.contractVersion = 2
+    $priorOwnership.fingerprint = ('A' * 64)
+    [System.IO.File]::WriteAllText($ownershipPath, ($priorOwnership | ConvertTo-Json), [System.Text.UTF8Encoding]::new($false))
+    Assert-Equal 'Drifted' ([string](Invoke-CpaStackManagedShortcut -Action Check -Root $root -DesktopDirectory $desktop -ShortcutPath $shortcut).status) 'A known prior shortcut contract is repairable drift, not an ownership conflict'
+    [void](Invoke-CpaStackManagedShortcut -Action Ensure -Root $root -DesktopDirectory $desktop -ShortcutPath $shortcut)
+    $upgradedOwnership = [System.IO.File]::ReadAllText($ownershipPath, [System.Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json
+    Assert-Equal 3 ([int]$upgradedOwnership.contractVersion) 'Ensure upgrades a known prior shortcut contract to the current version'
 
     Write-TestShortcut -Path $shortcut -TargetPath ([System.IO.Path]::GetFullPath((Get-Command notepad.exe -ErrorAction Stop).Source)) -WorkingDirectory $desktop
     $driftHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $shortcut).Hash
@@ -469,12 +484,12 @@ try {
     $adoptInstanceId = [guid]::NewGuid().ToString('N')
     New-Item -ItemType Directory -Force -Path $adoptDesktop | Out-Null
     New-TestCanonicalRoot -Root $adoptRoot -InstanceId $adoptInstanceId
-    $adoptLauncher = [System.IO.Path]::GetFullPath((Join-Path $adoptRoot 'ops\Start-CPA-Stack.ps1'))
+    $adoptLegacyLauncher = [System.IO.Path]::GetFullPath((Join-Path $testHome 'old managed root\ops\Start-CPA-Stack.ps1'))
     $adoptOps = [System.IO.Path]::GetFullPath((Join-Path $adoptRoot 'ops')).TrimEnd('\')
     $adoptLegacyIcon = Join-Path $legacyIconDirectory 'adopt-legacy.ico'
     Set-Content -LiteralPath $adoptLegacyIcon -Value 'adopt icon fixture' -Encoding ASCII
     $powershellPath = [System.IO.Path]::GetFullPath((Get-Command powershell.exe -ErrorAction Stop).Source)
-    Write-TestShortcut -Path $adoptShortcut -TargetPath $powershellPath -Arguments ('-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $adoptLauncher) -WorkingDirectory $adoptOps -WindowStyle 7 -IconPath $adoptLegacyIcon
+    Write-TestShortcut -Path $adoptShortcut -TargetPath $powershellPath -Arguments ('-NoLogo -NoProfile -NoExit -ExecutionPolicy Bypass -File "{0}"' -f $adoptLegacyLauncher) -WorkingDirectory (Split-Path -Parent $adoptLegacyLauncher) -WindowStyle 7 -IconPath $adoptLegacyIcon
 
     $adoptHashBefore = (Get-FileHash -Algorithm SHA256 -LiteralPath $adoptShortcut).Hash
     $adoptRootBefore = @(Get-TestTreeSnapshot -Path $adoptRoot)
@@ -590,6 +605,7 @@ try {
                 WorkingDirectory = ''
                 WindowStyle = 1
                 IconLocation = ''
+                Description = ''
             }
         }
     }

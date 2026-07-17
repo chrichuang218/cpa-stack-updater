@@ -482,7 +482,7 @@ while (`$true) { Start-Sleep -Seconds 60 }
     $launcherText = [System.IO.File]::ReadAllText($launcher, [System.Text.UTF8Encoding]::new($false, $true))
     Assert-True ($launcherText -match 'CODEX_HOME') 'Launcher locates the installed skill through CODEX_HOME'
     Assert-True ($launcherText -match '\$HOME.+\.codex') 'Launcher falls back to the user Codex home'
-    Assert-True ($launcherText -match 'cpa-stack\.ps1') 'Launcher invokes the stable installed CLI'
+    Assert-True ($launcherText -match 'Start-CPA-Stack\.ps1' -and $launcherText -match 'Fast\s*=\s*\$true') 'Launcher invokes the stable installed Fast starter'
     Assert-False (Test-Path -LiteralPath (Join-Path $stackRoot 'runtime')) 'Installer does not create or change runtime data'
     Assert-False (Test-Path -LiteralPath (Join-Path $stackRoot 'data')) 'Installer does not create or change Manager data'
 
@@ -640,22 +640,27 @@ while (`$true) { Start-Sleep -Seconds 60 }
     }
     Set-CpaStackRegisteredRoot -ControlRoot $stackRoot
 
-    $installedCli = Join-Path $installed 'scripts\cpa-stack.ps1'
-    $installedCliBytes = [System.IO.File]::ReadAllBytes($installedCli)
-    $fakeCliText = @'
+    $installedStarter = Join-Path $installed 'scripts\Start-CPA-Stack.ps1'
+    $installedStarterBytes = [System.IO.File]::ReadAllBytes($installedStarter)
+    $fakeStarterText = @'
 param(
-    [Parameter(Position = 0)][string]$Command,
-    [string]$Root,
-    [switch]$NoBrowser
+    [switch]$Fast,
+    [switch]$ReturnResult,
+    [string]$ConfigPath,
+    [switch]$NoBrowser,
+    [switch]$InteractiveProgress
 )
 Start-Sleep -Milliseconds 500
 [pscustomobject]@{
-    command = $Command
-    root = $Root
+    success = $true
+    fast = [bool]$Fast
+    returnResult = [bool]$ReturnResult
+    configPath = $ConfigPath
     noBrowser = [bool]$NoBrowser
+    interactiveProgress = [bool]$InteractiveProgress
 } | ConvertTo-Json -Compress
 '@
-    [System.IO.File]::WriteAllText($installedCli, $fakeCliText, [System.Text.Encoding]::ASCII)
+    [System.IO.File]::WriteAllText($installedStarter, $fakeStarterText, [System.Text.Encoding]::ASCII)
     $previousCodexHome = [Environment]::GetEnvironmentVariable('CODEX_HOME', 'Process')
     $previousUserProfile = [Environment]::GetEnvironmentVariable('USERPROFILE', 'Process')
     try {
@@ -674,11 +679,13 @@ Start-Sleep -Milliseconds 500
     } finally {
         [Environment]::SetEnvironmentVariable('CODEX_HOME', $previousCodexHome, 'Process')
         [Environment]::SetEnvironmentVariable('USERPROFILE', $previousUserProfile, 'Process')
-        [System.IO.File]::WriteAllBytes($installedCli, $installedCliBytes)
+        [System.IO.File]::WriteAllBytes($installedStarter, $installedStarterBytes)
     }
-    Assert-Equal 'start' $bootstrapResult.command 'Launcher delegates to its custom installed home without requiring a persistent CODEX_HOME'
-    Assert-Equal ([System.IO.Path]::GetFullPath($stackRoot).TrimEnd('\')) ([System.IO.Path]::GetFullPath([string]$bootstrapResult.root).TrimEnd('\')) 'Launcher derives Root from the parent of ops'
+    Assert-True ([bool]$bootstrapResult.fast) 'Launcher delegates to the Fast starter in its custom installed home'
+    Assert-True ([bool]$bootstrapResult.returnResult) 'Launcher requires a structured Fast starter result'
+    Assert-Equal ([System.IO.Path]::GetFullPath((Join-Path $stackRoot 'config\stack.psd1'))) ([System.IO.Path]::GetFullPath([string]$bootstrapResult.configPath)) 'Launcher derives ConfigPath from the parent of ops'
     Assert-True ([bool]$bootstrapResult.noBrowser) 'Launcher forwards NoBrowser without starting a real process'
+    Assert-False ([bool]$bootstrapResult.interactiveProgress) 'Redirected launcher tests do not request interactive progress output'
 
     $codexBeforeNoChange = Get-TestTreeSnapshot -Root $codexHome
     $stackBeforeNoChange = Get-TestTreeSnapshot -Root $stackRoot

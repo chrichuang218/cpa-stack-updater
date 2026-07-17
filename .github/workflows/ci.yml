@@ -33,3 +33,32 @@ jobs:
       - name: PowerShell 7
         shell: pwsh
         run: .\tools\Test-All.ps1
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: windows-2022
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Validate release version
+        shell: pwsh
+        run: .\tools\Test-ReleaseVersion.ps1
+
+      - name: Build checksummed release package
+        shell: pwsh
+        run: .\tools\New-ReleasePackage.ps1 -DestinationDirectory "$env:RUNNER_TEMP\cpa-release"
+
+      - name: Publish GitHub Release assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $releaseDirectory = Join-Path $env:RUNNER_TEMP 'cpa-release'
+          $assets = @(Get-ChildItem -LiteralPath $releaseDirectory -File | Select-Object -ExpandProperty FullName)
+          if ($assets.Count -ne 2) { throw 'Release packaging did not produce exactly two assets.' }
+          gh release create '${{ github.ref_name }}' --verify-tag --generate-notes --title '${{ github.ref_name }}' @assets

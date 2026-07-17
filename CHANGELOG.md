@@ -1,5 +1,50 @@
 # 更新记录
 
+## 1.1.0 - 2026-07-18
+
+- `upgrade` 在接触 CPA/Manager runtime 前自动检查固定官方仓库的 updater Release；发现更高稳定版本时校验固定资产名、`checksums.txt` 与 GitHub SHA256 digest，通过本地 installer 原子更新 Skill，再使用新版 CLI 重新执行一次升级。
+- updater 检查、下载、校验、安装或新版重执行失败时返回 `automation.failedStep=updater` 并停止，不继续使用旧 updater；状态、启动、快捷方式和 LAN 操作不触发联网自更新。
+- 标签 CI 在完整测试通过后生成最小版本化 ZIP 与 `checksums.txt`，并发布为 GitHub Release 资产，为无人值守定时升级提供可验证的自更新信任链。
+
+## 1.0.9 - 2026-07-17
+
+- 主 `SKILL.md` 移除 0.x 历史兼容说明，新用户直接进入当前执行流程；仅在实际检测到旧 updater 残留时按需读取故障排查规则。
+
+## 1.0.8 - 2026-07-17
+
+- 删除已无人读取的快速启动临时进度文件通道，实时状态继续直接显示在唯一的 PowerShell 7 窗口中。
+- 删除 `doctor`、`plan`、`init`、`register-root` 旧命令及其公开兼容参数；公共 CLI 仅保留正式 v2 操作，自动升级和内部恢复安全门禁保持不变。
+
+## 1.0.7 - 2026-07-17
+
+- 桌面快速启动与安全事务彻底分流：canonical bootstrap 在当前 PS7 窗口直接调用 bundled starter 的 `Fast` 模式，不再执行 `cpa-stack status/start`、ACL、hash、端口健康或 Manager readiness 预检，也不再创建第二个 PowerShell 进程。
+- Fast 模式仅按已配置 executable 复用现有进程，缺失时直接用原有无控制台进程启动器拉起 CPA/Manager，并立即打开管理页面；完整检查继续保留在 CLI `start`、迁移、恢复与升级路径。
+- 已运行栈的桌面启动实测由约 15.1 秒降至约 2.7 秒，剩余主要是 WindowsApps PowerShell 7 冷启动时间。
+
+## 1.0.6 - 2026-07-17
+
+- 桌面快速启动和隐藏 CLI 子进程优先使用 PowerShell 7 (`pwsh.exe`)；未安装 PS7 时自动回退 Windows PowerShell 5.1，快捷方式契约升级为 v3 并自动修复现有入口。
+
+## 1.0.5 - 2026-07-17
+
+- 修复桌面快速启动时内部 PowerShell 子进程导致终端窗口反复闪烁的问题：交互入口改为显式隐藏并重定向输出的子进程，内部状态检查与启动脚本不再抢占桌面窗口，也避免 `Start-Job` 的冷启动延迟。
+- 新增协议安全的实时进度通道，配置校验、CPA API、Manager 与浏览器阶段在执行过程中立即显示，不再等全部完成后才一次性输出。
+
+## 1.0.4 - 2026-07-17
+
+- 运行时升级成功后自动创建或更新当前用户桌面的 `CPA 本地启动.lnk`；可识别旧 CPA 快捷方式会先备份再接管，旧的“（新版）”名称在新入口成功建立后自动清理，不再要求二次确认，未知无关冲突仍拒绝覆盖。
+- 桌面快速启动改为可见并保留的 PowerShell 窗口，使用内置 CPA 图标、标题、颜色与分阶段状态提示；独立的“创建桌面启动方式”请求直接执行同一幂等 Ensure。
+- 快捷方式维护失败以 warning 返回，不回滚已经成功的 CPA/Manager 运行时升级。
+
+## 1.0.3 - 2026-07-17
+
+- `upgrade` 成为单命令自动事务：遇到单一 pending 时自动恢复一次，尚未建立 canonical stack 时自动迁移一次，随后自动升级；`-RequestPath` 可直接随 upgrade 提供，所有重试有固定上限。
+- 升级授权同时覆盖必要的 recover、migrate 与未知版本稳定版替换，不再要求中途二次确认；不可证明的 journal、进程、ACL、checksum、候选健康或 SQLite 数据问题仍立即失败。
+
+## 1.0.2 - 2026-07-17
+
+- 自动升级默认允许用已验证的 latest stable 替换无法可靠识别版本或来源的旧 binary，不再要求 `-AllowUnknownVersionReplacement` 二次确认；官方 release、checksum、候选健康、SQLite 水位与自动回滚门禁保持不变。
+
 ## 1.0.1 - 2026-07-17
 
 - 修复管理员令牌下首次迁移成功后，`ops`、`state`、`runtime`、`data` 和 canonical launcher 仍由 Administrators 持有，导致下一次 `status/upgrade` 被自身健康门禁拒绝的问题。

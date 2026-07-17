@@ -18,17 +18,17 @@
 
 ## Release 信任
 
-Release 元数据与资产只从硬编码的官方 GitHub 仓库通过 HTTPS 获取。压缩包 SHA256 必须匹配 `checksums.txt`；GitHub 提供 asset digest 时也会校验。解压前检查 ZIP 条目、路径、数量和总大小。候选 exe hash 会贯穿下载、候选验证和正式切换。
+Release 元数据与资产只从硬编码的官方 GitHub 仓库通过 HTTPS 获取。CPA/Manager 压缩包 SHA256 必须匹配 `checksums.txt`；GitHub 提供 asset digest 时也会校验。解压前检查 ZIP 条目、路径、数量和总大小。候选 exe hash 会贯穿下载、候选验证和正式切换。
 
 上游 Windows executable 不假设拥有 Authenticode 签名。实际信任边界是上游 GitHub 仓库与已验证 release hash。
 
-若旧 binary 的版本无法可靠识别，且 hash 与 latest stable 不同，默认阻断替换。只有用户明确承担预发布版被替换的风险后，才允许 `-AllowUnknownVersionReplacement`。
+若旧 binary 的版本或来源无法可靠识别，公开 `upgrade` 自动允许用已验证的 latest stable 替换。该策略只放宽版本单调性证明；官方 release、checksum、候选健康、SQLite 水位、进程身份与自动回滚门禁保持不变。
 
-updater/Skill 自身不在线更新。只有用户已取得并明确指定的可信本地发行目录可运行 `install.ps1`；`Check` 严格只读，`Update` 使用 ownership marker、双槽和受保护 journal 原子提交。Skill 不下载或管道执行远端 installer。installer 只同步 Skill、稳定 bootstrap 与 root registration，不触碰正式 runtime/data 或 LAN 设置。
+只有公开 `upgrade` 可以在线更新 updater/Skill，来源固定为 `chrichuang218/cpa-stack-updater` 的最新非预发布 Release。远端版本必须高于本地，并且固定名称 ZIP、`checksums.txt`、两项 GitHub SHA256 digest、Release tag、仓库 VERSION 与 Skill VERSION 必须一致；安全解压后才运行本地 `install.ps1`。安装使用 ownership marker、双槽和受保护 journal 原子提交，成功后旧进程只负责启动新版 CLI 一次。查询、校验、安装或重执行失败全部 fail closed，不接触 runtime。源码分支、fork、预发布版和远程管道执行永远不受支持。用户明确提供的可信本地发行目录仍可作为手工/离线更新入口。
 
 ## 事务模型
 
-迁移、恢复、升级、安装、卸载和 root 登记在同一 Windows 账户下共享跨会话独占文件锁。runtime 的 recover/migrate/upgrade 是互不隐式调用的公开事务。该锁不承诺协调另一 Windows 账户；managed root 本身只应由其 owner 运行本工具。
+迁移、恢复、升级、安装、卸载和 root 登记在同一 Windows 账户下共享跨会话独占文件锁。`upgrade` 先收敛一次 updater 自更新或新版重执行，再按固定上限编排一次 recover、一次 migrate、一次 runtime upgrade，并在成功后幂等维护默认桌面快捷方式；每个底层事务仍保持独立结果与失败边界。快捷方式失败只追加 warning，不回滚已提交的运行时升级。该锁不承诺协调另一 Windows 账户；managed root 本身只应由其 owner 运行本工具。
 
 无密钥 pending journal 在破坏性动作前原子写入，并绑定 instance ID。`recover` 只调用底层 recovery-only interface；即使并发恢复时 journal 已被另一调用收敛，也不会开始新迁移、联网升级或 LAN 变更。初始化或升级的顶层 journal 可以拥有经过底层再次校验的 switch journal 与 `rollback/pending-*` 从属 artifact；无关的多个顶层事务仍视为歧义。runtime 切换与 `current.json` 提交是可恢复的两阶段提交：
 
@@ -52,7 +52,7 @@ SQLite online backup 必须成功生成、重新打开并通过 `quick_check`。
 
 候选与正式服务进程使用最小环境变量白名单，只保留 Windows 运行必需项和不含 userinfo/query/fragment 的代理 URL、TLS 路径；带内嵌账号口令的代理变量会被丢弃，也不会继承其他无关会话变量。loopback 只限制入站监听；经官方 release 与 hash 验证的二进制仍可通过当前网络或安全代理出站，它不是 AppContainer 或防火墙沙箱。
 
-长驻进程通过 Windows handle-list 白名单以无控制台窗口方式启动，只继承三个指向 `NUL` 的 stdin/stdout/stderr；父 PowerShell 的管道、文件和 secret 句柄不会传入服务。canonical 桌面快捷方式使用隐藏 PowerShell；直接 CLI 保留调用方终端，bundled PowerShell 复用同一控制台，不另创建可见窗口。这样 CLI 的结构化结果可以在事务结束时立即返回，而不依赖长驻服务退出。
+长驻进程通过 Windows handle-list 白名单以无控制台窗口方式启动，只继承三个指向 `NUL` 的 stdin/stdout/stderr；父 PowerShell 的管道、文件和 secret 句柄不会传入服务。canonical 桌面快捷方式只保留一个可见且 `-NoExit` 的 PowerShell，并在同一进程直接运行 Fast starter；Fast 只按配置路径复用或拉起进程，不执行事务级 ACL、hash、state 或健康门禁。完整门禁继续由 CLI `start`、迁移、恢复与升级负责。后台 CPA/Manager 进程仍保持无控制台，CLI 的结构化结果不依赖长驻服务退出。
 
 ## 不在范围内
 

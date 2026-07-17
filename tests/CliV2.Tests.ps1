@@ -46,20 +46,36 @@ try {
             Copy-Item -LiteralPath $_.FullName -Destination $modules -Force
         }
     }
+    [System.IO.File]::WriteAllText((Join-Path $skillRoot 'VERSION'), '1.0.9', [System.Text.Encoding]::ASCII)
+    @'
+function Invoke-CpaStackSelfUpdate {
+    param([string]$StackRoot)
+    $skillRoot = Split-Path -Parent $PSScriptRoot
+    $versionPath = Join-Path $skillRoot 'VERSION'
+    $current = [System.IO.File]::ReadAllText($versionPath).Trim()
+    if ($current -ceq '1.0.9') {
+        [System.IO.File]::WriteAllText($versionPath, '1.1.0', [System.Text.Encoding]::ASCII)
+        return [pscustomobject]@{ success = $true; changed = $true; currentVersion = '1.0.9'; latestVersion = '1.1.0'; availableVersion = '1.1.0'; installedCliPath = (Join-Path $skillRoot 'scripts\cpa-stack.ps1'); error = $null }
+    }
+    return [pscustomobject]@{ success = $true; changed = $false; currentVersion = $current; latestVersion = $current; availableVersion = $current; installedCliPath = (Join-Path $skillRoot 'scripts\cpa-stack.ps1'); error = $null }
+}
+Export-ModuleMember -Function Invoke-CpaStackSelfUpdate
+'@ | Set-Content -LiteralPath (Join-Path $modules 'CpaStack.SelfUpdate.psm1') -Encoding ASCII
 
     @'
 param([string]$ControlRoot)
+$initialized = Test-Path -LiteralPath (Join-Path $ControlRoot 'Initialize-CpaStack.ps1.called')
 [pscustomobject]@{
     SchemaVersion = 1
-    OverallHealthy = $false
-    CanonicalEstablished = $false
-    MigrationRequired = $true
+    OverallHealthy = $initialized
+    CanonicalEstablished = $initialized
+    MigrationRequired = (-not $initialized)
     LegacyCanonicalAdoptionRequired = $false
     InterruptedState = $false
     PendingOperations = @()
     Error = $null
 } | ConvertTo-Json -Depth 8 -Compress
-exit 1
+if (-not $initialized) { exit 1 }
 '@ | Set-Content -LiteralPath (Join-Path $scripts 'Get-CpaStackState.ps1') -Encoding UTF8
 
     foreach ($name in @('Initialize-CpaStack.ps1', 'Adopt-CpaStackLegacyCanonical.ps1', 'Invoke-CpaStackUpgrade.ps1')) {
@@ -78,27 +94,10 @@ Set-Content -LiteralPath (Join-Path `$ControlRoot '$name.called') -Value 'called
     Assert-Equal 'Blocked' $status.Json.outcome 'Unhealthy discovered state is observable as Blocked'
     Assert-False ([bool]$status.Json.changed) 'Status is strictly read-only'
 
-    foreach ($legacyInspectionCommand in @('doctor', 'plan')) {
-        $legacyInspection = Invoke-TestCli $legacyInspectionCommand -Root $managedRoot -Json
-        Assert-Equal 0 $legacyInspection.ExitCode "$legacyInspectionCommand remains a successful read-only compatibility command"
-        Assert-Equal 2 $legacyInspection.Json.schemaVersion "$legacyInspectionCommand uses the v2 result envelope"
-        Assert-Equal 'status' $legacyInspection.Json.operation "$legacyInspectionCommand maps to the status operation"
-        Assert-Equal $legacyInspectionCommand $legacyInspection.Json.deprecatedCommand "$legacyInspectionCommand identifies the deprecated command"
-        Assert-True (@($legacyInspection.Json.warnings).Count -gt 0) "$legacyInspectionCommand reports its one-release deprecation"
-        Assert-False ([bool]$legacyInspection.Json.changed) "$legacyInspectionCommand remains read-only"
-    }
-
-    $legacyCombinedInit = Invoke-TestCli init -Root $managedRoot -ExposeToLan -Json
-    Assert-Equal 1 $legacyCombinedInit.ExitCode 'Deprecated init rejects an implicit LAN side effect'
-    Assert-Equal 2 $legacyCombinedInit.Json.schemaVersion 'Deprecated init failure uses the v2 result envelope'
-    Assert-Equal 'migrate' $legacyCombinedInit.Json.operation 'Deprecated init maps to migrate'
-    Assert-Equal 'init' $legacyCombinedInit.Json.deprecatedCommand 'Deprecated init identifies the compatibility command'
-    Assert-Equal 'OperationSplitRequired' $legacyCombinedInit.Json.error.code 'Deprecated init requires explicit split operations'
-
     foreach ($invalidInvocation in @(
         [pscustomobject]@{ Command = 'status'; Arguments = @('-Mode', 'Lan'); Operation = 'status' },
-        [pscustomobject]@{ Command = 'migrate'; Arguments = @('-ExposeToLan'); Operation = 'migrate' },
-        [pscustomobject]@{ Command = 'upgrade'; Arguments = @('-RequestPath', (Join-Path $temp 'not-used.json')); Operation = 'upgrade' }
+        [pscustomobject]@{ Command = 'migrate'; Arguments = @('-Mode', 'Lan'); Operation = 'migrate' },
+        [pscustomobject]@{ Command = 'upgrade'; Arguments = @('-Mode', 'Lan'); Operation = 'upgrade' }
     )) {
         $invalidArguments = @([string]$invalidInvocation.Command, '-Root', $managedRoot) + @($invalidInvocation.Arguments) + @('-Json')
         $invalid = Invoke-TestCli @invalidArguments
@@ -108,18 +107,22 @@ Set-Content -LiteralPath (Join-Path `$ControlRoot '$name.called') -Value 'called
     }
 
     $upgrade = Invoke-TestCli upgrade -Root $managedRoot -Json
-    Assert-Equal 1 $upgrade.ExitCode 'Upgrade is blocked when explicit migration is required'
-    Assert-Equal 2 $upgrade.Json.schemaVersion ('Blocked upgrade uses the v2 result envelope. Output=' + ($upgrade.Output -join ' | '))
-    Assert-Equal 'upgrade' $upgrade.Json.operation 'Blocked result identifies upgrade'
-    Assert-Equal 'Blocked' $upgrade.Json.outcome 'Migration requirement blocks upgrade'
-    Assert-Equal 'MigrationRequired' $upgrade.Json.error.code ('Upgrade returns a stable explicit-migration error. Output=' + ($upgrade.Output -join ' | '))
-    foreach ($name in @('Initialize-CpaStack.ps1', 'Adopt-CpaStackLegacyCanonical.ps1', 'Invoke-CpaStackUpgrade.ps1')) {
-        Assert-False (Test-Path -LiteralPath (Join-Path $managedRoot ($name + '.called'))) "Upgrade must not invoke $name"
-    }
-
-    $split = Invoke-TestCli upgrade -Root $managedRoot -ExposeToLan -Json
-    Assert-Equal 1 $split.ExitCode 'Legacy combined upgrade intent is rejected'
-    Assert-Equal 'OperationSplitRequired' $split.Json.error.code 'Combined upgrade intent returns a stable split-operation error'
+    Assert-Equal 0 $upgrade.ExitCode ('Upgrade automatically migrates an unmanaged root. Output=' + ($upgrade.Output -join ' | '))
+    Assert-Equal 2 $upgrade.Json.schemaVersion 'Automatic upgrade uses the v2 result envelope'
+    Assert-Equal 'upgrade' $upgrade.Json.operation 'Automatic result identifies upgrade'
+    Assert-Equal 'Changed' $upgrade.Json.outcome 'Automatic migration makes the overall upgrade changed'
+    Assert-True ([bool]$upgrade.Json.success) 'Automatic migration and upgrade succeed as one operation'
+    Assert-True (Test-Path -LiteralPath (Join-Path $managedRoot 'Initialize-CpaStack.ps1.called')) 'Upgrade automatically invokes migration once'
+    Assert-True (Test-Path -LiteralPath (Join-Path $managedRoot 'Invoke-CpaStackUpgrade.ps1.called')) 'Upgrade continues to the runtime upgrade after migration'
+    Assert-False (Test-Path -LiteralPath (Join-Path $managedRoot 'Adopt-CpaStackLegacyCanonical.ps1.called')) 'Auto discovery does not invoke canonical adoption when it is not requested'
+    Assert-True ('migrate' -in @($upgrade.Json.automation.steps.operation)) 'Automatic result records the migration step'
+    Assert-True ('upgrade' -in @($upgrade.Json.automation.steps.operation)) 'Automatic result records the runtime upgrade step'
+    Assert-True ('shortcut' -in @($upgrade.Json.automation.steps.operation)) 'Automatic result records desktop shortcut maintenance'
+    Assert-True ('updater' -in @($upgrade.Json.automation.steps.operation)) 'Automatic result records updater self-update before runtime work'
+    Assert-True ([bool]$upgrade.Json.updater.changed) 'Automatic result reports that the updater changed across re-execution'
+    Assert-Equal '1.0.9' ([string]$upgrade.Json.updater.before) 'Automatic result preserves the updater version before re-execution'
+    Assert-Equal '1.1.0' ([string]$upgrade.Json.updater.after) 'Automatic result reports the updater version used for runtime work'
+    Remove-Item -LiteralPath (Join-Path $managedRoot 'Invoke-CpaStackUpgrade.ps1.called') -Force
 
     $requestPath = Join-Path $temp 'migration request.json'
     $secretsPath = Join-Path $temp 'private secrets.json'
@@ -174,12 +177,6 @@ param(
     Assert-Equal (Join-Path $temp 'legacy cpa') ([string]$migration.Json.migration.received.sourceCpaRuntime) ('Source path with spaces remains one argument. Output=' + ($migration.Output -join ' | '))
     Assert-False (Test-Path -LiteralPath (Join-Path $managedRoot 'Invoke-CpaStackUpgrade.ps1.called')) 'Migrate does not invoke upgrade'
 
-    $legacySecretsOnly = Invoke-TestCli init -Root $managedRoot -SecretsInputPath $secretsPath -Json
-    Assert-Equal 0 $legacySecretsOnly.ExitCode ('Deprecated init preserves secrets-only auto discovery. Output=' + ($legacySecretsOnly.Output -join ' | '))
-    Assert-Equal 'migrate' $legacySecretsOnly.Json.operation 'Deprecated secrets-only init maps to migrate'
-    Assert-Equal 'init' $legacySecretsOnly.Json.deprecatedCommand 'Deprecated secrets-only init identifies the compatibility command'
-    Assert-Equal $secretsPath ([string]$legacySecretsOnly.Json.migration.received.secretsInputPath) 'Deprecated init forwards SecretsInputPath during auto discovery'
-
     @'
 param([string]$ControlRoot)
 $recovered = Test-Path -LiteralPath (Join-Path $ControlRoot 'recovered.flag')
@@ -202,10 +199,13 @@ Set-Content -LiteralPath (Join-Path $ControlRoot 'recovered.flag') -Value 'recov
 [pscustomobject]@{ success = $true; recoveredInterruptedState = $true; rolledBack = $false; recoverOnly = [bool]$RecoverOnly } | ConvertTo-Json -Compress
 '@ | Set-Content -LiteralPath (Join-Path $scripts 'Initialize-CpaStack.ps1') -Encoding UTF8
 
-    $blockedByPending = Invoke-TestCli upgrade -Root $managedRoot -Json
-    Assert-Equal 1 $blockedByPending.ExitCode 'Upgrade does not recover implicitly'
-    Assert-Equal 'RecoveryRequired' $blockedByPending.Json.outcome 'Upgrade exposes the explicit recovery state'
-    Assert-False (Test-Path -LiteralPath (Join-Path $managedRoot 'recovered.flag')) 'Blocked upgrade does not run recovery'
+    $automaticRecovery = Invoke-TestCli upgrade -Root $managedRoot -Json
+    Assert-Equal 0 $automaticRecovery.ExitCode ('Upgrade automatically recovers one supported pending transaction. Output=' + ($automaticRecovery.Output -join ' | '))
+    Assert-True ([bool]$automaticRecovery.Json.recovered) 'Automatic upgrade reports that recovery occurred'
+    Assert-True (Test-Path -LiteralPath (Join-Path $managedRoot 'recovered.flag')) 'Automatic upgrade runs the matching transaction recovery path'
+    Assert-True ('recover' -in @($automaticRecovery.Json.automation.steps.operation)) 'Automatic result records the recovery step'
+
+    Remove-Item -LiteralPath (Join-Path $managedRoot 'recovered.flag') -Force
 
     $recovery = Invoke-TestCli recover -Root $managedRoot -Json
     Assert-Equal 0 $recovery.ExitCode ('Explicit recover exits successfully. Output=' + ($recovery.Output -join ' | '))
@@ -259,17 +259,6 @@ param([string]$ControlRoot, [ValidateSet('Loopback', 'Lan')][string]$Mode)
     Assert-Equal 'lan' $lan.Json.operation 'LAN identifies the operation'
     Assert-Equal 'Changed' $lan.Json.outcome 'Applied LAN configuration reports Changed'
     Assert-Equal 'Lan' $lan.Json.lan.mode 'LAN result retains the explicit requested mode'
-
-    $register = Invoke-TestCli register-root -Root $managedRoot -Json
-    Assert-Equal 0 $register.ExitCode ('register-root compatibility command succeeds. Output=' + ($register.Output -join ' | '))
-    Assert-Equal 2 $register.Json.schemaVersion 'register-root uses the v2 result envelope'
-    Assert-Equal 'register-root' $register.Json.operation 'register-root identifies its compatibility operation'
-    Assert-Equal 'Changed' $register.Json.outcome 'register-root reports its locator write'
-    Assert-True (@($register.Json.warnings).Count -gt 0) 'register-root reports its one-release deprecation'
-    $locatorPath = Join-Path $isolatedLocalAppData 'CPAStack\root.json'
-    Assert-True (Test-Path -LiteralPath $locatorPath -PathType Leaf) 'register-root writes only the isolated root locator'
-    $locator = [System.IO.File]::ReadAllText($locatorPath, [System.Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json
-    Assert-Equal ([System.IO.Path]::GetFullPath($managedRoot).TrimEnd('\')) ([System.IO.Path]::GetFullPath([string]$locator.root).TrimEnd('\')) 'register-root stores the requested managed root'
 
     @'
 param([string]$ControlRoot)

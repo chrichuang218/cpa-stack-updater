@@ -400,6 +400,7 @@ try {
         'tests\DynamicPorts.Tests.ps1',
         'tests\ManagedShortcutV2.Tests.ps1',
         'tests\LanConfiguration.Tests.ps1',
+        'tests\SelfUpdate.Tests.ps1',
         'tests\CliV2.Tests.ps1',
         'tests\Static.Tests.ps1',
         'tests\Shortcut.Tests.ps1',

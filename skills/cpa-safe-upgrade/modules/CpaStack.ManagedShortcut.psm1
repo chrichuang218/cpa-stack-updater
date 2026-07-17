@@ -1,6 +1,16 @@
 Set-StrictMode -Version Latest
 
-$script:ShortcutContractVersion = 1
+$script:ShortcutContractVersion = 3
+
+function Get-CpaStackPreferredPowerShellPath {
+    foreach ($name in @('pwsh.exe', 'powershell.exe')) {
+        $command = Get-Command $name -ErrorAction SilentlyContinue
+        if ($null -ne $command -and -not [string]::IsNullOrWhiteSpace([string]$command.Source)) {
+            return [System.IO.Path]::GetFullPath([string]$command.Source)
+        }
+    }
+    throw 'PowerShell 7 or Windows PowerShell 5.1 is required for the desktop shortcut.'
+}
 
 function Get-CpaStackManagedFileHash {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -93,6 +103,7 @@ function New-CpaStackWshShortcutStore {
                 WorkingDirectory = [string]$link.WorkingDirectory
                 WindowStyle = [int]$link.WindowStyle
                 IconLocation = [string]$link.IconLocation
+                Description = [string]$link.Description
             }
         } finally {
             foreach ($comObject in @($link, $shell)) {
@@ -114,6 +125,7 @@ function New-CpaStackWshShortcutStore {
             $link.Arguments = [string]$Contract.Arguments
             $link.WorkingDirectory = [string]$Contract.WorkingDirectory
             $link.WindowStyle = [int]$Contract.WindowStyle
+            $link.Description = [string]$Contract.Description
             if (-not [string]::IsNullOrWhiteSpace([string]$Contract.IconPath)) {
                 $link.IconLocation = ([string]$Contract.IconPath + ',0')
             }
@@ -167,15 +179,16 @@ function Get-CpaStackManagedShortcutContract {
     if ($Context.LauncherPath.IndexOf('"') -ge 0) {
         throw 'Canonical launcher path must not contain a quote.'
     }
-    $powershell = [System.IO.Path]::GetFullPath((Get-Command powershell.exe -ErrorAction Stop).Source)
+    $powershell = Get-CpaStackPreferredPowerShellPath
     $iconPath = Join-Path $Context.Root 'assets\cpa-shortcut.ico'
     Assert-CpaStackManagedChildPath -Root $Context.Root -Path $iconPath
     return [pscustomobject]@{
         TargetPath = $powershell
-        Arguments = '-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $Context.LauncherPath
+        Arguments = '-NoLogo -NoProfile -NoExit -ExecutionPolicy Bypass -File "{0}"' -f $Context.LauncherPath
         WorkingDirectory = [System.IO.Path]::GetFullPath((Join-Path $Context.Root 'ops')).TrimEnd('\')
-        WindowStyle = 7
+        WindowStyle = 1
         IconPath = if (Test-Path -LiteralPath $iconPath -PathType Leaf) { [System.IO.Path]::GetFullPath($iconPath) } else { '' }
+        Description = 'Quick-start CPA and Manager with visible status'
     }
 }
 
@@ -188,7 +201,8 @@ function Get-CpaStackManagedShortcutFingerprint {
         'arguments=' + [string]$Contract.Arguments,
         'workingDirectory=' + ([System.IO.Path]::GetFullPath([string]$Contract.WorkingDirectory).TrimEnd('\').ToUpperInvariant()),
         'windowStyle=' + [string][int]$Contract.WindowStyle,
-        'icon=' + $(if ([string]::IsNullOrWhiteSpace([string]$Contract.IconPath)) { '' } else { [System.IO.Path]::GetFullPath([string]$Contract.IconPath).ToUpperInvariant() })
+        'icon=' + $(if ([string]::IsNullOrWhiteSpace([string]$Contract.IconPath)) { '' } else { [System.IO.Path]::GetFullPath([string]$Contract.IconPath).ToUpperInvariant() }),
+        'description=' + [string]$Contract.Description
     ) -join "`n"
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($canonical)
     $sha = [System.Security.Cryptography.SHA256]::Create()
@@ -228,7 +242,8 @@ function Test-CpaStackShortcutMatchesContract {
         [string]$Shortcut.Arguments -ceq [string]$Contract.Arguments -and
         [string]::Equals($actualWorking, [System.IO.Path]::GetFullPath([string]$Contract.WorkingDirectory).TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase) -and
         [int]$Shortcut.WindowStyle -eq [int]$Contract.WindowStyle -and
-        [string]::Equals($actualIcon, $expectedIcon, [System.StringComparison]::OrdinalIgnoreCase)
+        [string]::Equals($actualIcon, $expectedIcon, [System.StringComparison]::OrdinalIgnoreCase) -and
+        [string]$Shortcut.Description -ceq [string]$Contract.Description
     )
 }
 
@@ -243,11 +258,30 @@ function Test-CpaStackShortcutReferencesLauncher {
     if ([string]::Equals($actualTarget, $Context.LauncherPath, [System.StringComparison]::OrdinalIgnoreCase)) {
         return $true
     }
-    if (-not [string]::Equals($actualTarget, [System.IO.Path]::GetFullPath([string]$Contract.TargetPath), [System.StringComparison]::OrdinalIgnoreCase)) {
+    $allowedPowerShellPaths = @(
+        foreach ($name in @('pwsh.exe', 'powershell.exe')) {
+            $command = Get-Command $name -ErrorAction SilentlyContinue
+            if ($null -ne $command -and -not [string]::IsNullOrWhiteSpace([string]$command.Source)) {
+                [System.IO.Path]::GetFullPath([string]$command.Source)
+            }
+        }
+    )
+    if (@($allowedPowerShellPaths | Where-Object { [string]::Equals($actualTarget, $_, [System.StringComparison]::OrdinalIgnoreCase) }).Count -eq 0) {
         return $false
     }
     $launcherPattern = '(?i)(?:^|\s)-File\s+"' + [regex]::Escape($Context.LauncherPath) + '"\s*$'
-    return [string]$Shortcut.Arguments -match $launcherPattern
+    if ([string]$Shortcut.Arguments -match $launcherPattern) {
+        return $true
+    }
+
+    # A prior managed root is safe to adopt because Ensure backs it up before
+    # replacing it, and the recognized command can only launch the CPA starter.
+    $legacyPattern = '(?i)^\s*-NoLogo\s+-NoProfile\s+(?:-NonInteractive\s+)?(?:-NoExit\s+)?(?:-WindowStyle\s+(?:Hidden|Minimized|Normal)\s+)?-ExecutionPolicy\s+Bypass\s+-File\s+"[^\"]+\\ops\\Start-CPA-Stack\.ps1"\s*$'
+    if ([string]$Shortcut.Arguments -match $legacyPattern) {
+        return $true
+    }
+    $originalLauncherPattern = '(?i)^\s*-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-NoExit\s+-File\s+"[^\"]+\\CPA-Stack\.ps1"\s+-Action\s+Restart\s*$'
+    return [string]$Shortcut.Arguments -match $originalLauncherPattern
 }
 
 function Get-CpaStackManagedShortcutAcl {
@@ -689,12 +723,14 @@ function Get-CpaStackManagedShortcutStatus {
         return [pscustomobject]@{ Status = 'Conflict'; Reason = 'ShortcutIsNotManaged'; Contract = $contract; Fingerprint = $fingerprint; Shortcut = $shortcut }
     }
     $ownershipNames = @($ownership.PSObject.Properties.Name)
+    $ownershipContractVersion = [int]$ownership.contractVersion
     $ownershipValid = (
         ($ownershipNames -join ',') -ceq 'schemaVersion,instanceId,path,contractVersion,fingerprint' -and
         [int]$ownership.schemaVersion -eq 1 -and
         [string]$ownership.instanceId -ceq $Context.InstanceId -and
         [string]::Equals([string]$ownership.path, $Context.ShortcutPath, [System.StringComparison]::OrdinalIgnoreCase) -and
-        [int]$ownership.contractVersion -eq $script:ShortcutContractVersion
+        $ownershipContractVersion -ge 1 -and
+        $ownershipContractVersion -le $script:ShortcutContractVersion
     )
     if (-not $ownershipValid) {
         return [pscustomobject]@{ Status = 'Conflict'; Reason = 'OwnershipStateInvalid'; Contract = $contract; Fingerprint = $fingerprint }
@@ -707,7 +743,9 @@ function Get-CpaStackManagedShortcutStatus {
     } catch {
         return [pscustomobject]@{ Status = 'Drifted'; Reason = 'ManagedShortcutUnreadable'; Contract = $contract; Fingerprint = $fingerprint; Ownership = $ownership }
     }
-    if ([string]$ownership.fingerprint -ceq $fingerprint -and (Test-CpaStackShortcutMatchesContract -Shortcut $shortcut -Contract $contract)) {
+    if ($ownershipContractVersion -eq $script:ShortcutContractVersion -and
+        [string]$ownership.fingerprint -ceq $fingerprint -and
+        (Test-CpaStackShortcutMatchesContract -Shortcut $shortcut -Contract $contract)) {
         return [pscustomobject]@{ Status = 'Matching'; Reason = 'ContractMatches'; Contract = $contract; Fingerprint = $fingerprint; Ownership = $ownership }
     }
     return [pscustomobject]@{ Status = 'Drifted'; Reason = 'ManagedShortcutContractDrift'; Contract = $contract; Fingerprint = $fingerprint; Ownership = $ownership }

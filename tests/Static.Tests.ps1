@@ -50,8 +50,8 @@ Assert-False ($skill.Contains('& "$PSScriptRoot\scripts\cpa-stack.ps1"')) 'Inter
 Assert-True ($skill.Contains('$skillRoot = Split-Path -Parent')) 'SKILL.md derives an explicit skill root from its own path'
 Assert-True ($skill.Contains('$cpaCli = Join-Path $skillRoot ''scripts\cpa-stack.ps1''')) 'SKILL.md derives one stable public CLI path'
 Assert-True ([regex]::Matches($skill, [regex]::Escape('& $cpaCli')).Count -ge 8) 'Runtime examples use only the stable public CLI'
-Assert-False ($skill -match '&\s+\$cpaCli\s+(?:plan|init)\b') 'Primary Skill workflow does not teach deprecated plan or init commands'
-Assert-False ($skill -match '-(?:UpdateDesktopShortcut|ExposeToLan)\b') 'Primary Skill workflow does not teach v0.1 combined side-effect switches'
+Assert-False ($skill -match '&\s+\$cpaCli\s+(?:doctor|plan|init|register-root)\b') 'Primary Skill workflow teaches only supported commands'
+Assert-False ($skill -match '-(?:UpdateDesktopShortcut|ExposeToLan|AllowUnknownVersionReplacement|AdoptExisting)\b') 'Primary Skill workflow teaches no removed compatibility switches'
 Assert-True ($skill -match "install\.ps1'\s+-Action\s+Check" -and $skill -match "install\.ps1'\s+-Action\s+Update") 'Skill self-update is limited to explicit local installer Check and Update actions'
 
 $initialize = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts\Initialize-CpaStack.ps1') -Raw -Encoding UTF8
@@ -85,8 +85,10 @@ $cli = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\cpa-stack.ps
 $launcherModule = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'modules\CpaStack.Launcher.psm1'), [System.Text.UTF8Encoding]::new($false, $true))
 Assert-True ($launcherModule -match "Invoke-CpaStackBundled\s+-HostAdapter\s+\`$HostAdapter\s+-Name\s+'Start-CPA-Stack\.ps1'") 'Public start executes the bundled trusted launcher through its host adapter'
 Assert-False ($cli -match 'function\s+(?:Invoke-BundledScript|Get-StatusResult|Get-InitArguments)') 'Public CLI contains no duplicate v0.1 execution implementation'
-Assert-False ($cli -match 'schemaVersion\s*=\s*1\s*\r?\n\s*command\s*=') 'Compatibility commands still return the v2 envelope'
-Assert-True ($cli -match "Command 'register-root' is a legacy alias outside the v1 supported interface") 'The remaining register-root alias is explicitly outside the supported v1 interface'
+Assert-False ($cli -match "'doctor'|'plan'|'init'|'register-root'") 'Public CLI contains no legacy command aliases'
+Assert-False ($cli -match '\$(?:SourceCpaRuntime|SourceCpaConfig|SourceManagerRuntime|SourceManagerData|LegacyStartScript|SecretsInputPath|DesktopShortcut|UpdateDesktopShortcut|ExposeToLan)\b') 'Public CLI contains no legacy combined-operation parameters'
+Assert-False ($cli -match '\[switch\]\$(?:AllowUnknownVersionReplacement|AdoptExisting)\b') 'Public CLI contains no no-op compatibility switches'
+Assert-False ($start -match 'CPA_STACK_START_PROGRESS_PATH|Get-CpaStackStartProgressPath|AppendAllText\(\$startProgressPath') 'Canonical start contains no orphaned temp-file progress channel'
 
 $common = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\CpaStack.Common.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
 $commonNativeStart = $common.IndexOf('using System;', $common.IndexOf("Add-Type -TypeDefinition @'", [System.StringComparison]::Ordinal), [System.StringComparison]::Ordinal)
@@ -193,12 +195,13 @@ Assert-True ($switchManager.IndexOf('Assert-CpaStackJsonWritePathBudget', [Syste
 
 $upgrade = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\Invoke-CpaStackUpgrade.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
 Assert-True ($upgrade -match 'DeferFinalCommit') 'Upgrade defers switch journal cleanup until current state is committed'
-Assert-True ($upgrade -match 'AllowUnknownVersionReplacement') 'Unknown-version replacement is explicit'
+$publicCli = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\cpa-stack.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
+Assert-True ($publicCli -match 'AllowUnknownVersionReplacement:\$true') 'Public upgrade always permits verified stable replacement of unknown versions'
 Assert-True ($upgrade -match 'if\s*\(-not\s+\$RecoverOnly\)\s*\{\s*Assert-CpaStackFreeSpace') 'Recovery-only bypasses the normal 1 GiB upgrade capacity gate'
 Assert-True ($upgrade.IndexOf('Set-UpgradeJournalPhase -Phase "testing-manager"', [System.StringComparison]::Ordinal) -lt $upgrade.IndexOf('Set-UpgradeJournalPhase -Phase "switching-cpa"', [System.StringComparison]::Ordinal)) 'Both component candidates are tested before the first formal switch'
 Assert-True ($upgrade.IndexOf('Assert-SwitchedServicesHealthy -PendingSwitchComponent cpa', [System.StringComparison]::Ordinal) -lt $upgrade.IndexOf('Set-CurrentComponentState -Component cpa', [System.StringComparison]::Ordinal)) 'CPA transition health is verified before current state commits the new hash'
 Assert-True ($upgrade.IndexOf('Assert-SwitchedServicesHealthy -PendingSwitchComponent manager', [System.StringComparison]::Ordinal) -lt $upgrade.IndexOf('Set-CurrentComponentState -Component manager', [System.StringComparison]::Ordinal)) 'Manager transition health is verified before current state commits the new hash'
-Assert-False (([System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\cpa-stack.ps1'), [System.Text.UTF8Encoding]::new($false, $true))) -match 'PendingSwitchComponent') 'The public CLI does not expose the internal transition health mode'
+Assert-False ($publicCli -match 'PendingSwitchComponent') 'The public CLI does not expose the internal transition health mode'
 Assert-True ($upgrade -match 'Immediate switch recovery failed') 'Outer switch failures attempt immediate in-process recovery before returning'
 Assert-True ($upgrade -match 'Protect-CpaStackSecretFile\s+-Path\s+\(Join-Path\s+\$ControlRoot\s+''config\\stack\.psd1''\)') 'Interrupted recovery repairs the canonical stack config owner before restart'
 Assert-True ($upgrade -match 'function Remove-CommittedOrphanSwitchPrevious') 'Recovery can remove a result-bound committed orphan switch previous journal'
@@ -238,6 +241,14 @@ Assert-True ($installer -match 'stableUninstallPath') 'Installer returns an inst
 $workflow = [System.IO.File]::ReadAllText((Join-Path $repo '.github\workflows\ci.yml'), [System.Text.UTF8Encoding]::new($false, $true))
 Assert-True ($workflow -match "tags:\s*\['v\*'\]") 'CI runs for release tags'
 Assert-True ($workflow -match 'actions/setup-python@') 'CI installs a pinned Python runtime'
+Assert-True ($workflow -match '(?s)release:\s+if:\s+startsWith\(github\.ref.+?needs:\s+test') 'Release publishing waits for the complete test job'
+Assert-True ($workflow -match 'New-ReleasePackage\.ps1' -and $workflow -match 'gh release create') 'Release publishing uploads the checksummed updater package'
+$releasePackager = [System.IO.File]::ReadAllText((Join-Path $repo 'tools\New-ReleasePackage.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
+Assert-True ($releasePackager -match 'checksums\.txt' -and $releasePackager -match 'Get-FileHash\s+-Algorithm\s+SHA256') 'Release packager emits a SHA256 checksum asset'
+$selfUpdate = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'modules\CpaStack.SelfUpdate.psm1'), [System.Text.UTF8Encoding]::new($false, $true))
+Assert-True ($selfUpdate -match 'chrichuang218/cpa-stack-updater') 'Updater self-update is pinned to the official repository'
+Assert-True ($selfUpdate -match 'ChecksumsDigest' -and $selfUpdate -match 'AssetDigest') 'Updater self-update requires checksums and GitHub asset digests'
+Assert-True ($cli -match 'Invoke-CpaStackSelfUpdate' -and $cli -match 'Invoke-CpaStackUpgradeReexec') 'Public upgrade updates the updater and re-executes before runtime work'
 
 $testAll = [System.IO.File]::ReadAllText((Join-Path $repo 'tools\Test-All.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
 Assert-True ($testAll -match 'Get-Command\s+python\s+-ErrorAction\s+Stop') 'Full tests fail when Python is unavailable'

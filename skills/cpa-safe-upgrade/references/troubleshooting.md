@@ -1,5 +1,9 @@
 # 故障排查
 
+## 检测到 0.x updater 残留
+
+installer 可以原子替换发现到的 0.x Skill 安装并保留 previous，但不要继续执行或恢复 0.x journal 与事务状态。保留现有 CPA/Manager 业务数据，通过正式 `migrate` 或 `upgrade` 流程建立新的 managed root。
+
 ## 目标盘不存在
 
 CLI 返回 `TargetDriveNotFound` 时，选择真实存在的本地 NTFS/ReFS 盘，或先挂载目标盘。示例 `E:` 不能假定每台电脑都有。
@@ -26,13 +30,17 @@ CLI 返回 `TargetDriveNotFound` 时，选择真实存在的本地 NTFS/ReFS 盘
 
 关闭正在查看已安装 `SKILL.md` 的编辑器，或工作目录位于该 Skill 下的终端，然后用同一个可信本地发行目录先执行 `install.ps1 -Action Check`，明确授权后再执行 `-Action Update`。安装器不会结束用户进程；失败时保留当前 Skill、`previous` 和受保护 journal。不要手工混合复制版本，也不要从网络管道执行 installer。
 
+## 自动更新 updater 失败
+
+`upgrade` 返回 `automation.failedStep=updater` 时，不要绕过检查或直接调用内部 runtime 脚本。保留结构化 `error.code`：Release 查询失败时检查 GitHub HTTPS 访问；校验失败时等待官方重新发布正确的版本化 ZIP、`checksums.txt` 和 digest；installer pending 时再次运行同一个公开 `upgrade`，由下载到本地的 installer 恢复。不要改用源码分支、fork 或远程管道执行。
+
 ## 报告 pending transaction
 
-不要删除 journal 或手工覆盖 runtime。针对同一 root 显式运行 `cpa-stack.ps1 recover -Json`，让恢复流程验证 instanceId、路径、exe/`data.key` hash、Manager 数据水位与服务状态。若验证失败，保留 journal 和结构化错误，再处理明确的路径、进程或数据问题；`upgrade` 不会隐式恢复。
+不要删除 journal 或手工覆盖 runtime。直接针对同一 root 运行 `cpa-stack.ps1 upgrade -Json`；它会自动调用一次受限 recovery-only 流程，验证 instanceId、路径、exe/`data.key` hash、Manager 数据水位与服务状态后继续。若返回 `ManualRecoveryRequired`，保留 journal 和结构化错误并停止。
 
 ## 无法证明版本单调
 
-这表示旧 binary 没有可靠的 stable version。默认阻断是为了避免把 nightly/预发布版降到 latest stable。只有用户理解并明确接受后，才添加 `-AllowUnknownVersionReplacement`。
+公开 `upgrade` 会自动允许用已验证的 latest stable 替换无法可靠识别版本或来源的旧 binary，不需要额外参数或确认。release checksum、候选健康、SQLite 水位和失败回滚仍按原安全门禁执行。
 
 ## 候选验证失败
 
@@ -52,4 +60,4 @@ CLI 返回 `TargetDriveNotFound` 时，选择真实存在的本地 NTFS/ReFS 盘
 
 ## 双击快捷方式仍弹出 PowerShell 窗口
 
-这通常表示仍在使用 legacy 快捷方式，或托管快捷方式发生 drift。不要手工修改目标字符串；先执行 `shortcut -Action Check -ShortcutPath <path> -Json`，确认用户授权后再执行 `shortcut -Action Ensure`。接管可识别的旧快捷方式还需要显式 `-AdoptExisting`。直接 CLI 应保留当前终端，不要用可见的 `Start-Process powershell.exe` 包装它。
+这通常表示仍在使用 legacy 快捷方式，或托管快捷方式发生 drift。不要手工修改目标字符串；直接执行 `shortcut -Action Ensure -ShortcutPath <path> -Json`。可识别的旧 CPA 快捷方式会先备份再自动接管，未知无关冲突仍拒绝覆盖。直接 CLI 应保留当前终端，不要额外包装另一个 PowerShell。

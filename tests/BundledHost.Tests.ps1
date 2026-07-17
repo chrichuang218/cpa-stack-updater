@@ -3,6 +3,7 @@ $ErrorActionPreference = 'Stop'
 
 $repo = Split-Path -Parent $PSScriptRoot
 $modulePath = Join-Path $repo 'skills\cpa-safe-upgrade\modules\CpaStack.BundledHost.psm1'
+$bundledStarterPath = Join-Path $repo 'skills\cpa-safe-upgrade\scripts\Start-CPA-Stack.ps1'
 $temp = Join-Path ([System.IO.Path]::GetTempPath()) ('cpa-bundled-host-' + [guid]::NewGuid().ToString('N'))
 
 try {
@@ -27,6 +28,10 @@ exit 7
 
     Import-Module $modulePath -Force
     $hostAdapter = New-CpaStackBundledHost -ScriptsRoot $temp
+
+    $bundledStarter = [System.IO.File]::ReadAllText($bundledStarterPath, [System.Text.UTF8Encoding]::new($false, $true))
+    Assert-False ($bundledStarter -match '(?m)\bClear-Host\b|RawUI') 'Bundled starter does not own console layout or window state'
+    Assert-True ($bundledStarter -match '(?s)if\s*\(\$InteractiveProgress\).+Write-Host') 'Bundled starter host output is explicitly gated behind InteractiveProgress'
 
     $pretty = Invoke-CpaStackBundled -HostAdapter $hostAdapter -Name 'pretty.ps1'
     Assert-Equal 'pretty' $pretty.Json.mode 'A single pretty-printed JSON object is accepted'

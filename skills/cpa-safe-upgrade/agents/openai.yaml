@@ -1,4 +1,4 @@
 interface:
   display_name: "CPA Safe Upgrade"
-  short_description: "安全迁移、恢复、升级 CPA Stack 与本地 Skill"
-  default_prompt: "使用 $cpa-safe-upgrade 按我明确授权的意图安全检查、迁移、恢复、升级或管理 CPA Stack。"
+  short_description: "一键升级 CPA Stack，并自动维护桌面快速启动方式"
+  default_prompt: "使用 $cpa-safe-upgrade 一键自动恢复、迁移并升级 CPA Stack，同时创建或更新桌面快速启动方式。"

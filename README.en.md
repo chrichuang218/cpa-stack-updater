@@ -6,30 +6,49 @@
 
 [中文](README.md)
 
-Transactional Windows migration, recovery, and upgrades for [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) and [CPA Manager Plus](https://github.com/seakee/CPA-Manager-Plus).
-
-v0.2 uses a thin Skill over a small, stable transaction executor. The Skill selects a public operation; bundled PowerShell owns discovery, ACL validation, SQLite snapshots, candidate verification, switching, and rollback.
+Transactional Windows migration, recovery, and upgrades for [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) and [CPA Manager Plus](https://github.com/seakee/CPA-Manager-Plus). Tell Codex the outcome you want; bundled PowerShell owns discovery, ACL validation, SQLite snapshots, candidate verification, switching, and rollback.
 
 > This is a community project. It is not affiliated with or endorsed by either upstream project.
 
-## v0.2 architecture
+## Use Codex directly
+
+For the first install, send Codex:
 
 ```text
-status (read-only)
-  +-- requiredOperation=recover --> recover
-  +-- requiredOperation=migrate --> migrate
-  +-- canonical healthy ---------> upgrade
+https://github.com/chrichuang218/cpa-stack-updater
 
-shortcut / lan / start / Skill installation are independent operations
+Install this CPA upgrade Skill. My CPA root is E:\CPA-Stack.
 ```
 
-`upgrade` never migrates, recovers, changes a shortcut, or enables LAN implicitly.
+Then say:
+
+```text
+Use $cpa-safe-upgrade to upgrade CPA.
+```
+
+Future requests can simply say “upgrade CPA,” “check CPA,” or “create the CPA desktop launcher.” The root is needed only for first install, switching instances, or isolated tests. Upgrade validates and updates the Skill first, then handles recovery, first migration, stable replacement, and shortcut maintenance without repeated confirmation. LAN remains separately authorized.
+
+## Automatic upgrade
+
+```text
+upgrade
+  +-- newer updater ------------> verify, atomically install, re-exec
+  +-- pending transaction -------> recover (at most once)
+  +-- canonical not established -> migrate (at most once)
+  +-- ready ---------------------> upgrade
+  +-- after success -------------> shortcut Ensure
+
+lan / start / manual Skill installation are independent operations
+```
+
+One `upgrade` invocation authorizes verified updater self-update, recovery, migration, stable replacement, and default desktop shortcut maintenance. A failed updater check or install stops before runtime work. LAN remains separate.
 
 ## Safety properties
 
 - Candidate processes use dynamically allocated, unused high loopback ports; candidate ports are not a fixed public interface.
 - Formal ports come from the managed stack configuration.
 - Release metadata and assets come only from two pinned official upstream repositories over HTTPS, with checksum and SHA256 verification.
+- Skill self-update accepts only a newer stable Release from this repository and verifies the versioned ZIP, `checksums.txt`, both GitHub digests, and bundled VERSION files.
 - ZIP traversal, entry count, and expanded size are checked before extraction.
 - Manager data uses SQLite online backup plus `quick_check`, required-table, and historical-watermark checks.
 - Secret-free journals bind every transaction to an instance ID and support hard-interruption recovery.
@@ -52,7 +71,7 @@ See [docs/safety-model.md](docs/safety-model.md) for the full model.
 
 The repository contains no third-party executables, real configuration, keys, databases, or telemetry.
 
-## Install or update the Skill
+## Manual Skill install or update (optional)
 
 Download and extract a trusted package from [Releases](https://github.com/chrichuang218/cpa-stack-updater/releases/latest). Start with a strictly read-only check:
 
@@ -76,7 +95,7 @@ Use `-CodexHome` for a non-default Codex home. The installer uses two slots and 
 
 `Bypass` applies only to this process and does not change persistent execution policy.
 
-## Use the v2 CLI
+## Run the CLI manually (optional)
 
 ```powershell
 $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
@@ -86,39 +105,35 @@ $root = 'E:\CPA-Stack'
 
 `E:` is only an example. Local C/D/E volumes, spaces, and non-ASCII paths are supported when they pass the filesystem safety checks.
 
-### 1. Inspect
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli status -Root $root -Json
-```
-
-A completed inspection exits 0. An unhealthy stack is represented by `outcome=Blocked`; an inspection protocol failure returns `success=false` and a non-zero exit code. Use `requiredOperation` to select the next explicit command.
-
-### 2. Recover or migrate explicitly
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli recover -Root $root -Json
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli migrate -Root $root -Json
-```
-
-Run only the operation required by status and authorized by the user. If automatic discovery is ambiguous, pass a migration request with `-RequestPath`. The request stores source paths, a secrets-file path, and optional formal ports—never secret values. See [migration-request.md](skills/cpa-safe-upgrade/references/migration-request.md).
-
-### 3. Upgrade a healthy canonical stack
+### 1. One-command upgrade
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli upgrade -Root $root -Json
 ```
 
-Unknown local versions are blocked by default to avoid replacing a prerelease build with latest stable. Only after a second explicit acknowledgement:
+The command runs `updater → recover → migrate → runtime upgrade → shortcut Ensure` without secondary authorization. A newer updater is verified, installed atomically, and re-executed before runtime work; failure stops. Unknown or unverifiable old binaries are replaced by the verified latest stable release, and a successful runtime upgrade maintains the default desktop quick launcher.
+
+When discovery is ambiguous, provide the migration request to the same command:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli upgrade `
-  -Root $root `
-  -AllowUnknownVersionReplacement `
-  -Json
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli upgrade -Root $root -RequestPath '<request.json>' -Json
 ```
 
-### 4. Start
+The request stores source paths, a secrets-file path, and optional formal ports—never secret values. See [migration-request.md](skills/cpa-safe-upgrade/references/migration-request.md).
+
+Real safety failures still stop immediately, including ambiguous journals, unknown port owners, untrusted ACL/reparse state, checksum or candidate-health failures, disk/path budgets, SQLite watermark regressions, and rollback failures.
+
+#### Windows Task Scheduler
+
+Use `powershell.exe` with:
+
+```text
+-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "<CodexHome>\skills\cpa-safe-upgrade\scripts\cpa-stack.ps1" upgrade -Root "<managed root>" -Json
+```
+
+Exit code `0` means the updater/runtime upgraded or was already current; non-zero means a real failure. The command reads no stdin, opens no browser, emits no confirmation prompt, and the next scheduled run automatically handles one recoverable pending transaction.
+
+### 2. Start
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli start -Root $root -NoBrowser
@@ -128,18 +143,14 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli start -Root $roo
 
 ## Desktop quick launch
 
-The installer creates the stable launcher. A separate managed operation owns the desktop shortcut. Check first; Ensure only when it is missing or drifted:
+After a successful `upgrade`, the updater automatically creates or updates the current user's `CPA 本地启动.lnk`. The same idempotent operation can also be invoked directly:
 
 ```powershell
-$shortcut = Join-Path ([Environment]::GetFolderPath('Desktop')) 'CPA Local Start (New).lnk'
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli shortcut `
-  -Action Check -Root $root -ShortcutPath $shortcut -Json
-
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli shortcut `
-  -Action Ensure -Root $root -ShortcutPath $shortcut -Json
+  -Action Ensure -Root $root -Json
 ```
 
-An identifiable legacy shortcut requires explicit `-AdoptExisting`; unknown conflicts are never overwritten.
+The shortcut uses the bundled icon and keeps one visible PowerShell window, preferring PowerShell 7 (`pwsh.exe`) and falling back to Windows PowerShell 5.1. The desktop entry runs the Fast starter directly: no ACL, hash, state, port-health, or Manager-readiness preflight is performed. Configured processes are reused immediately; missing processes are launched directly before the management page opens. Full checks remain in CLI `start` and update transactions. Recognizable legacy CPA shortcuts are backed up and adopted automatically; unknown unrelated conflicts are never overwritten.
 
 ## LAN exposure
 
@@ -152,7 +163,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli lan -Action Set 
 
 Candidate validation remains loopback-only.
 
-## Schema v2
+## Structured result (developer reference)
 
 Every public command returns a v2 envelope:
 
@@ -170,7 +181,7 @@ Every public command returns a v2 envelope:
   "after": null,
   "warnings": [],
   "error": null,
-  "updaterVersion": "1.0.1"
+  "updaterVersion": "1.1.0"
 }
 ```
 
@@ -201,8 +212,6 @@ Drive roots, UNC paths, Git worktrees, Windows/Program Files trees, the user-pro
 ## Tests and release status
 
 Tests use isolated root/state/lock directories, dynamically allocated high loopback ports, and a `KILL_ON_JOB_CLOSE` Job Object. Formal ports, PIDs, roots, control files, executable hashes, and critical ACLs are release-blocking invariants. CI runs the complete suite under both Windows PowerShell 5.1 and PowerShell 7.
-
-v1.0.0 is the first supported release. The 0.x line is development history only; compatibility with old updater installations, journals, or transaction state is not guaranteed. Existing CPA/Manager data can still be moved into a managed root on any local drive through the supported `migrate` flow.
 
 ## Security reports
 
