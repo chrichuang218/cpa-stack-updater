@@ -701,13 +701,25 @@ function Initialize-SkillDiscoveryRoot {
     Assert-CpaStackPathNoReparseAncestors -Path $skillsRoot -Description 'Codex skill discovery root'
     if (-not (Test-Path -LiteralPath $skillsRoot)) {
         New-Item -ItemType Directory -Force -Path $skillsRoot | Out-Null
+        Protect-CpaStackPrivateDirectory -Path $skillsRoot
     } elseif (-not (Test-Path -LiteralPath $skillsRoot -PathType Container)) {
         throw "Codex skill discovery root is not a directory: $skillsRoot"
     }
     $skillsAcl = Get-CpaStackFileSystemAcl -Path $skillsRoot
     $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    if ((Get-CpaStackAclOwnerSid -Acl $skillsAcl) -ne $currentSid) {
-        throw "Codex skill discovery root is not owned by the current Windows user: $skillsRoot"
+    $trustedSids = @($currentSid, 'S-1-5-18', 'S-1-5-32-544')
+    if ($trustedSids -notcontains (Get-CpaStackAclOwnerSid -Acl $skillsAcl)) {
+        throw "Codex skill discovery root is not owned by a trusted Windows identity: $skillsRoot"
+    }
+    foreach ($rule in Get-CpaStackAclAccessRules -Acl $skillsAcl | Where-Object { $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow }) {
+        try {
+            $sid = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        } catch {
+            throw "Codex skill discovery root contains an unresolvable allow principal: $skillsRoot"
+        }
+        if ($trustedSids -notcontains $sid) {
+            throw "Codex skill discovery root grants access to an unexpected identity: $skillsRoot ($sid)"
+        }
     }
     Protect-CpaStackPrivateDirectory -Path $skillsRoot
     Assert-CpaStackInstallAcl -Path $skillsRoot -PathType Container -RequireProtected

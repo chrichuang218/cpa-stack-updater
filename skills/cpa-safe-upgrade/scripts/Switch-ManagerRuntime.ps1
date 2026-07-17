@@ -301,6 +301,7 @@ try {
                 sourceRuntime = $SourceRuntime
                 sourceData = $SourceData
             }) -Path (Join-Path $snapshotStaging "manifest.json")
+            Protect-CpaStackPrivateTree -Root $snapshotStaging
             Move-Item -LiteralPath $snapshotStaging -Destination $pending -ErrorAction Stop
             $snapshotStaging = $null
             $baselinePath = Join-Path $pending "sqlite-backup.json"

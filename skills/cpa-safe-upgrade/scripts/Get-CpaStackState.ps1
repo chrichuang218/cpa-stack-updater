@@ -396,19 +396,17 @@ function Get-RootSecurityState {
         (Join-Path $StackRoot 'data\manager-plus\usage.sqlite'),
         (Join-Path $StackRoot 'data\manager-plus\data.key')
     ) | Where-Object { Test-Path -LiteralPath $_ }
-    $privateTreePaths = @()
     $authRoot = Join-Path $StackRoot 'runtime\cli-proxy-api\auth'
     if (Test-Path -LiteralPath $authRoot -PathType Container) {
         try {
-            $authPaths = @(Get-TreeItemsNoReparse -Root $authRoot -Description 'Protected CPA auth' | Select-Object -ExpandProperty FullName)
-            $paths += $authPaths
-            $privateTreePaths += $authPaths
+            Assert-CpaStackPrivateTree -Root $authRoot -Description 'Protected CPA auth' -AllowInheritedDescendants
         } catch {
             $issues += $_.Exception.Message
         }
     } else {
         $issues += 'CPA auth directory is missing.'
     }
+    $pluginPaths = @()
     $pluginsRoot = Join-Path $StackRoot 'runtime\cli-proxy-api\plugins'
     if (Test-Path -LiteralPath $pluginsRoot) {
         if (-not (Test-Path -LiteralPath $pluginsRoot -PathType Container)) {
@@ -417,7 +415,6 @@ function Get-RootSecurityState {
             try {
                 $pluginPaths = @(Get-TreeItemsNoReparse -Root $pluginsRoot -Description 'Protected CPA plugins' | Select-Object -ExpandProperty FullName)
                 $paths += $pluginPaths
-                $privateTreePaths += $pluginPaths
             } catch {
                 $issues += $_.Exception.Message
             }
@@ -434,7 +431,7 @@ function Get-RootSecurityState {
             if ($path -ieq $StackRoot -and -not $acl.AreAccessRulesProtected) {
                 $issues += 'Root ACL inheritance is enabled.'
             }
-            if ($privateTreePaths -icontains $path -and -not $acl.AreAccessRulesProtected) {
+            if ($pluginPaths -icontains $path -and -not $acl.AreAccessRulesProtected) {
                 $issues += "Private CPA tree ACL inheritance is enabled: $path"
             }
             $ownerText = [string]$acl.Owner

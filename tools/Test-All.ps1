@@ -381,7 +381,7 @@ $productionArtifactsBefore = Get-CpaStackProductionArtifactSnapshot `
     -ProductionStateHome $productionStateHome `
     -ListenerSnapshot $listenerSnapshot `
     -ProductionPort $productionPorts
-$suiteRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('cpa-stack-test-all-' + [guid]::NewGuid().ToString('N'))
+$suiteRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('cst-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $suiteRoot | Out-Null
 [void](Assert-CpaStackTestIsolation `
     -Guard $productionGuard `

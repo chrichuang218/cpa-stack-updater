@@ -482,10 +482,16 @@ function Write-CpaStackJson {
     $temp = $Path + ".tmp-" + [guid]::NewGuid().ToString("N")
     try {
         [System.IO.File]::WriteAllText($temp, $json, [System.Text.UTF8Encoding]::new($false))
+        Protect-CpaStackSecretFile -Path $temp
         if (Test-Path -LiteralPath $Path -PathType Leaf) {
             [System.IO.File]::Replace($temp, $Path, ($Path + ".previous"))
         } else {
             [System.IO.File]::Move($temp, $Path)
+        }
+        Protect-CpaStackSecretFile -Path $Path
+        $previous = $Path + ".previous"
+        if (Test-Path -LiteralPath $previous -PathType Leaf) {
+            Protect-CpaStackSecretFile -Path $previous
         }
     } finally {
         if (Test-Path -LiteralPath $temp) {

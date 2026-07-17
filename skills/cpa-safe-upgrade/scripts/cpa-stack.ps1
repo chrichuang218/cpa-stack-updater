@@ -111,7 +111,7 @@ try {
     if ($Command -in @('status', 'doctor', 'plan')) {
         $compatibilityWarnings = @()
         if ($Command -ne 'status') {
-            $compatibilityWarnings += "Command '$Command' is deprecated in v0.2.0; use 'status'. It will be removed in v0.3.0."
+            $compatibilityWarnings += "Command '$Command' is a legacy alias outside the v1 supported interface; use 'status'."
         }
         $inspection = Invoke-CpaStackInspection -Root $resolvedRoot -HostAdapter $hostAdapter -Operation status -Warnings $compatibilityWarnings
         if ($Command -ne 'status') {
@@ -124,7 +124,7 @@ try {
     if ($Command -eq 'init') {
         if ($UpdateDesktopShortcut -or $ExposeToLan -or -not [string]::IsNullOrWhiteSpace($DesktopShortcut)) {
             $legacySplit = New-CpaStackResult -Operation migrate -Success $false -Outcome Blocked -Changed $false -Root $resolvedRoot `
-                -Warnings @("Command 'init' is deprecated in v0.2.0; use 'migrate'. It will be removed in v0.3.0.") `
+                -Warnings @("Command 'init' is a legacy alias outside the v1 supported interface; use 'migrate'.") `
                 -Error (New-CpaStackError -Code 'OperationSplitRequired' -Message 'Shortcut and LAN changes must use their explicit v2 operations.') `
                 -Extensions ([ordered]@{ deprecatedCommand = 'init' })
             Write-CommandResult -Value $legacySplit
@@ -171,7 +171,7 @@ try {
                 [System.IO.File]::WriteAllText($legacyRequestPath, ($legacyRequest | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
             }
             $legacyMigration = Invoke-CpaStackMigrationTransaction -Root $resolvedRoot -HostAdapter $hostAdapter -RequestPath $legacyRequestPath
-            $legacyMigration.warnings = @($legacyMigration.warnings) + @("Command 'init' is deprecated in v0.2.0; use 'migrate'. It will be removed in v0.3.0.")
+            $legacyMigration.warnings = @($legacyMigration.warnings) + @("Command 'init' is a legacy alias outside the v1 supported interface; use 'migrate'.")
             $legacyMigration['deprecatedCommand'] = 'init'
             Write-CommandResult -Value $legacyMigration
             if (-not $legacyMigration.success) { exit 1 }
@@ -270,7 +270,7 @@ try {
             Exit-CpaStackOperationLock -Mutex $registerLock
         }
         $registerResult = New-CpaStackResult -Operation register-root -Success $true -Outcome Changed -Changed $true -Root $resolvedRoot `
-            -Warnings @("Command 'register-root' is deprecated in v0.2.0; install.ps1 manages root registration. It will be removed in v0.3.0.")
+            -Warnings @("Command 'register-root' is a legacy alias outside the v1 supported interface; install.ps1 manages root registration.")
         Write-CommandResult -Value $registerResult
         exit 0
     }

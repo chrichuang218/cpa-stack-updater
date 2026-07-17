@@ -168,7 +168,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli lan -Action Set 
   "after": null,
   "warnings": [],
   "error": null,
-  "updaterVersion": "0.2.0"
+  "updaterVersion": "1.0.0"
 }
 ```
 
@@ -200,7 +200,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File $uninstaller -Yes
 
 测试使用隔离 root/state/lock、动态高位 loopback 端口和 `KILL_ON_JOB_CLOSE` Job Object；正式端口、正式 PID、正式 root 与控制文件是发布阻断保护项。CI 在 Windows PowerShell 5.1 和 PowerShell 7 运行完整套件。
 
-v0.2.0 是架构与事务接口重构版；真实环境仍应逐步扩展验证，不宣称覆盖所有 Windows 配置。
+v1.0.0 是首个受支持版本。0.x 仅为开发历史，不承诺旧 updater 安装、journal 或事务状态兼容；现有 CPA/Manager 数据仍可通过正式 `migrate` 流程迁入任意本地盘的 managed root。
 
 ## 安全反馈
 

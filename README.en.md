@@ -170,7 +170,7 @@ Every public command returns a v2 envelope:
   "after": null,
   "warnings": [],
   "error": null,
-  "updaterVersion": "0.2.0"
+  "updaterVersion": "1.0.0"
 }
 ```
 
@@ -202,7 +202,7 @@ Drive roots, UNC paths, Git worktrees, Windows/Program Files trees, the user-pro
 
 Tests use isolated root/state/lock directories, dynamically allocated high loopback ports, and a `KILL_ON_JOB_CLOSE` Job Object. Formal ports, PIDs, roots, control files, executable hashes, and critical ACLs are release-blocking invariants. CI runs the complete suite under both Windows PowerShell 5.1 and PowerShell 7.
 
-v0.2.0 is an architecture and transaction-interface release. Real-world rollout should still expand gradually; it is not claimed to cover every Windows configuration.
+v1.0.0 is the first supported release. The 0.x line is development history only; compatibility with old updater installations, journals, or transaction state is not guaranteed. Existing CPA/Manager data can still be moved into a managed root on any local drive through the supported `migrate` flow.
 
 ## Security reports
 

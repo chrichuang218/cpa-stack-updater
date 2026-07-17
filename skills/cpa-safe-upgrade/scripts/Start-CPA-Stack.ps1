@@ -346,7 +346,7 @@ function Assert-CanonicalInstanceState {
             throw "$($entry.Name) executable does not match current state."
         }
     }
-    Assert-PrivateCpaTree -Root (Join-Path $Settings.Cpa.WorkingDirectory 'auth') -Description 'Canonical CPA auth'
+    Assert-PrivateCpaTree -Root (Join-Path $Settings.Cpa.WorkingDirectory 'auth') -Description 'Canonical CPA auth' -AllowInheritedDescendants
     $pluginsRoot = Join-Path $Settings.Cpa.WorkingDirectory 'plugins'
     if (Test-Path -LiteralPath $pluginsRoot) {
         Assert-PrivateCpaTree -Root $pluginsRoot -Description 'Canonical CPA plugins'

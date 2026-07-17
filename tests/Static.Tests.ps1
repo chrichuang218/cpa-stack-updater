@@ -82,7 +82,7 @@ $launcherModule = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'modules\C
 Assert-True ($launcherModule -match "Invoke-CpaStackBundled\s+-HostAdapter\s+\`$HostAdapter\s+-Name\s+'Start-CPA-Stack\.ps1'") 'Public start executes the bundled trusted launcher through its host adapter'
 Assert-False ($cli -match 'function\s+(?:Invoke-BundledScript|Get-StatusResult|Get-InitArguments)') 'Public CLI contains no duplicate v0.1 execution implementation'
 Assert-False ($cli -match 'schemaVersion\s*=\s*1\s*\r?\n\s*command\s*=') 'Compatibility commands still return the v2 envelope'
-Assert-True ($cli -match "Command 'register-root' is deprecated in v0\.2\.0") 'The remaining register-root compatibility command has an explicit one-release lifetime'
+Assert-True ($cli -match "Command 'register-root' is a legacy alias outside the v1 supported interface") 'The remaining register-root alias is explicitly outside the supported v1 interface'
 
 $common = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\CpaStack.Common.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
 $commonNativeStart = $common.IndexOf('using System;', $common.IndexOf("Add-Type -TypeDefinition @'", [System.StringComparison]::Ordinal), [System.StringComparison]::Ordinal)
@@ -148,8 +148,10 @@ foreach ($criticalParent in @('runtime\cli-proxy-api', 'runtime\manager-plus', '
 Assert-True ($stateScript -match 'ManagerDataTree') 'Canonical status reports the recursive Manager data-tree trust state'
 Assert-True ($stateScript -match "migrationStatus\s+-in\s+@\('ready', 'migrated'\)") 'Status accepts the latest Manager completed-migration state'
 Assert-True ($stateScript -match "runtime\\cli-proxy-api\\plugins") 'Status recursively includes the optional CPA plugins tree in root security'
-Assert-True ($stateScript -match '\$privateTreePaths\s+-icontains\s+\$path') 'Status rejects inherited ACLs inside auth and plugins trees'
+Assert-True ($stateScript -match 'Assert-CpaStackPrivateTree\s+-Root\s+\$authRoot.+-AllowInheritedDescendants') 'Status permits trusted inherited ACLs on runtime-created CPA auth descendants'
+Assert-True ($stateScript -match '\$pluginPaths\s+-icontains\s+\$path') 'Status still rejects inherited ACLs inside the plugins tree'
 Assert-True ($start -match "migrationStatus\s+-in\s+@\('ready', 'migrated'\)") 'Canonical start accepts the latest Manager completed-migration state'
+Assert-True ($start -match 'Assert-PrivateCpaTree\s+-Root\s+\(Join-Path\s+\$Settings\.Cpa\.WorkingDirectory\s+''auth''\).+-AllowInheritedDescendants') 'Canonical start permits trusted inherited ACLs on runtime-created CPA auth descendants'
 Assert-True ($start -match 'Assert-PrivateCpaTree\s+-Root\s+\$pluginsRoot') 'Canonical start validates optional plugins before launching CPA'
 
 $testCpaCandidate = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\Test-CpaCandidate.ps1'), [System.Text.UTF8Encoding]::new($false, $true))

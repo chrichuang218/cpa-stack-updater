@@ -5,6 +5,8 @@ description: 在 Windows 上安全检查、迁移、恢复、启动或升级 CLI
 
 # CPA Safe Upgrade
 
+v1.0.0 是首个受支持版本。不要为 0.x updater 安装、journal 或事务状态增加兼容分支；遇到这类残留时先保护用户数据，再建立干净的 v1 managed root。现有 CPA/Manager 业务数据迁移仍属于受支持主流程。
+
 ## 执行边界
 
 只使用 bundled `scripts/cpa-stack.ps1` 处理 CPA/Manager runtime。不要直接调用内部 `Test-*`、`Switch-*`、初始化或启动脚本，也不要临时重写停止、复制、迁移、切换或恢复逻辑。

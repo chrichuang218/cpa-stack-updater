@@ -1,5 +1,15 @@
 # 更新记录
 
+## 1.0.0 - 2026-07-17
+
+- 首个受支持的正式版本。`0.x` 仅视为开发过程产物，不承诺旧 updater 安装、journal 或事务状态兼容；从本版本开始建立稳定升级基线。
+- 修复管理员令牌默认 owner 为 `BUILTIN\Administrators` 时，原子 JSON 写入会导致 `current.json` 与 pending journal 被自身安全检查拒绝的问题；写入与替换后统一恢复当前用户 owner 和受保护 ACL。
+- CPA `auth` 根继续严格保护，运行期日志后代允许继承仅包含当前用户、SYSTEM 与 Administrators 的受信 ACL；`plugins` 仍保持全树严格校验。
+- CPA 与 Manager 回滚快照进入 pending 前整树加固，确保正式切换中断后恢复器可以读取、验证并自动收敛。
+- 已用真实动态 loopback 候选端口完成 CPA v7.2.81 与 Manager Plus v1.11.2 升级验证，并核对 SQLite 历史水位、`data.key` 与 collector 状态。
+
+以下 `0.x` 条目仅保留为开发历史，不属于受支持版本。
+
 ## 0.2.0 - 2026-07-17
 
 - 将公开 CLI 重构为 schema v2 深模块：`status`、`recover`、`migrate`、`upgrade`、`start`、`shortcut` 与 `lan` 各自拥有显式事务；升级不再隐式迁移、恢复、修改快捷方式或改变 LAN。`plan`、`doctor`、`init` 与 `register-root` 仅保留一版兼容映射。

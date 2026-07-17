@@ -105,7 +105,7 @@ try {
     Assert-CpaStackPath -Path $SourceConfig -PathType Leaf
     Assert-CpaStackPath -Path $candidateExe -PathType Leaf
     if ($sameRuntime) {
-        Assert-CpaStackPrivateTree -Root $sourceAuth -Description 'Preserved CPA auth'
+        Assert-CpaStackPrivateTree -Root $sourceAuth -Description 'Preserved CPA auth' -AllowInheritedDescendants
         if (Test-Path -LiteralPath $sourcePlugins) {
             Assert-CpaStackPrivateTree -Root $sourcePlugins -Description 'Preserved CPA plugins'
         }
@@ -175,6 +175,7 @@ try {
             executableSha256 = $result.oldHash
             sourceRuntime = $SourceRuntime
         }) -Path (Join-Path $snapshotStaging "manifest.json")
+        Protect-CpaStackPrivateTree -Root $snapshotStaging
     } else {
         $operationId = [guid]::NewGuid().ToString("N")
         $pending = $null
@@ -245,7 +246,7 @@ try {
             throw "CPA target executable hash does not match the candidate."
         }
         Protect-CpaStackSecretFile -Path $targetExe
-        Assert-CpaStackPrivateTree -Root $targetAuth -Description 'Preserved CPA auth'
+        Assert-CpaStackPrivateTree -Root $targetAuth -Description 'Preserved CPA auth' -AllowInheritedDescendants
         if (Test-Path -LiteralPath $targetPlugins) {
             Assert-CpaStackPrivateTree -Root $targetPlugins -Description 'Preserved CPA plugins'
         }

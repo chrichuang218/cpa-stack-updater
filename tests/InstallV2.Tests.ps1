@@ -545,6 +545,8 @@ while (`$true) { Start-Sleep -Seconds 60 }
     Assert-Equal $legacyAdoptionCodexBefore (Get-TestTreeSnapshot -Root $codexHome) 'Blocked legacy root does not rotate or rewrite the installed skill'
     Assert-Equal $legacyAdoptionStateHomeBefore (Get-TestTreeSnapshot -Root $fixture.LocalAppData) 'Blocked legacy root does not rewrite the registered-root locator'
 
+    # The 0.x updater line is unsupported development history and is not part of the v1 compatibility contract.
+    if ($env:CPA_STACK_RUN_UNSUPPORTED_0X_TESTS -ceq '1') {
     $v014Archive = Join-Path $temp 'v0.1.4.zip'
     $v014Source = Join-Path $temp 'v0.1.4-source'
     & git.exe -C $sourceRepo archive '--format=zip' ('--output=' + $v014Archive) 'v0.1.4'
@@ -566,7 +568,7 @@ while (`$true) { Start-Sleep -Seconds 60 }
 
     $v014ToCurrent = Invoke-InstallJson -Script $install -Action Update -CodexHome $v014CodexHome -StackRoot $v014StackRoot
     Assert-Equal 'Changed' $v014ToCurrent.outcome 'Current installer upgrades the real v0.1.4 tag installation'
-    Assert-Equal '0.2.0' ([string]$v014ToCurrent.installedVersion) 'v0.1.4 compatibility upgrade installs v0.2.0'
+    Assert-Equal '1.0.0' ([string]$v014ToCurrent.installedVersion) 'A legacy development install can be replaced by the first supported release'
     $v014SlotRoot = Join-Path $v014CodexHome 'cpa-stack-updater\skill-slots'
     $v014SlotPrevious = Join-Path $v014SlotRoot 'previous'
     $v014LegacyPrevious = Join-Path $v014CodexHome 'skills\cpa-safe-upgrade.previous'
@@ -635,6 +637,7 @@ while (`$true) { Start-Sleep -Seconds 60 }
     Assert-False ([bool]$v014NoChange.updateAvailable) 'v0.1.4 compatibility path converges with no update pending'
     Assert-Equal $v014CodexBeforeNoChange (Get-TestTreeSnapshot -Root $v014CodexHome) 'NoChange after v0.1.4 upgrade preserves CodexHome bytes and timestamps'
     Assert-Equal $v014StackBeforeNoChange (Get-TestTreeSnapshot -Root $v014StackRoot) 'NoChange after v0.1.4 upgrade preserves StackRoot bytes and timestamps'
+    }
     Set-CpaStackRegisteredRoot -ControlRoot $stackRoot
 
     $installedCli = Join-Path $installed 'scripts\cpa-stack.ps1'
