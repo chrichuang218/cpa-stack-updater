@@ -500,18 +500,42 @@ function Write-CpaStackJson {
     }
 }
 
+function Get-CpaStackCanonicalBootstrapBytes {
+    $skillRoot = Split-Path -Parent $PSScriptRoot
+    $templatePath = Join-Path $skillRoot 'installer\Start-CPA-Stack.bootstrap.ps1'
+    Assert-CpaStackPath -Path $templatePath -PathType Leaf
+    $templateItem = Get-Item -Force -LiteralPath $templatePath
+    if (($templateItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'The bundled canonical bootstrap template must not be a reparse point.'
+    }
+
+    $template = [System.IO.File]::ReadAllText($templatePath, [System.Text.UTF8Encoding]::new($false, $true))
+    $token = '__CPA_STACK_CODEX_HOME_BASE64__'
+    if ([regex]::Matches($template, [regex]::Escape($token)).Count -ne 1) {
+        throw 'Canonical bootstrap template must contain exactly one CodexHome token.'
+    }
+    $codexHome = Split-Path -Parent (Split-Path -Parent $skillRoot)
+    $encodedHome = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes(
+        [System.IO.Path]::GetFullPath($codexHome).TrimEnd('\')
+    ))
+    return ,([System.Text.UTF8Encoding]::new($false).GetBytes($template.Replace($token, $encodedHome)))
+}
+
+function Get-CpaStackByteArrayHash {
+    param([Parameter(Mandatory = $true)][byte[]]$Bytes)
+
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($sha256.ComputeHash($Bytes))).Replace('-', '')
+    } finally {
+        $sha256.Dispose()
+    }
+}
+
 function Sync-CpaStackCanonicalLauncher {
-    param(
-        [Parameter(Mandatory = $true)][string]$ControlRoot,
-        [Parameter(Mandatory = $true)][string]$SourcePath
-    )
+    param([Parameter(Mandatory = $true)][string]$ControlRoot)
 
     $root = Assert-CpaStackSecureLocalRoot -Path $ControlRoot
-    Assert-CpaStackPath -Path $SourcePath -PathType Leaf
-    $sourceItem = Get-Item -Force -LiteralPath $SourcePath
-    if (($sourceItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw 'The bundled canonical launcher source must not be a reparse point.'
-    }
     $marker = Ensure-CpaStackInstanceMarker -ControlRoot $root
     $currentPath = Join-Path $root 'state\current.json'
     Assert-CpaStackChildPath -Root $root -Path $currentPath
@@ -523,7 +547,8 @@ function Sync-CpaStackCanonicalLauncher {
 
     $destination = Join-Path $root 'ops\Start-CPA-Stack.ps1'
     Assert-CpaStackChildPath -Root $root -Path $destination
-    $sourceHash = Get-CpaStackFileHash -Path $SourcePath
+    $bootstrapBytes = Get-CpaStackCanonicalBootstrapBytes
+    $sourceHash = Get-CpaStackByteArrayHash -Bytes $bootstrapBytes
     $previousHash = Get-CpaStackFileHash -Path $destination
     if ($previousHash -eq $sourceHash) {
         return [pscustomobject]@{ changed = $false; path = $destination; sha256 = $sourceHash }
@@ -533,7 +558,7 @@ function Sync-CpaStackCanonicalLauncher {
     $temporary = $destination + '.tmp-' + [guid]::NewGuid().ToString('N')
     $backup = $destination + '.previous-' + [guid]::NewGuid().ToString('N')
     try {
-        [System.IO.File]::WriteAllBytes($temporary, [System.IO.File]::ReadAllBytes($SourcePath))
+        [System.IO.File]::WriteAllBytes($temporary, $bootstrapBytes)
         Protect-CpaStackSecretFile -Path $temporary
         if ((Get-CpaStackFileHash -Path $temporary) -ne $sourceHash) {
             throw 'Canonical launcher staging hash mismatch.'

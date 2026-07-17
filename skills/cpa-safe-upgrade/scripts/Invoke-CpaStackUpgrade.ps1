@@ -1451,7 +1451,7 @@ try {
     if (-not $preflight.OverallHealthy -or $preflight.CanonicalEstablished -eq $false) {
         throw "Canonical preflight is not healthy."
     }
-    $launcherSync = Sync-CpaStackCanonicalLauncher -ControlRoot $ControlRoot -SourcePath (Join-Path $PSScriptRoot 'Start-CPA-Stack.ps1')
+    $launcherSync = Sync-CpaStackCanonicalLauncher -ControlRoot $ControlRoot
     $result.launcherUpdated = [bool]$launcherSync.changed
     foreach ($path in @($cpaRuntime, $managerRuntime, $managerData)) { Assert-CpaStackPath -Path $path }
     foreach ($path in @($cpaConfig, (Join-Path $cpaRuntime "cli-proxy-api.exe"), (Join-Path $managerRuntime "cpa-manager-plus.exe"))) { Assert-CpaStackPath -Path $path -PathType Leaf }

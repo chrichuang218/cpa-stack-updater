@@ -1,5 +1,10 @@
 # 更新记录
 
+## 1.1.1 - 2026-07-18
+
+- 修复迁移与运行时升级把 canonical 快速 bootstrap 覆盖成完整 starter 的回归；桌面快捷方式继续显式进入 `Fast` 模式，不再意外执行完整启动检查。
+- launcher 同步统一渲染 installer 的 canonical bootstrap，已发生覆盖的托管实例会在下一次更新时自动恢复快速启动。
+
 ## 1.1.0 - 2026-07-18
 
 - `upgrade` 在接触 CPA/Manager runtime 前自动检查固定官方仓库的 updater Release；发现更高稳定版本时校验固定资产名、`checksums.txt` 与 GitHub SHA256 digest，通过本地 installer 原子更新 Skill，再使用新版 CLI 重新执行一次升级。

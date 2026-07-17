@@ -57,7 +57,7 @@ Assert-True ($skill -match "install\.ps1'\s+-Action\s+Check" -and $skill -match 
 $initialize = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts\Initialize-CpaStack.ps1') -Raw -Encoding UTF8
 Assert-True ($initialize -match '\$canonicalDirectories\s*=') 'Initialization defines the complete set of canonical top-level directories'
 Assert-True ($initialize -match 'foreach\s*\(\$dir\s+in\s+\$canonicalDirectories\)\s*\{\s*Protect-CpaStackPrivateDirectory') 'Initialization protects every canonical top-level directory after creating it'
-Assert-True ($initialize -match 'Copy-Item.+Start-CPA-Stack\.ps1.+\r?\n\s*Protect-CpaStackSecretFile\s+-Path\s+\$newStartScript') 'Initialization protects the canonical launcher after copying it'
+Assert-True ($initialize -match 'WriteAllBytes\(\$newStartScript, \(Get-CpaStackCanonicalBootstrapBytes\)\)\s*\r?\n\s*Protect-CpaStackSecretFile\s+-Path\s+\$newStartScript') 'Initialization protects the rendered canonical bootstrap after writing it'
 Assert-True ($initialize -match 'WriteAllText\(\$stackConfigPath[\s\S]+Protect-CpaStackSecretFile\s+-Path\s+\$stackConfigPath') 'Initialization protects the canonical stack config after writing it'
 Assert-False ($initialize -match 'legacyStartScriptSha256\s*=\s*Get-CpaStackFileHash\s+-Path\s+\$LegacyStartScript') 'Legacy start script hash is not computed unconditionally'
 Assert-True ($initialize -match 'legacyStartScriptSha256\s*=\s*if\s*\(\[string\]::IsNullOrWhiteSpace\(\$LegacyStartScript\)\)') 'Legacy start script hash is guarded for an empty path'

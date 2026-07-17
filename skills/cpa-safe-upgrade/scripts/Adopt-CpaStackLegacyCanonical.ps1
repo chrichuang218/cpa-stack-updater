@@ -245,7 +245,7 @@ try {
         throw 'Adopted canonical services, ACL, or integrity did not pass the trusted health contract.'
     }
 
-    $launcher = Sync-CpaStackCanonicalLauncher -ControlRoot $ControlRoot -SourcePath (Join-Path $PSScriptRoot 'Start-CPA-Stack.ps1')
+    $launcher = Sync-CpaStackCanonicalLauncher -ControlRoot $ControlRoot
     $result.launcherUpdated = [bool]$launcher.changed
     Set-CpaStackRegisteredRoot -ControlRoot $ControlRoot
     $result.instanceId = $instanceId

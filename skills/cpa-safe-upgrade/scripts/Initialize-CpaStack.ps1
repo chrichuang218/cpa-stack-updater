@@ -1870,7 +1870,7 @@ try {
     Write-CanonicalConfiguration -RequestMonitoringEnabled ([bool]$sourceManagerBaseline.collectorEnabled) -ManagerBindAddress $sourceManagerBindAddress
     Copy-CurrentCpaRuntime -Source $SourceCpaRuntime -Destination $targetCpaRuntime -Config $SourceCpaConfig
     Copy-CurrentManagerRuntime -Source $SourceManagerRuntime -Destination $targetManagerRuntime
-    Copy-Item -LiteralPath (Join-Path $PSScriptRoot "Start-CPA-Stack.ps1") -Destination $newStartScript -Force
+    [System.IO.File]::WriteAllBytes($newStartScript, (Get-CpaStackCanonicalBootstrapBytes))
     Protect-CpaStackSecretFile -Path $newStartScript
     $legacyIcon = if ($DesktopShortcut) { (New-Object -ComObject WScript.Shell).CreateShortcut($DesktopShortcut).IconLocation.Split(',')[0] } else { $null }
     if ($legacyIcon -and (Test-Path -LiteralPath $legacyIcon)) {
