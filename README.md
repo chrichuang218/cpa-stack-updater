@@ -28,6 +28,18 @@ https://github.com/chrichuang218/cpa-stack-updater
 
 以后只需说“升级 CPA”“检查 CPA”或“创建 CPA 桌面启动方式”。根目录只在首次安装、切换实例或隔离测试时指定。升级会先验证并更新 Skill，再自动处理恢复、首次迁移、稳定版替换和快捷方式维护，不重复询问；LAN 仍需单独授权。
 
+## 使用截图
+
+![通过 Codex 升级 CPA 并创建自动更新任务](docs/screenshots/1.png)
+
+![已安排的 CPA 自动更新任务](docs/screenshots/2.png)
+
+![升级前的 CPA Manager Plus 版本](docs/screenshots/3.png)
+
+![升级后的 CPA Manager Plus 与 CLIProxyAPI 版本](docs/screenshots/4.png)
+
+![CPA Stack 桌面快捷方式启动成功](docs/screenshots/5.png)
+
 ## 自动升级会做什么
 
 ```text
@@ -220,6 +232,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File $uninstaller -Yes
 ## 安全反馈
 
 请按 [SECURITY.md](SECURITY.md) 私下报告漏洞。Issue 中不要上传 key、`data.key`、SQLite、auth、完整配置或原始请求日志。
+
+**致谢**
+
+感谢 [LINUX DO](https://linux.do/) 社区的支持与讨论
 
 ## License
 
