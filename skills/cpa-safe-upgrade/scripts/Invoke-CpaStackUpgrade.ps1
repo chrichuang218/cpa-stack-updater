@@ -157,6 +157,88 @@ function Repair-CpaStackRecordedExecutableAcl {
     }
 }
 
+function Remove-CommittedOrphanSwitchPrevious {
+    param($CurrentState)
+
+    function Assert-OrphanPathEquals {
+        param([string]$Actual, [string]$Expected, [string]$Description)
+
+        if ([string]::IsNullOrWhiteSpace($Actual) -or [string]::IsNullOrWhiteSpace($Expected)) {
+            throw "$Description is missing."
+        }
+        $actualFull = [System.IO.Path]::GetFullPath($Actual).TrimEnd('\')
+        $expectedFull = [System.IO.Path]::GetFullPath($Expected).TrimEnd('\')
+        if (-not [string]::Equals($actualFull, $expectedFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "$Description does not match the canonical path."
+        }
+    }
+
+    $removed = $false
+    $rollbackRoot = Join-Path $ControlRoot 'rollback'
+    foreach ($component in @('cpa', 'manager')) {
+        $journalPath = Join-Path $stateDir "switch-$component.pending.json"
+        $previousPath = $journalPath + '.previous'
+        if ((Test-Path -LiteralPath $journalPath -PathType Leaf) -or -not (Test-Path -LiteralPath $previousPath -PathType Leaf)) {
+            continue
+        }
+
+        Assert-CpaStackPath -Path $previousPath -PathType Leaf
+        $beforeHash = Get-CpaStackFileHash -Path $previousPath
+        $journal = Read-CpaStackJson -Path $previousPath
+        $expectedOperation = "switch-$component"
+        foreach ($field in @('operation', 'operationId', 'parentOperationId', 'instanceId', 'oldHash', 'newHash', 'targetRuntime')) {
+            if ($null -eq $journal.PSObject.Properties[$field] -or [string]::IsNullOrWhiteSpace([string]$journal.$field)) {
+                throw "Orphan $expectedOperation previous journal is missing $field."
+            }
+        }
+        if ([string]$journal.operation -cne $expectedOperation -or [string]$journal.instanceId -cne [string]$CurrentState.instanceId) {
+            throw "Orphan $expectedOperation previous journal is not bound to the current stack instance."
+        }
+
+        $componentState = $CurrentState.$component
+        $runtime = if ($component -eq 'cpa') { $cpaRuntime } else { $managerRuntime }
+        $exeName = if ($component -eq 'cpa') { 'cli-proxy-api.exe' } else { 'cpa-manager-plus.exe' }
+        $exe = Join-Path $runtime $exeName
+        Assert-OrphanPathEquals -Actual ([string]$journal.targetRuntime) -Expected $runtime -Description "$component orphan previous targetRuntime"
+        if ([string]$componentState.sha256 -ine [string]$journal.newHash -or
+            (Get-CpaStackFileHash -Path $exe) -ine [string]$journal.newHash) {
+            throw "Orphan $expectedOperation previous journal does not describe the committed executable."
+        }
+
+        $pendingPath = Join-Path $rollbackRoot ("pending-$component-" + [string]$journal.operationId)
+        if (Test-Path -LiteralPath $pendingPath) {
+            throw "Orphan $expectedOperation previous journal still has a rollback pending directory."
+        }
+
+        $matchingResult = $null
+        foreach ($name in @("$component-migration-switch.json", "$component-upgrade-switch.json")) {
+            $path = Join-Path $stateDir $name
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+            Assert-CpaStackPath -Path $path -PathType Leaf
+            $candidate = Read-CpaStackJson -Path $path
+            if ([bool]$candidate.success -and
+                [string]$candidate.operation -ceq $expectedOperation -and
+                [string]$candidate.operationId -ceq [string]$journal.operationId -and
+                [string]$candidate.parentOperationId -ceq [string]$journal.parentOperationId -and
+                [string]$candidate.newHash -ieq [string]$journal.newHash -and
+                -not [bool]$candidate.rolledBack) {
+                $matchingResult = $candidate
+                break
+            }
+        }
+        if ($null -eq $matchingResult) {
+            throw "Orphan $expectedOperation previous journal has no matching successful switch result."
+        }
+        Assert-OrphanPathEquals -Actual ([string]$matchingResult.targetPath) -Expected $exe -Description "$component orphan previous switch result targetPath"
+        if ((Get-CpaStackFileHash -Path $previousPath) -ine $beforeHash) {
+            throw "Orphan $expectedOperation previous journal changed while it was being validated."
+        }
+        Remove-Item -LiteralPath $previousPath -Force -ErrorAction Stop
+        $removed = $true
+    }
+    return $removed
+}
+
 function Prepare-CpaCandidateRuntime {
     param([string]$ReleasePackageRoot, [string]$ActiveRuntime)
 
@@ -1227,6 +1309,7 @@ function Restore-CanonicalInterruptedState {
         Assert-CpaStackPrivateTree -Root $recoveryPlugins -Description 'Preserved CPA plugins'
     }
 
+    Protect-CpaStackSecretFile -Path (Join-Path $ControlRoot 'config\stack.psd1')
     $startScript = Join-Path $PSScriptRoot "Start-CPA-Stack.ps1"
     $started = $false
     $startError = $null
@@ -1332,6 +1415,10 @@ try {
 
     if (Test-Path -LiteralPath (Join-Path $stateDir "initialize.pending.json") -PathType Leaf) {
         throw "Initialization recovery must be finalized with Initialize-CpaStack.ps1 before upgrading."
+    }
+
+    if ($RecoverOnly -and (Remove-CommittedOrphanSwitchPrevious -CurrentState $identityState)) {
+        $result.recoveredInterruptedState = $true
     }
 
     $pendingStateFiles = @(Get-ChildItem -LiteralPath $stateDir -File -Filter '*.pending.json' -ErrorAction SilentlyContinue)

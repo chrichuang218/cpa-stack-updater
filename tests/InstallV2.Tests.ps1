@@ -568,7 +568,7 @@ while (`$true) { Start-Sleep -Seconds 60 }
 
     $v014ToCurrent = Invoke-InstallJson -Script $install -Action Update -CodexHome $v014CodexHome -StackRoot $v014StackRoot
     Assert-Equal 'Changed' $v014ToCurrent.outcome 'Current installer upgrades the real v0.1.4 tag installation'
-    Assert-Equal '1.0.0' ([string]$v014ToCurrent.installedVersion) 'A legacy development install can be replaced by the first supported release'
+    Assert-Equal '1.0.1' ([string]$v014ToCurrent.installedVersion) 'A legacy development install can be replaced by the current supported release'
     $v014SlotRoot = Join-Path $v014CodexHome 'cpa-stack-updater\skill-slots'
     $v014SlotPrevious = Join-Path $v014SlotRoot 'previous'
     $v014LegacyPrevious = Join-Path $v014CodexHome 'skills\cpa-safe-upgrade.previous'

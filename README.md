@@ -168,7 +168,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli lan -Action Set 
   "after": null,
   "warnings": [],
   "error": null,
-  "updaterVersion": "1.0.0"
+  "updaterVersion": "1.0.1"
 }
 ```
 

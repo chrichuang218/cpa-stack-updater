@@ -236,10 +236,21 @@ function Set-TestFileAcl {
     Set-TestPathAcl -Path $Path -Acl $Acl
 }
 
-$wshProbeRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('cpa-shortcut-wsh-probe-' + [guid]::NewGuid().ToString('N'))
+$shortcutTestWork = Join-Path $PSScriptRoot 'work'
+$wshProbeRoot = Join-Path $shortcutTestWork 'cpa-shortcut-wsh-probe-policy'
 $wshProbePath = Join-Path $wshProbeRoot 'CPA Probe.lnk'
 $wshProbeLauncher = Join-Path $wshProbeRoot 'Start-CPA-Stack.ps1'
 $wshShortcutSupported = $false
+$wshProbeCleanupBlocked = $false
+if (Test-Path -LiteralPath $wshProbeRoot) {
+    try {
+        Remove-TestPathWithRetry -Path $wshProbeRoot
+    } catch {
+        Write-Host 'Managed shortcut v2 tests skipped: endpoint policy retains the PowerShell WSH probe.'
+        Remove-Module CpaStack.ManagedShortcut -ErrorAction SilentlyContinue
+        return
+    }
+}
 try {
     New-Item -ItemType Directory -Force -Path $wshProbeRoot | Out-Null
     Set-Content -LiteralPath $wshProbeLauncher -Value '# WSH policy probe' -Encoding ASCII
@@ -251,15 +262,21 @@ try {
     $wshShortcutSupported = [string]::Equals([string]$wshProbe.TargetPath, $wshPowerShell, [System.StringComparison]::OrdinalIgnoreCase) -and
         [string]$wshProbe.Arguments -ceq $wshArguments -and [int]$wshProbe.WindowStyle -eq 7
 } finally {
-    Remove-TestPathWithRetry -Path $wshProbeRoot
+    try {
+        Remove-TestPathWithRetry -Path $wshProbeRoot
+    } catch {
+        $wshProbeCleanupBlocked = $true
+        $wshShortcutSupported = $false
+    }
 }
 if (-not $wshShortcutSupported) {
-    Write-Host 'Managed shortcut v2 tests skipped: endpoint policy rewrites PowerShell WSH shortcuts.'
+    $reason = if ($wshProbeCleanupBlocked) { 'retains' } else { 'rewrites' }
+    Write-Host "Managed shortcut v2 tests skipped: endpoint policy $reason PowerShell WSH shortcuts."
     Remove-Module CpaStack.ManagedShortcut -ErrorAction SilentlyContinue
     return
 }
 
-$testHome = Join-Path ([System.IO.Path]::GetTempPath()) ('cpa-managed-shortcut-v2-' + [guid]::NewGuid().ToString('N'))
+$testHome = Join-Path $shortcutTestWork ('cpa-managed-shortcut-v2-' + [guid]::NewGuid().ToString('N'))
 $root = Join-Path $testHome 'managed-root'
 $desktop = Join-Path $testHome 'Desktop'
 $shortcut = Join-Path $desktop 'CPA Local Start.lnk'

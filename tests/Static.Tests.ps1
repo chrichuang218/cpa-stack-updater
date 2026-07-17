@@ -55,6 +55,10 @@ Assert-False ($skill -match '-(?:UpdateDesktopShortcut|ExposeToLan)\b') 'Primary
 Assert-True ($skill -match "install\.ps1'\s+-Action\s+Check" -and $skill -match "install\.ps1'\s+-Action\s+Update") 'Skill self-update is limited to explicit local installer Check and Update actions'
 
 $initialize = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts\Initialize-CpaStack.ps1') -Raw -Encoding UTF8
+Assert-True ($initialize -match '\$canonicalDirectories\s*=') 'Initialization defines the complete set of canonical top-level directories'
+Assert-True ($initialize -match 'foreach\s*\(\$dir\s+in\s+\$canonicalDirectories\)\s*\{\s*Protect-CpaStackPrivateDirectory') 'Initialization protects every canonical top-level directory after creating it'
+Assert-True ($initialize -match 'Copy-Item.+Start-CPA-Stack\.ps1.+\r?\n\s*Protect-CpaStackSecretFile\s+-Path\s+\$newStartScript') 'Initialization protects the canonical launcher after copying it'
+Assert-True ($initialize -match 'WriteAllText\(\$stackConfigPath[\s\S]+Protect-CpaStackSecretFile\s+-Path\s+\$stackConfigPath') 'Initialization protects the canonical stack config after writing it'
 Assert-False ($initialize -match 'legacyStartScriptSha256\s*=\s*Get-CpaStackFileHash\s+-Path\s+\$LegacyStartScript') 'Legacy start script hash is not computed unconditionally'
 Assert-True ($initialize -match 'legacyStartScriptSha256\s*=\s*if\s*\(\[string\]::IsNullOrWhiteSpace\(\$LegacyStartScript\)\)') 'Legacy start script hash is guarded for an empty path'
 Assert-True ([regex]::Matches($initialize, 'Assert-CpaStackLegacyCpaSource').Count -ge 3) 'Initialization gates the legacy source before journaling, copying, and recovery'
@@ -142,6 +146,7 @@ Assert-True ($stateScript -match 'ValidateSet\(''cpa'', ''manager''\)\]\[string\
 Assert-True ($stateScript -match '\[string\]\$journal\.phase\s+-cne\s+''runtime-verified''') 'Transition health checks require a fully verified switched runtime'
 Assert-True ($stateScript -match '\[string\]\$journal\.instanceId\s+-cne\s+\[string\]\$current\.instanceId') 'Transition health checks remain bound to the current stack instance'
 Assert-True ($stateScript -match '\[string\]\$componentState\.sha256\s+-cne\s+\(\[string\]\$journal\.oldHash\)\.ToUpperInvariant\(\)') 'Transition health checks bind the pending old hash to current state'
+Assert-True ($stateScript -match 'function Get-OptionalJournalValue') 'Status tolerates optional fields that are absent from component-specific pending journals'
 foreach ($criticalParent in @('runtime\cli-proxy-api', 'runtime\manager-plus', 'data\manager-plus')) {
     Assert-True ($stateScript.Contains($criticalParent)) "Canonical status checks critical parent path $criticalParent"
 }
@@ -195,12 +200,18 @@ Assert-True ($upgrade.IndexOf('Assert-SwitchedServicesHealthy -PendingSwitchComp
 Assert-True ($upgrade.IndexOf('Assert-SwitchedServicesHealthy -PendingSwitchComponent manager', [System.StringComparison]::Ordinal) -lt $upgrade.IndexOf('Set-CurrentComponentState -Component manager', [System.StringComparison]::Ordinal)) 'Manager transition health is verified before current state commits the new hash'
 Assert-False (([System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\cpa-stack.ps1'), [System.Text.UTF8Encoding]::new($false, $true))) -match 'PendingSwitchComponent') 'The public CLI does not expose the internal transition health mode'
 Assert-True ($upgrade -match 'Immediate switch recovery failed') 'Outer switch failures attempt immediate in-process recovery before returning'
+Assert-True ($upgrade -match 'Protect-CpaStackSecretFile\s+-Path\s+\(Join-Path\s+\$ControlRoot\s+''config\\stack\.psd1''\)') 'Interrupted recovery repairs the canonical stack config owner before restart'
+Assert-True ($upgrade -match 'function Remove-CommittedOrphanSwitchPrevious') 'Recovery can remove a result-bound committed orphan switch previous journal'
+Assert-True ($upgrade -match 'matching successful switch result') 'Orphan switch previous cleanup requires a matching successful switch result'
 Assert-True ($upgrade -match 'Copy-CpaStackPluginTree\s+-Source\s+\$plugins') 'CPA candidate preparation copies plugins through the protected-tree helper'
 Assert-True ($upgrade -match 'Assert-CpaStackPrivateTree\s+-Root\s+\$activePlugins') 'Top-level upgrade fails closed on an unsafe preserved plugins tree'
 Assert-False ($upgrade -match 'Protect-CpaStackPrivateTree\s+-Root\s+\$activePlugins') 'Top-level upgrade does not erase evidence of an unsafe plugins ACL'
 Assert-True ($upgrade -match 'Repair-CpaStackRecordedExecutableAcl') 'Upgrade repairs only hash-bound active executable ACL drift before trusted preflight'
 Assert-True ($upgrade.IndexOf('Repair-CpaStackRecordedExecutableAcl', [System.StringComparison]::Ordinal) -lt $upgrade.IndexOf('$preflight = Invoke-ChildPowerShellJson', [System.StringComparison]::Ordinal)) 'Hash-bound executable ACL repair occurs before canonical preflight'
 Assert-True ($upgrade.IndexOf('Assert-UpgradeSwitchPathBudget', $upgrade.IndexOf('try {', [System.StringComparison]::Ordinal), [System.StringComparison]::Ordinal) -lt $upgrade.IndexOf('Set-UpgradeJournalPhase -Phase "switching-cpa"', [System.StringComparison]::Ordinal)) 'Upgrade budgets both components before the first formal switch'
+
+$testAll = [System.IO.File]::ReadAllText((Join-Path $repo 'tools\Test-All.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
+Assert-True ($testAll -match "TransactionIntegration\.Tests\.ps1'\) \{ 2700 \} else \{ 1200 \}") 'Only the full transaction integration file receives the measured 45-minute timeout'
 Assert-True ($initialize.IndexOf('Assert-InitializationSwitchPathBudget', $initialize.IndexOf('try {', [System.StringComparison]::Ordinal), [System.StringComparison]::Ordinal) -lt $initialize.IndexOf('Set-InitializeJournalPhase -Phase "switching"', [System.StringComparison]::Ordinal)) 'Initialization budgets both components before the first formal switch'
 Assert-True ($upgrade.LastIndexOf('$result | ConvertTo-Json', [System.StringComparison]::Ordinal) -lt $upgrade.LastIndexOf('if (-not $result.success)', [System.StringComparison]::Ordinal)) 'Upgrade emits its structured result before a non-zero exit'
 foreach ($journalScript in @('Adopt-CpaStackLegacyCanonical.ps1', 'Initialize-CpaStack.ps1', 'Invoke-CpaStackUpgrade.ps1', 'Switch-CpaRuntime.ps1', 'Switch-ManagerRuntime.ps1')) {

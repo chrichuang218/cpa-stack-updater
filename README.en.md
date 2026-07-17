@@ -170,7 +170,7 @@ Every public command returns a v2 envelope:
   "after": null,
   "warnings": [],
   "error": null,
-  "updaterVersion": "1.0.0"
+  "updaterVersion": "1.0.1"
 }
 ```
 

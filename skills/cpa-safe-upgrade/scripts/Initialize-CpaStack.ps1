@@ -222,6 +222,7 @@ function Write-CanonicalConfiguration {
 }
 "@
     [System.IO.File]::WriteAllText($stackConfigPath, $content, [System.Text.UTF8Encoding]::new($false))
+    Protect-CpaStackSecretFile -Path $stackConfigPath
 }
 
 function Initialize-Secrets {
@@ -1781,11 +1782,21 @@ try {
     [void](Wait-CpaStackTrustedListener -Port $CpaPort -ExpectedPath (Join-Path $SourceCpaRuntime "cli-proxy-api.exe") -ExpectedProcessId $cpaListener.ProcessId -ExpectedHash (Get-CpaStackFileHash -Path (Join-Path $SourceCpaRuntime "cli-proxy-api.exe")) -Seconds 2)
     [void](Wait-CpaStackTrustedListener -Port $ManagerPort -ExpectedPath (Join-Path $SourceManagerRuntime "cpa-manager-plus.exe") -ExpectedProcessId $managerListener.ProcessId -ExpectedHash (Get-CpaStackFileHash -Path (Join-Path $SourceManagerRuntime "cpa-manager-plus.exe")) -Seconds 2)
 
-    foreach ($dir in @($configDir, $opsDir, $stateDir, (Join-Path $ControlRoot "work"), (Join-Path $ControlRoot "rollback"), (Join-Path $ControlRoot "assets"))) {
+    $canonicalDirectories = @(
+        $configDir,
+        $opsDir,
+        $stateDir,
+        (Join-Path $ControlRoot "runtime"),
+        (Join-Path $ControlRoot "data"),
+        (Join-Path $ControlRoot "work"),
+        (Join-Path $ControlRoot "rollback"),
+        (Join-Path $ControlRoot "assets")
+    )
+    foreach ($dir in $canonicalDirectories) {
         New-Item -ItemType Directory -Force -Path $dir | Out-Null
     }
-    foreach ($privateDir in @($configDir, (Join-Path $ControlRoot "work"), (Join-Path $ControlRoot "rollback"))) {
-        Protect-CpaStackPrivateDirectory -Path $privateDir
+    foreach ($dir in $canonicalDirectories) {
+        Protect-CpaStackPrivateDirectory -Path $dir
     }
     $preparationStarted = $true
     Remove-SecretTempFiles
@@ -1860,6 +1871,7 @@ try {
     Copy-CurrentCpaRuntime -Source $SourceCpaRuntime -Destination $targetCpaRuntime -Config $SourceCpaConfig
     Copy-CurrentManagerRuntime -Source $SourceManagerRuntime -Destination $targetManagerRuntime
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot "Start-CPA-Stack.ps1") -Destination $newStartScript -Force
+    Protect-CpaStackSecretFile -Path $newStartScript
     $legacyIcon = if ($DesktopShortcut) { (New-Object -ComObject WScript.Shell).CreateShortcut($DesktopShortcut).IconLocation.Split(',')[0] } else { $null }
     if ($legacyIcon -and (Test-Path -LiteralPath $legacyIcon)) {
         Copy-Item -LiteralPath $legacyIcon -Destination (Join-Path $ControlRoot "assets\cpa-frontend-logo.ico") -Force

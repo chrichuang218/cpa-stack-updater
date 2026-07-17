@@ -1,5 +1,13 @@
 # 更新记录
 
+## 1.0.1 - 2026-07-17
+
+- 修复管理员令牌下首次迁移成功后，`ops`、`state`、`runtime`、`data` 和 canonical launcher 仍由 Administrators 持有，导致下一次 `status/upgrade` 被自身健康门禁拒绝的问题。
+- 初始化时统一加固全部 canonical 顶层目录、launcher 与 `config\stack.psd1`；中断恢复启动前也会修复由 updater 写出的 stack config owner/ACL。
+- 修复状态页把缺少组件可选字段的合法 pending journal 误报为 `unreadable`，并允许公开 `recover` 在当前 hash、instance、路径和成功 switch 结果全部匹配时清理已提交的孤立 `.previous` journal。
+- 已用 CPA v7.2.80 / Manager v1.11.1 在隔离 managed root 完成真实升级：测试端口升至 v7.2.81 / v1.11.2，SQLite 历史水位、`data.key`、last-known-good 与正式栈均保持正确。
+- 测试框架识别企业端点策略锁定 PowerShell WSH 探针的环境，并按实测耗时为完整事务集成测试提供独立 45 分钟上限。
+
 ## 1.0.0 - 2026-07-17
 
 - 首个受支持的正式版本。`0.x` 仅视为开发过程产物，不承诺旧 updater 安装、journal 或事务状态兼容；从本版本开始建立稳定升级基线。

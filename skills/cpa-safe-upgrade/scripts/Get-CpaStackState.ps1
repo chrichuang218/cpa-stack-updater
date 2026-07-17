@@ -946,6 +946,14 @@ function Get-LegacyClientApiKey {
 function Get-PendingOperationState {
     param([string]$StackRoot)
 
+    function Get-OptionalJournalValue {
+        param($Journal, [string]$Name)
+
+        $property = $Journal.PSObject.Properties[$Name]
+        if ($null -eq $property) { return $null }
+        return $property.Value
+    }
+
     $paths = @()
     $details = @()
     $rollbackRoot = Join-Path $StackRoot 'rollback'
@@ -960,13 +968,13 @@ function Get-PendingOperationState {
                 $journal = [System.IO.File]::ReadAllText($file.FullName, [System.Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json
                 $details += [pscustomobject]@{
                     Path = $file.FullName
-                    Operation = $journal.operation
-                    Phase = $journal.phase
-                    SourceRuntime = $journal.sourceRuntime
-                    SourceData = $journal.sourceData
-                    TargetRuntime = $journal.targetRuntime
-                    TargetData = $journal.targetData
-                    PendingPath = $journal.pendingPath
+                    Operation = Get-OptionalJournalValue -Journal $journal -Name 'operation'
+                    Phase = Get-OptionalJournalValue -Journal $journal -Name 'phase'
+                    SourceRuntime = Get-OptionalJournalValue -Journal $journal -Name 'sourceRuntime'
+                    SourceData = Get-OptionalJournalValue -Journal $journal -Name 'sourceData'
+                    TargetRuntime = Get-OptionalJournalValue -Journal $journal -Name 'targetRuntime'
+                    TargetData = Get-OptionalJournalValue -Journal $journal -Name 'targetData'
+                    PendingPath = Get-OptionalJournalValue -Journal $journal -Name 'pendingPath'
                 }
             } catch {
                 $details += [pscustomobject]@{ Path = $file.FullName; Operation = $null; Phase = 'unreadable' }

@@ -290,7 +290,8 @@ function Invoke-CpaStackGuardedTestCase {
         [Parameter(Mandatory = $true)][string]$ArtifactBaseline,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$ProductionRoot,
         [Parameter(Mandatory = $true)][string]$ProductionStateHome,
-        [Parameter(Mandatory = $true)][int[]]$ProductionPort
+        [Parameter(Mandatory = $true)][int[]]$ProductionPort,
+        [ValidateRange(1, 3600)][int]$TimeoutSeconds = 1200
     )
 
     Assert-CpaStackProductionBaseline `
@@ -316,7 +317,8 @@ function Invoke-CpaStackGuardedTestCase {
             -CaseRoot $CaseRoot `
             -CommonPath $CommonPath `
             -Guard $caseGuard `
-            -ProtectedPort $ProductionPort
+            -ProtectedPort $ProductionPort `
+            -TimeoutSeconds $TimeoutSeconds
     } catch {
         $testError = $_
     } finally {
@@ -447,7 +449,8 @@ try {
             -ArtifactBaseline $productionArtifactsBefore `
             -ProductionRoot $productionRoots `
             -ProductionStateHome $productionStateHome `
-            -ProductionPort $productionPorts
+            -ProductionPort $productionPorts `
+            -TimeoutSeconds $(if ($test -ceq 'tests\TransactionIntegration.Tests.ps1') { 2700 } else { 1200 })
     }
 
     $pythonTestPath = Join-Path $suiteRoot 'python-regression-tests.ps1'
