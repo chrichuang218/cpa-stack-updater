@@ -48,8 +48,11 @@ Assert-True ($skill -match '(?s)^---\s*\r?\nname:\s*cpa-safe-upgrade\s*\r?\ndesc
 Assert-True ($skill.Length -lt 20000) 'SKILL.md remains concise'
 Assert-False ($skill.Contains('& "$PSScriptRoot\scripts\cpa-stack.ps1"')) 'Interactive examples do not use PSScriptRoot as the skill root'
 Assert-True ($skill.Contains('$skillRoot = Split-Path -Parent')) 'SKILL.md derives an explicit skill root from its own path'
-$skillEntry = '& (Join-Path $skillRoot ''scripts\cpa-stack.ps1'')'
-Assert-Equal 6 ([regex]::Matches($skill, [regex]::Escape($skillEntry)).Count) 'Every interactive command uses the explicit skill root'
+Assert-True ($skill.Contains('$cpaCli = Join-Path $skillRoot ''scripts\cpa-stack.ps1''')) 'SKILL.md derives one stable public CLI path'
+Assert-True ([regex]::Matches($skill, [regex]::Escape('& $cpaCli')).Count -ge 8) 'Runtime examples use only the stable public CLI'
+Assert-False ($skill -match '&\s+\$cpaCli\s+(?:plan|init)\b') 'Primary Skill workflow does not teach deprecated plan or init commands'
+Assert-False ($skill -match '-(?:UpdateDesktopShortcut|ExposeToLan)\b') 'Primary Skill workflow does not teach v0.1 combined side-effect switches'
+Assert-True ($skill -match "install\.ps1'\s+-Action\s+Check" -and $skill -match "install\.ps1'\s+-Action\s+Update") 'Skill self-update is limited to explicit local installer Check and Update actions'
 
 $initialize = Get-Content -LiteralPath (Join-Path $skillRoot 'scripts\Initialize-CpaStack.ps1') -Raw -Encoding UTF8
 Assert-False ($initialize -match 'legacyStartScriptSha256\s*=\s*Get-CpaStackFileHash\s+-Path\s+\$LegacyStartScript') 'Legacy start script hash is not computed unconditionally'
@@ -75,7 +78,11 @@ Assert-True ($start -match 'PROC_THREAD_ATTRIBUTE_HANDLE_LIST|ProcThreadAttribut
 Assert-True ($start -match '\[CpaStack\.NativeProcessV1\]::Start') 'Canonical services use the native isolated process launcher'
 
 $cli = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\cpa-stack.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
-Assert-True ($cli -match 'trustedStartScript\s*=\s*Join-Path\s+\$PSScriptRoot\s+''Start-CPA-Stack\.ps1''') 'Public start executes the bundled trusted launcher'
+$launcherModule = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'modules\CpaStack.Launcher.psm1'), [System.Text.UTF8Encoding]::new($false, $true))
+Assert-True ($launcherModule -match "Invoke-CpaStackBundled\s+-HostAdapter\s+\`$HostAdapter\s+-Name\s+'Start-CPA-Stack\.ps1'") 'Public start executes the bundled trusted launcher through its host adapter'
+Assert-False ($cli -match 'function\s+(?:Invoke-BundledScript|Get-StatusResult|Get-InitArguments)') 'Public CLI contains no duplicate v0.1 execution implementation'
+Assert-False ($cli -match 'schemaVersion\s*=\s*1\s*\r?\n\s*command\s*=') 'Compatibility commands still return the v2 envelope'
+Assert-True ($cli -match "Command 'register-root' is deprecated in v0\.2\.0") 'The remaining register-root compatibility command has an explicit one-release lifetime'
 
 $common = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\CpaStack.Common.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
 $commonNativeStart = $common.IndexOf('using System;', $common.IndexOf("Add-Type -TypeDefinition @'", [System.StringComparison]::Ordinal), [System.StringComparison]::Ordinal)
@@ -180,6 +187,7 @@ Assert-True ($switchManager.IndexOf('Assert-CpaStackJsonWritePathBudget', [Syste
 $upgrade = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\Invoke-CpaStackUpgrade.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
 Assert-True ($upgrade -match 'DeferFinalCommit') 'Upgrade defers switch journal cleanup until current state is committed'
 Assert-True ($upgrade -match 'AllowUnknownVersionReplacement') 'Unknown-version replacement is explicit'
+Assert-True ($upgrade -match 'if\s*\(-not\s+\$RecoverOnly\)\s*\{\s*Assert-CpaStackFreeSpace') 'Recovery-only bypasses the normal 1 GiB upgrade capacity gate'
 Assert-True ($upgrade.IndexOf('Set-UpgradeJournalPhase -Phase "testing-manager"', [System.StringComparison]::Ordinal) -lt $upgrade.IndexOf('Set-UpgradeJournalPhase -Phase "switching-cpa"', [System.StringComparison]::Ordinal)) 'Both component candidates are tested before the first formal switch'
 Assert-True ($upgrade.IndexOf('Assert-SwitchedServicesHealthy -PendingSwitchComponent cpa', [System.StringComparison]::Ordinal) -lt $upgrade.IndexOf('Set-CurrentComponentState -Component cpa', [System.StringComparison]::Ordinal)) 'CPA transition health is verified before current state commits the new hash'
 Assert-True ($upgrade.IndexOf('Assert-SwitchedServicesHealthy -PendingSwitchComponent manager', [System.StringComparison]::Ordinal) -lt $upgrade.IndexOf('Set-CurrentComponentState -Component manager', [System.StringComparison]::Ordinal)) 'Manager transition health is verified before current state commits the new hash'
@@ -200,6 +208,8 @@ foreach ($journalScript in @('Adopt-CpaStackLegacyCanonical.ps1', 'Initialize-Cp
 $adoption = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\Adopt-CpaStackLegacyCanonical.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
 Assert-True ($adoption -match 'adopt\.pending\.json') 'Legacy canonical adoption is journaled'
 Assert-True ($adoption -match 'Assert-LegacyCanonicalLayout') 'Legacy canonical adoption validates fixed paths and hashes'
+Assert-Equal 3 ([regex]::Matches($adoption, '(?<!\d)8317(?!\d)').Count) 'Source adoption keeps the fixed CPA formal-port contract'
+Assert-Equal 3 ([regex]::Matches($adoption, '(?<!\d)18317(?!\d)').Count) 'Source adoption keeps the fixed Manager formal-port contract'
 Assert-True ($adoption -match 'Protect-CpaStackPrivateTree\s+-Root\s+\$layout\.auth') 'Legacy canonical adoption hardens the full CPA auth tree'
 Assert-True ($adoption -match 'Protect-CpaStackPrivateTree\s+-Root\s+\$layout\.plugins') 'Legacy canonical adoption hardens the optional CPA plugins tree'
 Assert-True ($adoption -match 'Protect-CpaStackPrivateTree\s+-Root\s+\$layout\.managerData') 'Legacy canonical adoption hardens the entire Manager data tree'
@@ -218,5 +228,33 @@ Assert-True ($workflow -match 'actions/setup-python@') 'CI installs a pinned Pyt
 
 $testAll = [System.IO.File]::ReadAllText((Join-Path $repo 'tools\Test-All.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
 Assert-True ($testAll -match 'Get-Command\s+python\s+-ErrorAction\s+Stop') 'Full tests fail when Python is unavailable'
+Assert-True ($testAll.Contains('[Environment]::SetEnvironmentVariable(''CPA_STACK_ROOT'', `$testStackRoot, ''Process'')')) 'Every isolated test process resolves an explicit case-local stack root'
+Assert-True ($testAll -match 'Resolve-CpaStackControlRoot') 'The isolated runner verifies root resolution inside the requested test host'
+Assert-True ($testAll -match 'PowerShell test host mismatch') 'The isolated runner verifies its requested PowerShell edition and version'
+Assert-True ($testAll -match 'Register-CpaStackTestProcess\s+-Guard\s+\$Guard\s+-Process\s+\$process') 'The isolated runner enters the kill-on-close Job before releasing its payload'
+Assert-True ($testAll -match 'before test' -and $testAll -match 'while running test') 'Every test case checks the production baseline before and after execution'
+Assert-False ($testAll -match "SetEnvironmentVariable\('LOCALAPPDATA'") 'The runner does not claim that an ineffective LOCALAPPDATA environment override isolates Windows known folders'
+
+foreach ($fixtureBoundTest in @(
+    'Adoption.Tests.ps1',
+    'FixtureStateIsolation.Tests.ps1',
+    'InitializeRecoverySafety.Tests.ps1',
+    'Install.Tests.ps1',
+    'InstallV2.Tests.ps1',
+    'LanConfiguration.Tests.ps1',
+    'PathSafety.Tests.ps1',
+    'TransactionIntegration.Tests.ps1'
+)) {
+    $fixtureBoundText = [System.IO.File]::ReadAllText((Join-Path $repo ('tests\' + $fixtureBoundTest)), [System.Text.UTF8Encoding]::new($false, $true))
+    Assert-True ($fixtureBoundText -match 'New-CpaStackUpdaterTestFixture') "$fixtureBoundTest isolates stateful scripts through a rewritten repository fixture"
+}
+$adoptionTest = [System.IO.File]::ReadAllText((Join-Path $repo 'tests\Adoption.Tests.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
+Assert-True ($adoptionTest -match 'New-CpaStackTestPortPlan') 'Adoption integration uses dynamically allocated high ports'
+Assert-True ($adoptionTest -match 'Register-CpaStackTestProcess\s+-Guard\s+\$Guard\s+-Process\s+\$process') 'Adoption integration enters the test Job before releasing its payload'
+Assert-True ($adoptionTest -match '\[regex\]::Replace\(\$adoptionHarnessText') 'Adoption integration rewrites only its executable fixture copy away from production ports'
+$testHelpers = [System.IO.File]::ReadAllText((Join-Path $repo 'tests\TestHelpers.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
+foreach ($statefulRelativePath in @('install.ps1', 'CpaStack.Common.ps1', 'Start-CPA-Stack.ps1')) {
+    Assert-True ($testHelpers.Contains($statefulRelativePath)) "Fixture construction structurally verifies $statefulRelativePath state-home rewriting"
+}
 
 'Static tests passed.'

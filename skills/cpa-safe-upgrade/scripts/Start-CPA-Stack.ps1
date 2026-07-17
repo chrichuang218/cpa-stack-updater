@@ -54,6 +54,7 @@ param(
     [switch]$NoBrowser,
     [System.IO.FileStream]$OperationLockHandle,
     [switch]$RecoveryMode,
+    [scriptblock]$StartedProcessRegistration,
     [switch]$InProcess
 )
 
@@ -758,6 +759,16 @@ namespace CpaStack
 
         public static Process Start(string filePath, string arguments, string workingDirectory, IDictionary environment)
         {
+            return Start(filePath, arguments, workingDirectory, environment, null);
+        }
+
+        public static Process Start(
+            string filePath,
+            string arguments,
+            string workingDirectory,
+            IDictionary environment,
+            Action<Process> registerBeforeResume)
+        {
             if (String.IsNullOrWhiteSpace(filePath) || filePath.IndexOf('"') >= 0)
             {
                 throw new ArgumentException("Managed-process executable path is invalid.", "filePath");
@@ -782,6 +793,8 @@ namespace CpaStack
             Process process = null;
             bool processCreated = false;
             bool processResumed = false;
+            bool registrationAttempted = false;
+            bool registrationCompleted = false;
             bool attributeListInitialized = false;
 
             try
@@ -849,6 +862,12 @@ namespace CpaStack
                 processCreated = true;
                 process = Process.GetProcessById((int)processInformation.ProcessId);
                 IntPtr processHandle = process.Handle;
+                if (registerBeforeResume != null)
+                {
+                    registrationAttempted = true;
+                    registerBeforeResume(process);
+                    registrationCompleted = true;
+                }
                 if (ResumeThread(processInformation.Thread) == UInt32.MaxValue)
                 {
                     throw new Win32Exception(Marshal.GetLastWin32Error(), "Managed process could not be resumed.");
@@ -856,7 +875,7 @@ namespace CpaStack
                 processResumed = true;
                 return process;
             }
-            catch
+            catch (Exception startupError)
             {
                 Exception cleanupError = null;
                 if (processCreated && !processResumed && processInformation.Process != IntPtr.Zero)
@@ -871,7 +890,19 @@ namespace CpaStack
                     }
                 }
                 if (process != null) { process.Dispose(); }
-                if (cleanupError != null) { throw cleanupError; }
+                if (cleanupError != null)
+                {
+                    throw new AggregateException(
+                        "Managed-process startup failed and suspended-process cleanup also failed.",
+                        startupError,
+                        cleanupError);
+                }
+                if (registrationAttempted && !registrationCompleted)
+                {
+                    throw new InvalidOperationException(
+                        "Started-process registration failed; the exact suspended process was terminated before it could execute.",
+                        startupError);
+                }
                 throw;
             }
             finally
@@ -898,7 +929,8 @@ function Start-ManagedProcess {
         [string]$FilePath,
         [string]$Arguments = '',
         [string]$WorkingDirectory,
-        [hashtable]$Environment = @{}
+        [hashtable]$Environment = @{},
+        [scriptblock]$ProcessRegistration
     )
 
     $processEnvironment = @{}
@@ -938,7 +970,21 @@ function Start-ManagedProcess {
         }
     }
     Initialize-CpaStackNativeProcessType
-    return [CpaStack.NativeProcessV1]::Start($FilePath, $Arguments, $WorkingDirectory, $processEnvironment)
+    if ($null -eq $ProcessRegistration) {
+        return [CpaStack.NativeProcessV1]::Start($FilePath, $Arguments, $WorkingDirectory, $processEnvironment)
+    }
+    $registrationCallback = $ProcessRegistration
+    $registrationScript = {
+        param([System.Diagnostics.Process]$Process)
+        & $registrationCallback $Process | Out-Null
+    }.GetNewClosure()
+    $registrationAction = [System.Action[System.Diagnostics.Process]]$registrationScript
+    return [CpaStack.NativeProcessV1]::Start(
+        $FilePath,
+        $Arguments,
+        $WorkingDirectory,
+        $processEnvironment,
+        $registrationAction)
 }
 
 function Get-ListenerProcess {
@@ -1200,7 +1246,7 @@ function Ensure-CpaService {
 
     Assert-NoDetachedExpectedProcess -ExpectedPath $Settings.Cpa.Executable
     $arguments = '-config "{0}"' -f $Settings.Cpa.Config
-    $process = Start-ManagedProcess -FilePath $Settings.Cpa.Executable -Arguments $arguments -WorkingDirectory $Settings.Cpa.WorkingDirectory
+    $process = Start-ManagedProcess -FilePath $Settings.Cpa.Executable -Arguments $arguments -WorkingDirectory $Settings.Cpa.WorkingDirectory -ProcessRegistration $StartedProcessRegistration
 
     try {
         $ready = Wait-ForCpaHealth -Settings $Settings -ApiKey $ApiKey -StartedProcessId $process.Id
@@ -1361,7 +1407,7 @@ function Start-ManagerProcess {
         CPA_MANAGER_ADMIN_KEY = $AdminKey
         PANEL_PATH = $null
     }
-    return Start-ManagedProcess -FilePath $Settings.Manager.Executable -WorkingDirectory $Settings.Manager.WorkingDirectory -Environment $environment
+    return Start-ManagedProcess -FilePath $Settings.Manager.Executable -WorkingDirectory $Settings.Manager.WorkingDirectory -Environment $environment -ProcessRegistration $StartedProcessRegistration
 }
 
 function Wait-ForManagerListener {
@@ -1456,6 +1502,9 @@ function Open-ManagerBrowser {
 
 try {
     $recoveryAuthorized = $false
+    if ($null -ne $StartedProcessRegistration -and -not $InProcess) {
+        throw '-StartedProcessRegistration is reserved for in-process callers.'
+    }
     if ($null -ne $OperationLockHandle) {
         if (-not $InProcess -or -not $RecoveryMode) {
             throw '-OperationLockHandle is reserved for in-process recovery transactions.'

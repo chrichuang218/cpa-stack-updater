@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][string]$ControlRoot
+    [Parameter(Mandatory = $true)][string]$ControlRoot,
+    [switch]$RecoverOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -120,11 +121,17 @@ try {
     $journal = $null
     if (Test-Path -LiteralPath $journalPath -PathType Leaf) {
         $journal = Read-CpaStackJson -Path $journalPath
-        if ([string]$journal.operation -ne 'adopt-legacy-canonical-stack' -or
+        if ([int]$journal.schemaVersion -ne 1 -or
+            [string]$journal.operation -ne 'adopt-legacy-canonical-stack' -or
             [string]$journal.instanceId -notmatch '^[0-9a-fA-F]{32}$' -or
             -not [string]::Equals([System.IO.Path]::GetFullPath([string]$journal.canonicalRoot).TrimEnd('\'), $ControlRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
             throw 'Legacy canonical adoption journal is invalid or belongs to another root.'
         }
+    } elseif ($RecoverOnly) {
+        $result.success = $true
+        $result.changed = $false
+        $result | ConvertTo-Json -Depth 8 -Compress
+        exit 0
     } else {
         $otherPending = @(Get-ChildItem -LiteralPath $stateDir -File -Filter '*.pending.json' -ErrorAction SilentlyContinue)
         $rollbackPending = @(Get-ChildItem -LiteralPath (Join-Path $ControlRoot 'rollback') -Directory -Filter 'pending-*' -ErrorAction SilentlyContinue)
@@ -134,6 +141,43 @@ try {
     }
 
     $current = Read-CpaStackJson -Path $currentPath
+    if ([int]$current.schemaVersion -ne 1) {
+        throw 'Legacy current state schema is unsupported.'
+    }
+    $currentIdProperty = $current.PSObject.Properties['instanceId']
+    $currentInstanceId = if ($null -ne $currentIdProperty) { [string]$currentIdProperty.Value } else { $null }
+    if ($null -ne $currentIdProperty -and $currentInstanceId -notmatch '^[0-9a-fA-F]{32}$') {
+        throw 'Legacy current state instance id is invalid.'
+    }
+
+    $existingMarker = $null
+    if (Test-Path -LiteralPath $markerPath -PathType Leaf) {
+        $existingMarker = Read-CpaStackJson -Path $markerPath
+        if ([int]$existingMarker.schemaVersion -ne 1 -or
+            [string]$existingMarker.instanceId -notmatch '^[0-9a-fA-F]{32}$' -or
+            -not [string]::Equals([System.IO.Path]::GetFullPath([string]$existingMarker.root).TrimEnd('\'), $ControlRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Existing instance marker is invalid or belongs to another root.'
+        }
+    }
+
+    $boundInstanceIds = @(@(
+            [string]$currentInstanceId,
+            $(if ($journal) { [string]$journal.instanceId } else { $null }),
+            $(if ($existingMarker) { [string]$existingMarker.instanceId } else { $null })
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+    if ($boundInstanceIds.Count -gt 1) {
+        throw 'Legacy current state, adoption journal, and instance marker do not identify the same stack.'
+    }
+    $instanceId = if ($journal) {
+        [string]$journal.instanceId
+    } elseif (-not [string]::IsNullOrWhiteSpace($currentInstanceId)) {
+        $currentInstanceId
+    } elseif ($existingMarker) {
+        [string]$existingMarker.instanceId
+    } else {
+        [guid]::NewGuid().ToString('N')
+    }
+
     $layout = Assert-LegacyCanonicalLayout -Current $current -Journal $journal
     $cpaListener = Get-CpaStackListener -Port 8317
     $managerListener = Get-CpaStackListener -Port 18317
@@ -143,20 +187,6 @@ try {
     }
     [void](Wait-CpaStackTrustedListener -Port 8317 -ExpectedPath $layout.cpaExe -ExpectedProcessId $cpaListener.ProcessId -ExpectedHash ([string]$current.cpa.sha256) -AllowedAddresses @($layout.cpaBindAddress) -Seconds 2)
     [void](Wait-CpaStackTrustedListener -Port 18317 -ExpectedPath $layout.managerExe -ExpectedProcessId $managerListener.ProcessId -ExpectedHash ([string]$current.manager.sha256) -AllowedAddresses @($layout.managerBindAddress) -Seconds 2)
-
-    if ($journal) {
-        $instanceId = [string]$journal.instanceId
-    } else {
-        $currentId = $current.PSObject.Properties['instanceId']
-        $instanceId = if ($null -ne $currentId -and [string]$currentId.Value -match '^[0-9a-fA-F]{32}$') { [string]$currentId.Value } else { [guid]::NewGuid().ToString('N') }
-    }
-    if (Test-Path -LiteralPath $markerPath -PathType Leaf) {
-        $existingMarker = Read-CpaStackJson -Path $markerPath
-        if ([string]$existingMarker.instanceId -ne $instanceId -or
-            -not [string]::Equals([System.IO.Path]::GetFullPath([string]$existingMarker.root).TrimEnd('\'), $ControlRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
-            throw 'Existing instance marker conflicts with legacy canonical adoption.'
-        }
-    }
 
     foreach ($directory in @($ControlRoot, (Join-Path $ControlRoot 'config'), (Join-Path $ControlRoot 'ops'), $stateDir, (Join-Path $ControlRoot 'runtime'), (Join-Path $ControlRoot 'runtime\cli-proxy-api'), (Join-Path $ControlRoot 'runtime\manager-plus'), (Join-Path $ControlRoot 'data'))) {
         Protect-CpaStackPrivateDirectory -Path $directory
@@ -186,7 +216,6 @@ try {
         Protect-CpaStackSecretFile -Path $journalPath
     }
 
-    $currentIdProperty = $current.PSObject.Properties['instanceId']
     if ($null -eq $currentIdProperty) {
         $current | Add-Member -NotePropertyName instanceId -NotePropertyValue $instanceId
     } elseif ([string]$currentIdProperty.Value -ne $instanceId) {

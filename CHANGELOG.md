@@ -1,5 +1,14 @@
 # 更新记录
 
+## 0.2.0 - 2026-07-17
+
+- 将公开 CLI 重构为 schema v2 深模块：`status`、`recover`、`migrate`、`upgrade`、`start`、`shortcut` 与 `lan` 各自拥有显式事务；升级不再隐式迁移、恢复、修改快捷方式或改变 LAN。`plan`、`doctor`、`init` 与 `register-root` 仅保留一版兼容映射。
+- 候选验证改为动态分配未占用的高位 loopback 端口，并把正式端口贯穿配置、journal、切换与恢复。测试引入 Production Guard、隔离 root/state/lock 与 `KILL_ON_JOB_CLOSE`，正式 listener、PID、控制文件、exe hash 和关键 ACL 变化会阻断发布。
+- 新增 `install.ps1 -Action Check|Update`：Check 严格零写入，Update 使用双槽、锁内重算和受保护 write-ahead journal，支持并发幂等与 hard-kill 恢复；launcher 或 root registration 未完成时返回可重试失败，不伪报成功。显式空 StackRoot 会写受保护 preinitialized marker，稳定 bootstrap 可定位自定义 CodexHome；Skill 只允许从用户提供的可信本地发行目录更新，不在线替换自身。
+- 新增托管桌面快捷方式事务，支持 `Absent/Matching/Drifted/Adoptable/Conflict`、显式接管、原子提交和零写入复检；新增独立 LAN write-ahead 事务、失败自动回滚及 hard-kill 后的公开恢复。
+- ACL 加固只读写 Owner/Group/DACL，不再 round-trip SACL；重复保护保持零写入，并把 runtime/data 的关键直接父目录纳入信任边界。
+- 精简 `SKILL.md` 为授权与编排层，迁移请求、安全模型和故障排查按需加载；共享 StateInspection seam 阻止状态错误伪成功或继续写入，Result seam 统一错误对象与协议失败，所有主流程在 Windows PowerShell 5.1、PowerShell 7 和隔离真实进程事务测试中验证。
+
 ## 0.1.4 - 2026-07-16
 
 - 修复两阶段正式切换在提交 `current.json` 前用旧 hash 执行稳态健康检查、从而必然误判新 runtime 不健康的问题。过渡期检查现在只接受绑定当前 instance、路径和 old/new hash 的 `runtime-verified` switch journal；CPA 与 Manager 均通过正式健康探测后才提交新状态，真实失败仍按旧状态自动回滚。

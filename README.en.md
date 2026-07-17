@@ -4,197 +4,209 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4)](https://github.com/chrichuang218/cpa-stack-updater)
 
-[简体中文](README.md)
+[中文](README.md)
 
-Safe, transactional Windows upgrades for [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) and [CPA Manager Plus](https://github.com/seakee/CPA-Manager-Plus).
+Transactional Windows migration, recovery, and upgrades for [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) and [CPA Manager Plus](https://github.com/seakee/CPA-Manager-Plus).
 
-New binaries are downloaded from official GitHub releases, verified, and tested on loopback-only temporary ports before production is touched. Failed formal switches restore the last healthy runtime automatically.
+v0.2 uses a thin Skill over a small, stable transaction executor. The Skill selects a public operation; bundled PowerShell owns discovery, ACL validation, SQLite snapshots, candidate verification, switching, and rollback.
 
-> Community project. It is not affiliated with or endorsed by either upstream project.
+> This is a community project. It is not affiliated with or endorsed by either upstream project.
 
-## Why this exists
-
-Manual CPA upgrades tend to accumulate copied runtimes, stale ZIP files, test databases, launch scripts, and unclear rollback folders. CPA Stack Updater turns that into one managed root with a repeatable transaction:
+## v0.2 architecture
 
 ```text
-discover -> plan -> download and verify -> candidate tests -> snapshot
-        -> atomic switch -> formal verification -> commit
-                           \-> automatic restore on failure
+status (read-only)
+  +-- requiredOperation=recover --> recover
+  +-- requiredOperation=migrate --> migrate
+  +-- canonical healthy ---------> upgrade
+
+shortcut / lan / start / Skill installation are independent operations
 ```
 
-The existing installation can live on C:, D:, E:, a path with spaces, or a non-English path. The updater discovers the running executables and migrates only the active runtime and active Manager data.
+`upgrade` never migrates, recovers, changes a shortcut, or enables LAN implicitly.
 
 ## Safety properties
 
-- Candidate CPA and Manager services bind only to `127.0.0.1`.
-- Official archives and checksums are verified with SHA256.
-- ZIP entries are checked for traversal and size limits before extraction.
-- Manager SQLite is copied through the SQLite online-backup API.
-- A per-Windows-account, cross-session lock prevents concurrent upgrades, installs, and uninstalls.
-- Secret-free journals bind to an instance ID and recover interrupted transactions.
-- Candidate hashes are checked again immediately before switching.
-- Long-lived services start without a console window and inherit only explicit `NUL` standard handles, so they cannot keep an upgrade command's output pipe open.
-- The updater fixes the verified listener's `Process` before stopping it. Even if the listener disappears first, it waits for that same process and executable lock; candidates started by the updater are also cleaned up by their fixed process when they never bind.
-- The managed root is restricted to the current user, SYSTEM, and Administrators.
-- Direct runtime parents and the full Manager data tree, including WAL/SHM, are checked for trusted owners, ACLs, and reparse points.
-- Before executing an old Manager during a non-in-place rollback, the updater revalidates the executable, `data.key`, required business tables, and the `usage_events` count/max-id/max-timestamp watermarks. Pre-existing settings and model-price data must not decrease.
-- SQLite validation protects business-data semantics; it does not require identical database SHA256, file size, page layout, WAL/SHM, checkpoint, or rollup bytes.
-- All switch paths are preflighted against the Windows PowerShell 5.1 budgets of 247 characters for directories and 259 for files, before any production stop.
-- Unknown port owners are never killed.
-- Legacy directories are never deleted without a separate explicit request.
+- Candidate processes use dynamically allocated, unused high loopback ports; candidate ports are not a fixed public interface.
+- Formal ports come from the managed stack configuration.
+- Release metadata and assets come only from two pinned official upstream repositories over HTTPS, with checksum and SHA256 verification.
+- ZIP traversal, entry count, and expanded size are checked before extraction.
+- Manager data uses SQLite online backup plus `quick_check`, required-table, and historical-watermark checks.
+- Secret-free journals bind every transaction to an instance ID and support hard-interruption recovery.
+- Shutdown pins a verified listener `Process`; an unknown PID/path is never terminated.
+- Long-lived services have no console and inherit only explicit `NUL` standard handles.
+- The managed root, runtime, auth/plugins, Manager data, and critical parent directories are checked for owner, DACL, and reparse safety.
+- Windows PowerShell 5.1 path budgets are checked before a formal service is stopped.
+- A failed formal switch restores the previous healthy runtime.
+- The updater installer changes only the Skill, stable launcher, and root registration. It does not upgrade CPA/Manager or alter LAN.
 
-See [docs/safety-model.md](docs/safety-model.md) for the complete trust and transaction model.
+See [docs/safety-model.md](docs/safety-model.md) for the full model.
 
 ## Requirements
 
-- Windows 10 or Windows 11, x64
+- Windows 10/11 x64
 - Windows PowerShell 5.1 or PowerShell 7
-- Python 3.10 or newer for SQLite online backups that can be generated, reopened, and checked
-- Local NTFS or ReFS destination
-- Existing CLIProxyAPI and CPA Manager Plus when performing a migration
+- Python 3.10+
+- A local NTFS or ReFS volume
+- An existing CLIProxyAPI and CPA Manager Plus installation for migration
 
-Git is not required for a normal installation. It is only needed if you choose to clone the repository for development.
+The repository contains no third-party executables, real configuration, keys, databases, or telemetry.
 
-The repository contains no third-party executables, user configuration, keys, databases, or telemetry.
+## Install or update the Skill
 
-## Quick start
-
-Download and extract the latest `Source code (zip)` from [Releases](https://github.com/chrichuang218/cpa-stack-updater/releases/latest). Open PowerShell in the extracted directory, then run:
+Download and extract a trusted package from [Releases](https://github.com/chrichuang218/cpa-stack-updater/releases/latest). Start with a strictly read-only check:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -StackRoot 'E:\CPA-Stack'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 `
+  -Action Check `
+  -StackRoot 'E:\CPA-Stack' `
+  -Json
 ```
 
-`Bypass` applies only to this installer process. It does not change the machine or user execution policy. Developers can clone the repository with Git and run the same command.
+After confirmation, install or update atomically:
 
-The extracted directory can be deleted after installation. Always use the installed stable CLI afterward; define it whenever you open a new PowerShell session:
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 `
+  -Action Update `
+  -StackRoot 'E:\CPA-Stack' `
+  -Json
+```
+
+Use `-CodexHome` for a non-default Codex home. The installer uses two slots and a protected write-ahead journal. Concurrent updates commit once, and a later Update recovers a hard-interrupted install. When an explicit `StackRoot` is new and empty, the installer creates a protected instance marker and stable launcher so a later explicit `migrate` can use the same root; it does not install or start the CPA runtime. The launcher is written to `<StackRoot>\ops\Start-CPA-Stack.ps1`, and no desktop shortcut is created.
+
+`Bypass` applies only to this process and does not change persistent execution policy.
+
+## Use the v2 CLI
 
 ```powershell
 $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
 $cpaCli = Join-Path $codexHome 'skills\cpa-safe-upgrade\scripts\cpa-stack.ps1'
+$root = 'E:\CPA-Stack'
 ```
 
-`E:` is only an example. Use a local NTFS/ReFS directory on a drive that actually exists. The installer writes an ownership marker, and uninstall refuses to remove an unowned look-alike directory.
+`E:` is only an example. Local C/D/E volumes, spaces, and non-ASCII paths are supported when they pass the filesystem safety checks.
 
-Preview without changing anything:
+### 1. Inspect
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli plan -Root 'E:\CPA-Stack' -Json
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli status -Root $root -Json
 ```
 
-Migrate an existing healthy installation when necessary, then upgrade both services. Desktop shortcuts are not changed silently. If the old shortcut still targets the legacy launcher, using it after migration or reboot can start the old runtime and data again. Before the first migration, explicitly choose one startup path:
+A completed inspection exits 0. An unhealthy stack is represented by `outcome=Blocked`; an inspection protocol failure returns `success=false` and a non-zero exit code. Use `requiredOperation` to select the next explicit command.
 
-- If you authorize the updater to repoint the discovered CPA desktop shortcut to the canonical launcher, run:
+### 2. Recover or migrate explicitly
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli upgrade -Root 'E:\CPA-Stack' -UpdateDesktopShortcut -Json
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli recover -Root $root -Json
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli migrate -Root $root -Json
 ```
 
-  The refreshed `.lnk` starts the canonical launcher through `powershell.exe -NonInteractive -WindowStyle Hidden`, so double-clicking it does not show a PowerShell window. Direct CLI commands remain visible, and bundled PowerShell scripts reuse the caller's console instead of opening another window.
+Run only the operation required by status and authorized by the user. If automatic discovery is ambiguous, pass a migration request with `-RequestPath`. The request stores source paths, a secrets-file path, and optional formal ports—never secret values. See [migration-request.md](skills/cpa-safe-upgrade/references/migration-request.md).
 
-- If you do not authorize a shortcut change, run the upgrade without that switch. Do not use the old shortcut afterward; always start the managed stack through the canonical CLI:
+### 3. Upgrade a healthy canonical stack
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli upgrade -Root 'E:\CPA-Stack' -Json
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli start -Root 'E:\CPA-Stack'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli upgrade -Root $root -Json
 ```
 
-If the existing binary version cannot be identified reliably, replacement is blocked to avoid downgrading a nightly or prerelease build to latest stable. After reviewing and explicitly accepting that risk:
+Unknown local versions are blocked by default to avoid replacing a prerelease build with latest stable. Only after a second explicit acknowledgement:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli upgrade -Root 'E:\CPA-Stack' -AllowUnknownVersionReplacement -Json
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli upgrade `
+  -Root $root `
+  -AllowUnknownVersionReplacement `
+  -Json
 ```
 
-After the first successful initialization, the selected root is registered under the current Windows profile. Future commands can omit `-Root`:
+### 4. Start
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli status -Json
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli start
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli upgrade -Json
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli start -Root $root -NoBrowser
 ```
 
-If the target was created by an earlier version of this tool and already has canonical runtime/data but no `instanceId` marker, `upgrade` first verifies fixed paths, running processes, and recorded hashes. It then adopts the root in place through a secret-free journal and hardens its ACLs without recopying or clearing Manager data.
+`start` does not recover a pending transaction implicitly.
 
-## Codex skill
+## Desktop quick launch
 
-`install.ps1` installs `cpa-safe-upgrade` into `$CODEX_HOME\skills`, or `$HOME\.codex\skills` when `CODEX_HOME` is unset.
+The installer creates the stable launcher. A separate managed operation owns the desktop shortcut. Check first; Ensure only when it is missing or drifted:
 
-Example prompt:
+```powershell
+$shortcut = Join-Path ([Environment]::GetFolderPath('Desktop')) 'CPA Local Start (New).lnk'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli shortcut `
+  -Action Check -Root $root -ShortcutPath $shortcut -Json
 
-> Use $cpa-safe-upgrade to discover my existing CPA installation, migrate it to E:\CPA-Stack, and safely upgrade both services.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli shortcut `
+  -Action Ensure -Root $root -ShortcutPath $shortcut -Json
+```
 
-The Skill calls the same `cpa-stack.ps1` interface as human users. It does not improvise stop/copy/start commands.
+An identifiable legacy shortcut requires explicit `-AdoptExisting`; unknown conflicts are never overwritten.
 
-To update the updater, download a newer Release and run `install.ps1` again; the installer atomically replaces the same stable path. If it reports that the Skill directory is in use, close editors viewing the installed `SKILL.md` or terminals whose working directory is inside that Skill, then retry. The installer never terminates those processes and preserves the current Skill and rollback slot on failure. A result with `success=true` and `complete=false` means the new Skill was committed but launcher, root-locator, or old-slot cleanup returned explicit `postCommitWarnings`; resolve that lock or ACL issue and run the installer again. The original ZIP is not needed for uninstall:
+## LAN exposure
+
+LAN is a separate high-risk operation. Explain the exposure and obtain explicit authorization before changing it:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli lan -Action Set -Mode Lan -Root $root -Json
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli lan -Action Set -Mode Loopback -Root $root -Json
+```
+
+Candidate validation remains loopback-only.
+
+## Schema v2
+
+Every public command returns a v2 envelope:
+
+```json
+{
+  "schemaVersion": 2,
+  "operation": "upgrade",
+  "success": true,
+  "outcome": "Changed",
+  "changed": true,
+  "rolledBack": false,
+  "recovered": false,
+  "root": "E:\\CPA-Stack",
+  "before": null,
+  "after": null,
+  "warnings": [],
+  "error": null,
+  "updaterVersion": "0.2.0"
+}
+```
+
+A non-null error always contains stable `code` and `message` fields. Operation-specific diagnostic details must not be confused with internal journal or dynamic candidate-port contracts.
+
+See [docs/cli.md](docs/cli.md) for complete syntax.
+
+## Uninstall
 
 ```powershell
 $uninstaller = Join-Path $codexHome 'skills\cpa-safe-upgrade\scripts\Uninstall-CpaSafeUpgrade.ps1'
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File $uninstaller -Yes
 ```
 
-Uninstall removes only the owned Skill and its previous-version copy. CPA runtimes and Manager data are never touched.
+Uninstall removes only owned Skill slots with valid markers. It does not touch CPA runtime, Manager data, or a legacy installation.
 
-## Any drive or directory
+## Root resolution
 
-Managed-root precedence is:
+Order:
 
 1. `-Root`
 2. `CPA_STACK_ROOT`
-3. the protected root locator from the last successful initialization
+3. the protected root locator
 4. `%LOCALAPPDATA%\CPAStack`
 
-Examples:
+Drive roots, UNC paths, Git worktrees, Windows/Program Files trees, the user-profile root, and unsupported filesystems are rejected.
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli plan -Root 'C:\Tools\CPA Stack'
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli plan -Root 'D:\服务\CPA-Stack'
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli plan -Root 'E:\CPA-Stack'
-```
+## Tests and release status
 
-UNC paths, drive roots, exFAT, Git worktrees, the Windows/Program Files trees, and the user-profile root itself are rejected. A dedicated directory under LocalAppData remains supported.
+Tests use isolated root/state/lock directories, dynamically allocated high loopback ports, and a `KILL_ON_JOB_CLOSE` Job Object. Formal ports, PIDs, roots, control files, executable hashes, and critical ACLs are release-blocking invariants. CI runs the complete suite under both Windows PowerShell 5.1 and PowerShell 7.
 
-## Commands
+v0.2.0 is an architecture and transaction-interface release. Real-world rollout should still expand gradually; it is not claimed to cover every Windows configuration.
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli status        [-Root <path>] [-Json]
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli plan          [-Root <path>] [-Json]
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli init          [-Root <path>] [source options] [-Json]
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli upgrade       [-Root <path>] [source options] [-AllowUnknownVersionReplacement] [-Json]
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli start         [-Root <path>] [-NoBrowser]
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli register-root -Root <path> [-Json]
-```
+## Security reports
 
-See [docs/cli.md](docs/cli.md) for explicit-source and protected-secret examples.
-
-## Managed layout
-
-```text
-CPA-Stack/
-├── .cpa-stack-instance.json
-├── config/
-├── runtime/
-│   ├── cli-proxy-api/
-│   └── manager-plus/
-├── data/manager-plus/
-├── ops/Start-CPA-Stack.ps1
-├── state/
-├── releases/current/
-├── rollback/last-known-good/
-├── work/
-└── logs/
-```
-
-The retention model is `current + last-known-good`. Candidate and work directories are temporary.
-
-## Current release stage
-
-`v0.1.x` is the public hardening series. Rollout should progress through 5, then 20, then 100 distinct Windows environments. Do not describe a new version as production-proven until its recovery and path matrix has passed on real machines.
-
-## Contributing and security
-
-- Read [CONTRIBUTING.md](CONTRIBUTING.md) before changing transaction code.
-- Report vulnerabilities privately according to [SECURITY.md](SECURITY.md).
-- Never attach keys, `data.key`, SQLite databases, auth files, full configuration, or raw request logs to an issue.
+Please report vulnerabilities privately as described in [SECURITY.md](SECURITY.md). Do not attach keys, `data.key`, SQLite files, auth data, complete configuration, or raw request logs to issues.
 
 ## License
 

@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$ControlRoot,
-    [switch]$AllowUnknownVersionReplacement
+    [switch]$AllowUnknownVersionReplacement,
+    [switch]$RecoverOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -9,7 +10,9 @@ $ErrorActionPreference = "Stop"
 
 $ControlRoot = Resolve-CpaStackControlRoot -RequestedRoot $ControlRoot
 $ControlRoot = Assert-CpaStackSecureLocalRoot -Path $ControlRoot
-Assert-CpaStackFreeSpace -Path $ControlRoot -MinimumBytes 1073741824
+if (-not $RecoverOnly) {
+    Assert-CpaStackFreeSpace -Path $ControlRoot -MinimumBytes 1073741824
+}
 
 $stateDir = Join-Path $ControlRoot "state"
 $workRoot = Join-Path $ControlRoot "work\current"
@@ -37,6 +40,8 @@ $result = [ordered]@{
 $operationMutex = $null
 $upgradeJournal = $null
 $instanceMarker = $null
+$candidatePortPlan = $null
+$suppressResultPersistence = $false
 
 function Invoke-ChildPowerShellJson {
     param([string]$Script, [string[]]$Arguments, [switch]$AllowNonZero)
@@ -185,34 +190,101 @@ function Set-UpgradeJournalPhase {
     Write-CpaStackJson -Value $script:upgradeJournal -Path $upgradeJournalPath
 }
 
-function Remove-UpgradeJournal {
-    foreach ($path in @($upgradeJournalPath, ($upgradeJournalPath + ".previous"))) {
-        if (Test-Path -LiteralPath $path -PathType Leaf) {
-            Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+function Read-StableUpgradeJournalFile {
+    param([string]$Path, [string]$Description)
+
+    Assert-CpaStackPath -Path $Path -PathType Leaf
+    $beforeHash = Get-CpaStackFileHash -Path $Path
+    $value = Read-CpaStackJson -Path $Path
+    $afterHash = Get-CpaStackFileHash -Path $Path
+    if ($beforeHash -notmatch '^[0-9A-Fa-f]{64}$' -or $beforeHash -ine $afterHash) {
+        throw "$Description changed while it was being validated."
+    }
+    return [pscustomobject]@{
+        Value = $value
+        Descriptor = [pscustomobject]@{
+            Path = [System.IO.Path]::GetFullPath($Path)
+            Exists = $true
+            Sha256 = $afterHash.ToUpperInvariant()
         }
     }
+}
+
+function Assert-UpgradeJournalFileDescriptor {
+    param($Descriptor, [string]$Description)
+
+    if ($null -eq $Descriptor) { throw "$Description descriptor is missing." }
+    $exists = Test-Path -LiteralPath ([string]$Descriptor.Path) -PathType Leaf
+    if (-not [bool]$Descriptor.Exists) {
+        if ($exists -or (Test-Path -LiteralPath ([string]$Descriptor.Path))) {
+            throw "$Description appeared after validation."
+        }
+        return
+    }
+    if (-not $exists) { throw "$Description disappeared after validation." }
+    if ((Get-CpaStackFileHash -Path ([string]$Descriptor.Path)) -ine [string]$Descriptor.Sha256) {
+        throw "$Description changed after validation."
+    }
+}
+
+function Assert-ValidatedUpgradeJournalDescriptors {
+    param($Validated)
+
+    if ($null -eq $Validated) { throw 'Validated upgrade journal state is missing.' }
+    Assert-UpgradeJournalFileDescriptor -Descriptor $Validated.JournalDescriptor -Description 'Current upgrade journal'
+    Assert-UpgradeJournalFileDescriptor -Descriptor $Validated.PreviousJournalDescriptor -Description 'Previous upgrade journal'
+}
+
+function Remove-UpgradeJournal {
+    $validated = Read-ValidatedUpgradeJournal
+    if ($null -eq $validated) { return }
+    Assert-ValidatedUpgradeJournalDescriptors -Validated $validated
+    if ([bool]$validated.PreviousJournalDescriptor.Exists) {
+        Remove-Item -LiteralPath ([string]$validated.PreviousJournalDescriptor.Path) -Force -ErrorAction Stop
+    }
+    Assert-UpgradeJournalFileDescriptor -Descriptor $validated.JournalDescriptor -Description 'Current upgrade journal'
+    Remove-Item -LiteralPath ([string]$validated.JournalDescriptor.Path) -Force -ErrorAction Stop
 }
 
 function Stop-UpgradeTemporaryListeners {
     param($Journal)
 
-    foreach ($entry in @(
-        [pscustomobject]@{ Port = 8318; Expected = [string]$Journal.cpaCandidateExe; Name = "CPA" },
-        [pscustomobject]@{ Port = 18318; Expected = [string]$Journal.managerCandidateExe; Name = "Manager" }
-    )) {
-        $listener = Get-CpaStackListener -Port $entry.Port
-        if (-not $listener) { continue }
-        if (-not $entry.Expected) { throw "$($entry.Name) temporary port $($entry.Port) is occupied without a recorded candidate path." }
-        Assert-CpaStackChildPath -Root $ControlRoot -Path $entry.Expected
-        if ($listener.ExecutablePath -ine $entry.Expected) {
-            throw "Unexpected process owns $($entry.Name) temporary port $($entry.Port): $($listener.ExecutablePath)"
+    $hasRecordedPorts = $null -ne $Journal.PSObject.Properties['cpaCandidatePort'] -and
+        $null -ne $Journal.PSObject.Properties['managerCandidatePort']
+    if (-not $hasRecordedPorts) {
+        foreach ($expected in @([string]$Journal.cpaCandidateExe, [string]$Journal.managerCandidateExe)) {
+            if (-not $expected) { continue }
+            Assert-CpaStackChildPath -Root $ControlRoot -Path $expected
+            [void](Stop-CpaStackProcessesByExecutablePath -ExpectedPath $expected)
         }
-        Stop-CpaStackPort -Port $entry.Port -ExpectedPath $entry.Expected -RequireExecutableWriteAccess
+        return
+    }
+
+    foreach ($entry in @(
+        [pscustomobject]@{ Port = [int]$Journal.cpaCandidatePort; Expected = [string]$Journal.cpaCandidateExe; Name = "CPA" },
+        [pscustomobject]@{ Port = [int]$Journal.managerCandidatePort; Expected = [string]$Journal.managerCandidateExe; Name = "Manager" }
+    )) {
+        if (-not $entry.Expected) { continue }
+        Assert-CpaStackChildPath -Root $ControlRoot -Path $entry.Expected
+        $listener = Get-CpaStackListener -Port $entry.Port
+        if ($listener) {
+            if ($listener.ExecutablePath -ine $entry.Expected) {
+                throw "Unexpected process owns $($entry.Name) temporary port $($entry.Port): $($listener.ExecutablePath)"
+            }
+            Stop-CpaStackPort -Port $entry.Port -ExpectedPath $entry.Expected -RequireExecutableWriteAccess
+        }
+        # A hard-killed validator can leave its fixed executable running before it binds.
+        [void](Stop-CpaStackProcessesByExecutablePath -ExpectedPath $entry.Expected)
     }
 }
 
 function Assert-UpgradeTemporaryPortsFree {
-    foreach ($port in @(8318, 18318)) {
+    param($Journal)
+
+    if ($null -eq $Journal) { return }
+    if ($null -eq $Journal.PSObject.Properties['cpaCandidatePort'] -or
+        $null -eq $Journal.PSObject.Properties['managerCandidatePort']) { return }
+    foreach ($port in @([int]$Journal.cpaCandidatePort, [int]$Journal.managerCandidatePort)) {
         $listener = Get-CpaStackListener -Port $port
         if ($listener) { throw "Temporary validation port $port is already owned by $($listener.ExecutablePath)." }
     }
@@ -231,10 +303,12 @@ function Assert-SwitchedServicesHealthy {
 }
 
 function Remove-UpgradeTemporaryWork {
-    Assert-UpgradeTemporaryPortsFree
+    param($Journal)
+
+    Assert-UpgradeTemporaryPortsFree -Journal $Journal
     $workBase = Join-Path $ControlRoot "work"
     if (-not (Test-Path -LiteralPath $workBase -PathType Container)) { return }
-    foreach ($directory in Get-ChildItem -Force -LiteralPath $workBase -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^(cpa-8318|manager-18318|manager-formal-verification)-[0-9a-fA-F]{32}$' }) {
+    foreach ($directory in Get-ChildItem -Force -LiteralPath $workBase -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^(cpa-(?:candidate|\d{1,5})|manager-(?:candidate|\d{1,5})|manager-formal-verification)-[0-9a-fA-F]{32}$' }) {
         Assert-CpaStackChildPath -Root $ControlRoot -Path $directory.FullName
         Remove-Item -LiteralPath $directory.FullName -Recurse -Force -ErrorAction Stop
     }
@@ -250,32 +324,49 @@ function Remove-OrphanedRollbackStaging {
 }
 
 function Clear-SensitiveUpgradeWork {
+    param($Journal)
+
     $candidateRuntime = Join-Path $testRoot "cpa-runtime"
     if (Test-Path -LiteralPath $candidateRuntime) {
         Assert-CpaStackChildPath -Root $ControlRoot -Path $candidateRuntime
         Remove-Item -LiteralPath $candidateRuntime -Recurse -Force -ErrorAction Stop
     }
-    Remove-UpgradeTemporaryWork
+    Remove-UpgradeTemporaryWork -Journal $Journal
 }
 
 function Ensure-CanonicalServicesForPreparationRecovery {
     param([string]$CpaRuntime, [string]$ManagerRuntime)
 
+    $stack = Get-CpaStackConfig -ControlRoot $ControlRoot
+    $cpaPort = [int]$stack.Cpa.Port
+    $managerPort = [int]$stack.Manager.Port
     $expectedCpa = Join-Path $CpaRuntime "cli-proxy-api.exe"
     $expectedManager = Join-Path $ManagerRuntime "cpa-manager-plus.exe"
-    $cpaListener = Get-CpaStackListener -Port 8317
-    $managerListener = Get-CpaStackListener -Port 18317
-    if ($cpaListener -and $cpaListener.ExecutablePath -ine $expectedCpa) { throw "Unexpected process owns 8317 during candidate recovery." }
-    if ($managerListener -and $managerListener.ExecutablePath -ine $expectedManager) { throw "Unexpected process owns 18317 during candidate recovery." }
+    $cpaListener = Get-CpaStackListener -Port $cpaPort
+    $managerListener = Get-CpaStackListener -Port $managerPort
+    if ($cpaListener -and $cpaListener.ExecutablePath -ine $expectedCpa) { throw "Unexpected process owns CPA formal port $cpaPort during candidate recovery." }
+    if ($managerListener -and $managerListener.ExecutablePath -ine $expectedManager) { throw "Unexpected process owns Manager formal port $managerPort during candidate recovery." }
     if ($cpaListener -and $managerListener) { return }
     $startResult = Invoke-InProcessPowerShellJson -Script (Join-Path $PSScriptRoot "Start-CPA-Stack.ps1") -Arguments @("-NoBrowser", "-ConfigPath", (Join-Path $ControlRoot 'config\stack.psd1')) -AdditionalParameters @{ OperationLockHandle = $operationMutex; RecoveryMode = $true }
     if (-not $startResult.Success) { throw "Canonical stack could not be started for candidate recovery: $($startResult.Error.Message)" }
 }
 
 function Read-ValidatedUpgradeJournal {
-    if (-not (Test-Path -LiteralPath $upgradeJournalPath -PathType Leaf)) { return $null }
-    $journal = Read-CpaStackJson -Path $upgradeJournalPath
+    $previousPath = $upgradeJournalPath + '.previous'
+    if (-not (Test-Path -LiteralPath $upgradeJournalPath -PathType Leaf)) {
+        if (Test-Path -LiteralPath $previousPath) {
+            throw 'An orphan upgrade journal previous generation requires manual recovery.'
+        }
+        return $null
+    }
+    $stableCurrent = Read-StableUpgradeJournalFile -Path $upgradeJournalPath -Description 'Current upgrade journal'
+    $journal = $stableCurrent.Value
     if ([string]$journal.operation -ne "upgrade-candidates") { throw "Unexpected upgrade journal operation." }
+    $journalSchemaVersion = [int]$journal.schemaVersion
+    if ($journalSchemaVersion -notin @(1, 2, 3)) { throw "Unsupported upgrade journal schema version." }
+    if ($journalSchemaVersion -eq 3 -and [string]$journal.operationId -notmatch '^[0-9a-fA-F]{32}$') {
+        throw 'Upgrade journal operationId is invalid.'
+    }
     if ($null -eq $instanceMarker -or [string]$journal.instanceId -ne [string]$instanceMarker.instanceId) {
         throw "Upgrade journal belongs to a different CPA stack instance."
     }
@@ -285,6 +376,28 @@ function Read-ValidatedUpgradeJournal {
     foreach ($field in @("cpaBaseUrl", "collectorEnabled", "pollIntervalMs", "usageStatisticsEnabled")) {
         if ($null -eq $journal.managerBaseline -or $null -eq $journal.managerBaseline.PSObject.Properties[$field]) {
             throw "Upgrade journal is missing Manager baseline field $field."
+        }
+    }
+    $phase = [string]$journal.phase
+    $allowedPhases = @('prepared', 'testing-cpa', 'testing-manager', 'switching-cpa', 'switching-manager', 'committing')
+    if ($phase -cnotin $allowedPhases) { throw "Upgrade journal phase is invalid: $phase" }
+    if ($journalSchemaVersion -ge 2) {
+        $stack = Get-CpaStackConfig -ControlRoot $ControlRoot
+        $formalPorts = @([int]$stack.Cpa.Port, [int]$stack.Manager.Port)
+        $protectedPorts = @(Get-CpaStackCandidateProtectedPorts -FormalPort $formalPorts)
+        $candidatePorts = @()
+        foreach ($property in @('cpaCandidatePort', 'managerCandidatePort')) {
+            if ($null -eq $journal.PSObject.Properties[$property]) {
+                throw "Upgrade journal is missing candidate port field $property."
+            }
+            $port = [int]$journal.$property
+            if ($port -lt 49152 -or $port -gt 65535 -or $port -in $protectedPorts) {
+                throw "Upgrade journal candidate port is unsafe: $property=$port"
+            }
+            $candidatePorts += $port
+        }
+        if (@($candidatePorts | Sort-Object -Unique).Count -ne $candidatePorts.Count) {
+            throw 'Upgrade journal candidate ports must be distinct.'
         }
     }
     foreach ($property in @("cpaCandidateExe", "managerCandidateExe")) {
@@ -297,15 +410,86 @@ function Read-ValidatedUpgradeJournal {
             throw "Upgrade journal candidate path is outside the work tree: $path"
         }
     }
-    return $journal
+
+    $previousDescriptor = [pscustomobject]@{
+        Path = [System.IO.Path]::GetFullPath($previousPath)
+        Exists = $false
+        Sha256 = $null
+    }
+    if (Test-Path -LiteralPath $previousPath -PathType Leaf) {
+        $stablePrevious = Read-StableUpgradeJournalFile -Path $previousPath -Description 'Previous upgrade journal'
+        $previous = $stablePrevious.Value
+        $previousDescriptor = $stablePrevious.Descriptor
+        foreach ($field in @('schemaVersion', 'operation', 'instanceId', 'canonicalRoot', 'createdAt')) {
+            $currentProperty = $journal.PSObject.Properties[$field]
+            $previousProperty = $previous.PSObject.Properties[$field]
+            if ($null -eq $currentProperty -or $null -eq $previousProperty -or
+                [string]$currentProperty.Value -cne [string]$previousProperty.Value) {
+                throw "Previous upgrade journal immutable field '$field' does not match the current transaction."
+            }
+        }
+        if ($journalSchemaVersion -eq 3) {
+            if ([string]$previous.operationId -notmatch '^[0-9a-fA-F]{32}$' -or
+                [string]$previous.operationId -cne [string]$journal.operationId) {
+                throw 'Previous upgrade journal belongs to a different operationId.'
+            }
+        }
+        if ($journalSchemaVersion -ge 2) {
+            foreach ($field in @('cpaCandidatePort', 'managerCandidatePort')) {
+                if ([string]$previous.$field -cne [string]$journal.$field) {
+                    throw "Previous upgrade journal immutable field '$field' does not match the current transaction."
+                }
+            }
+        }
+        foreach ($field in @('cpaBaseUrl', 'collectorEnabled', 'pollIntervalMs', 'usageStatisticsEnabled')) {
+            if ($null -eq $previous.managerBaseline -or
+                [string]$previous.managerBaseline.$field -cne [string]$journal.managerBaseline.$field) {
+                throw "Previous upgrade journal Manager baseline field '$field' does not match the current transaction."
+            }
+        }
+        foreach ($field in @('cpaCandidateExe', 'managerCandidateExe')) {
+            $previousValue = [string]$previous.$field
+            $currentValue = [string]$journal.$field
+            if (-not [string]::IsNullOrWhiteSpace($previousValue) -and $previousValue -cne $currentValue) {
+                throw "Previous upgrade journal candidate field '$field' changed within the transaction."
+            }
+        }
+        $previousPhase = [string]$previous.phase
+        $allowedPreviousPhases = switch ($phase) {
+            'prepared' { @('prepared') }
+            'testing-cpa' { @('prepared', 'testing-cpa') }
+            'testing-manager' { @('prepared', 'testing-cpa', 'testing-manager') }
+            'switching-cpa' { @('testing-cpa', 'testing-manager', 'switching-cpa') }
+            'switching-manager' { @('testing-manager', 'switching-cpa', 'switching-manager') }
+            'committing' { @('switching-cpa', 'switching-manager', 'committing') }
+        }
+        if ($previousPhase -cnotin @($allowedPreviousPhases)) {
+            throw "Previous upgrade journal phase '$previousPhase' is not a legal predecessor of '$phase'."
+        }
+        $currentUpdatedAt = [DateTimeOffset]::MinValue
+        $previousUpdatedAt = [DateTimeOffset]::MinValue
+        if (-not [DateTimeOffset]::TryParse([string]$journal.updatedAt, [ref]$currentUpdatedAt) -or
+            -not [DateTimeOffset]::TryParse([string]$previous.updatedAt, [ref]$previousUpdatedAt) -or
+            $previousUpdatedAt -gt $currentUpdatedAt) {
+            throw 'Previous upgrade journal timestamp is not ordered before the current generation.'
+        }
+    }
+    return [pscustomobject]@{
+        Journal = $journal
+        JournalDescriptor = $stableCurrent.Descriptor
+        PreviousJournalDescriptor = $previousDescriptor
+    }
 }
 
 function Recover-UpgradePreparationState {
     param([string]$CpaRuntime, [string]$ManagerRuntime)
 
-    $journal = Read-ValidatedUpgradeJournal
-    if ($null -eq $journal) { return $false }
+    $validatedJournal = Read-ValidatedUpgradeJournal
+    if ($null -eq $validatedJournal) { return $false }
+    $journal = $validatedJournal.Journal
+    Assert-ValidatedUpgradeJournalDescriptors -Validated $validatedJournal
     Stop-UpgradeTemporaryListeners -Journal $journal
+    Assert-ValidatedUpgradeJournalDescriptors -Validated $validatedJournal
     Ensure-CanonicalServicesForPreparationRecovery -CpaRuntime $CpaRuntime -ManagerRuntime $ManagerRuntime
     $trustedManager = Assert-TrustedCanonicalManagerListener -ManagerRuntime $ManagerRuntime
     $secrets = Get-CpaStackSecrets -ControlRoot $ControlRoot
@@ -313,7 +497,8 @@ function Recover-UpgradePreparationState {
     [void](Set-CpaStackManagerCollector -ManagerPort $trustedManager.Port -CpaPort ([int]$trustedManager.Stack.Cpa.Port) -ManagerAdminKey $secrets.managerAdminKey -CpaManagementKey $secrets.cpaManagementKey -Enabled ([bool]$baseline.collectorEnabled) -Baseline $baseline)
     [void](Assert-CpaStackManagerSetupBaseline -ManagerPort $trustedManager.Port -ManagerAdminKey $secrets.managerAdminKey -Expected $baseline)
     [void](Wait-CpaStackTrustedListener -Port $trustedManager.Port -ExpectedPath $trustedManager.Exe -ExpectedProcessId $trustedManager.Listener.ProcessId -ExpectedHash $trustedManager.Hash -AllowedAddresses @([string]$trustedManager.Stack.Manager.BindAddress) -Seconds 2)
-    Clear-SensitiveUpgradeWork
+    Assert-ValidatedUpgradeJournalDescriptors -Validated $validatedJournal
+    Clear-SensitiveUpgradeWork -Journal $journal
     Remove-OrphanedRollbackStaging
     Remove-UpgradeJournal
     return $true
@@ -423,53 +608,388 @@ function Restore-CanonicalInterruptedState {
     $rollbackRoot = Join-Path $ControlRoot "rollback"
     $cpaJournalPath = Join-Path $stateRoot "switch-cpa.pending.json"
     $managerJournalPath = Join-Path $stateRoot "switch-manager.pending.json"
+    $hasRecoveryArtifact = (Test-Path -LiteralPath $cpaJournalPath -PathType Leaf) -or
+        (Test-Path -LiteralPath $managerJournalPath -PathType Leaf) -or
+        (@(Get-ChildItem -LiteralPath $rollbackRoot -Directory -Filter 'pending-*' -ErrorAction SilentlyContinue).Count -gt 0)
+    if ($hasRecoveryArtifact) { $script:suppressResultPersistence = $true }
+    $recoveryStack = Get-CpaStackConfig -ControlRoot $ControlRoot
+    $cpaFormalPort = [int]$recoveryStack.Cpa.Port
+    $managerFormalPort = [int]$recoveryStack.Manager.Port
+    $canonicalCpaRuntime = Join-Path $ControlRoot ([string]$recoveryStack.Cpa.WorkingDirectory)
+    $canonicalCpaConfig = Join-Path $ControlRoot ([string]$recoveryStack.Cpa.Config)
+    $canonicalManagerRuntime = Join-Path $ControlRoot ([string]$recoveryStack.Manager.WorkingDirectory)
+    $canonicalManagerData = Join-Path $ControlRoot ([string]$recoveryStack.Manager.DataDirectory)
 
-    function Quarantine-PendingPath {
-        param([string]$Path)
-        if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return }
-        $rollbackFull = [System.IO.Path]::GetFullPath($rollbackRoot).TrimEnd('\')
-        $pathFull = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
-        if ((Split-Path -Parent $pathFull).TrimEnd('\') -ine $rollbackFull -or (Split-Path -Leaf $pathFull) -notmatch '^pending-(cpa|manager)-[0-9a-fA-F]{32}$') {
-            throw "Refusing to quarantine a path outside an exact rollback pending slot: $Path"
+    function Get-NormalizedRecoveryPath {
+        param([string]$Path, [string]$Description)
+        if ([string]::IsNullOrWhiteSpace($Path)) { throw "$Description is missing." }
+        try {
+            return [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+        } catch {
+            throw "$Description is invalid: $Path"
         }
-        Assert-CpaStackChildPath -Root $ControlRoot -Path $Path
-        $destination = Join-Path $rollbackRoot ("orphaned-" + (Split-Path -Leaf $Path) + "-" + [guid]::NewGuid().ToString("N"))
-        Move-Item -LiteralPath $Path -Destination $destination -ErrorAction Stop
+    }
+
+    function Assert-RecoveryPathEquals {
+        param([string]$Actual, [string]$Expected, [string]$Description)
+        $actualFull = Get-NormalizedRecoveryPath -Path $Actual -Description $Description
+        $expectedFull = Get-NormalizedRecoveryPath -Path $Expected -Description "Canonical $Description"
+        if (-not [string]::Equals($actualFull, $expectedFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "$Description is not the canonical stack slot. Expected=$expectedFull Actual=$actualFull"
+        }
+    }
+
+    foreach ($canonicalPath in @($canonicalCpaRuntime, $canonicalCpaConfig, $canonicalManagerRuntime, $canonicalManagerData)) {
+        Assert-CpaStackChildPath -Root $ControlRoot -Path $canonicalPath
+    }
+    Assert-RecoveryPathEquals -Actual $CpaRuntime -Expected $canonicalCpaRuntime -Description 'CPA recovery runtime'
+    Assert-RecoveryPathEquals -Actual $ManagerRuntime -Expected $canonicalManagerRuntime -Description 'Manager recovery runtime'
+    Assert-RecoveryPathEquals -Actual $ManagerData -Expected $canonicalManagerData -Description 'Manager recovery data directory'
+
+    $recordedState = Read-CpaStackJson -Path $currentStatePath
+
+    function Get-RequiredJournalProperty {
+        param($Journal, [string]$Name, [string]$JournalPath)
+        $property = $Journal.PSObject.Properties[$Name]
+        if ($null -eq $property) { throw "Recovery journal is missing $Name in $JournalPath" }
+        return $property.Value
+    }
+
+    function Read-StableRecoveryJson {
+        param([string]$Path, [string]$Description)
+
+        Assert-CpaStackPath -Path $Path -PathType Leaf
+        $beforeHash = Get-CpaStackFileHash -Path $Path
+        $value = Read-CpaStackJson -Path $Path
+        $afterHash = Get-CpaStackFileHash -Path $Path
+        if ($beforeHash -notmatch '^[0-9A-Fa-f]{64}$' -or $beforeHash -ine $afterHash) {
+            throw "$Description changed while it was being validated."
+        }
+        return [pscustomobject]@{
+            Value = $value
+            Descriptor = [pscustomobject]@{
+                Path = [System.IO.Path]::GetFullPath($Path)
+                Exists = $true
+                Sha256 = $afterHash.ToUpperInvariant()
+            }
+        }
+    }
+
+    function Assert-RecoveryFileDescriptor {
+        param($Descriptor, [string]$Description)
+
+        if ($null -eq $Descriptor) { throw "$Description descriptor is missing." }
+        $exists = Test-Path -LiteralPath ([string]$Descriptor.Path) -PathType Leaf
+        if (-not [bool]$Descriptor.Exists) {
+            if ($exists -or (Test-Path -LiteralPath ([string]$Descriptor.Path))) {
+                throw "$Description appeared after recovery validation."
+            }
+            return
+        }
+        if (-not $exists) { throw "$Description disappeared after recovery validation." }
+        if ((Get-CpaStackFileHash -Path ([string]$Descriptor.Path)) -ine [string]$Descriptor.Sha256) {
+            throw "$Description changed after recovery validation."
+        }
+    }
+
+    function Assert-RecoveryJournalDescriptors {
+        param($Recovery)
+
+        Assert-RecoveryFileDescriptor -Descriptor $Recovery.JournalDescriptor -Description 'Current switch journal'
+        Assert-RecoveryFileDescriptor -Descriptor $Recovery.PreviousJournalDescriptor -Description 'Previous switch journal'
+    }
+
+    function Assert-RecoveryBackupDescriptor {
+        param($Recovery)
+
+        if ($null -eq $Recovery.BackupDescriptor) { return }
+        $descriptor = $Recovery.BackupDescriptor
+        $backupRoot = Get-NormalizedRecoveryPath -Path ([string]$descriptor.Root) -Description 'Recovery backup root'
+        if ($backupRoot -ine (Get-NormalizedRecoveryPath -Path ([string]$Recovery.Backup.FullName) -Description 'Recorded recovery backup root')) {
+            throw 'Recovery backup descriptor no longer identifies the validated backup.'
+        }
+        Assert-CpaStackChildPath -Root $ControlRoot -Path $backupRoot
+        Assert-CpaStackPath -Path $backupRoot
+        Assert-RecoveryFileDescriptor -Descriptor $descriptor.Manifest -Description 'Recovery backup manifest'
+        $runtimeRoot = Join-Path $backupRoot 'runtime'
+        if ([string](Get-CpaStackTreeManifest -Root $runtimeRoot).sha256 -ine [string]$descriptor.RuntimeTreeSha256) {
+            throw 'Recovery backup runtime tree changed after validation.'
+        }
+        if ((Get-CpaStackFileHash -Path ([string]$descriptor.ExecutablePath)) -ine [string]$descriptor.ExecutableSha256) {
+            throw 'Recovery backup executable changed after validation.'
+        }
+        if ($null -ne $descriptor.DataTreeSha256) {
+            $dataRoot = Join-Path $backupRoot 'data'
+            if ([string](Get-CpaStackTreeManifest -Root $dataRoot).sha256 -ine [string]$descriptor.DataTreeSha256) {
+                throw 'Recovery backup data tree changed after validation.'
+            }
+            if ((Get-CpaStackFileHash -Path ([string]$descriptor.DataKeyPath)) -ine [string]$descriptor.DataKeySha256) {
+                throw 'Recovery backup data.key changed after validation.'
+            }
+            Assert-RecoveryFileDescriptor -Descriptor $descriptor.SqliteBackupResult -Description 'Recovery SQLite backup result'
+        }
+    }
+
+    function Assert-RecoveryDescriptors {
+        param($Recovery, [switch]$IncludeBackup)
+
+        if ($null -eq $Recovery) { return }
+        Assert-RecoveryJournalDescriptors -Recovery $Recovery
+        if ($IncludeBackup) { Assert-RecoveryBackupDescriptor -Recovery $Recovery }
+    }
+
+    function Assert-SwitchPhaseState {
+        param(
+            [string]$Component,
+            [string]$Phase,
+            [string]$RecordedHash,
+            [string]$ActiveHash,
+            [string]$OldHash,
+            [string]$NewHash,
+            [string]$PendingPath,
+            $Journal,
+            [string]$JournalPath
+        )
+
+        $recorded = $RecordedHash.ToUpperInvariant()
+        $active = $ActiveHash.ToUpperInvariant()
+        $old = $OldHash.ToUpperInvariant()
+        $new = $NewHash.ToUpperInvariant()
+        $targetProcessValue = Get-RequiredJournalProperty -Journal $Journal -Name 'targetProcessId' -JournalPath $JournalPath
+        $targetProcessId = if ($null -eq $targetProcessValue) { 0 } else { [int]$targetProcessValue }
+
+        switch ($Phase) {
+            'prepared' {
+                if ($recorded -ne $old -or $active -ne $old -or $targetProcessId -ne 0 -or
+                    ($Component -eq 'manager' -and -not [string]::IsNullOrWhiteSpace($PendingPath))) {
+                    throw "$Component prepared recovery phase is not bound to the active old runtime."
+                }
+            }
+            'collector-disabled' {
+                if ($Component -ne 'manager' -or $recorded -ne $old -or $active -ne $old -or
+                    -not [string]::IsNullOrWhiteSpace($PendingPath) -or $targetProcessId -ne 0) {
+                    throw 'Manager collector-disabled recovery phase is not semantically valid.'
+                }
+                if ($null -eq $Journal.managerBaseline -or
+                    [bool](Get-RequiredJournalProperty -Journal $Journal -Name 'collectorEnabled' -JournalPath $JournalPath) -ne
+                    [bool](Get-RequiredJournalProperty -Journal $Journal.managerBaseline -Name 'collectorEnabled' -JournalPath $JournalPath)) {
+                    throw 'Manager collector-disabled recovery phase has an inconsistent collector baseline.'
+                }
+            }
+            'source-stopped' {
+                if ($recorded -ne $old -or $active -notin @($old, $new) -or $targetProcessId -ne 0) {
+                    throw "$Component source-stopped recovery phase is inconsistent with the recorded runtime."
+                }
+            }
+            { $_ -in @('target-started', 'runtime-verified') } {
+                if ($recorded -notin @($old, $new) -or $active -ne $new -or
+                    [string]::IsNullOrWhiteSpace($PendingPath) -or $targetProcessId -lt 1) {
+                    throw "$Component $Phase recovery phase is not bound to the active new runtime and canonical backup."
+                }
+            }
+            default { throw "$Component switch recovery phase is unsupported: $Phase" }
+        }
     }
 
     function Read-ValidatedPending {
         param([string]$JournalPath, [string]$ExpectedOperation)
         if (-not (Test-Path -LiteralPath $JournalPath -PathType Leaf)) { return $null }
-        $journal = Read-CpaStackJson -Path $JournalPath
-        if ([string]$journal.operation -ne $ExpectedOperation) { throw "Unexpected recovery journal operation in $JournalPath" }
-        if ($null -eq $instanceMarker -or [string]$journal.instanceId -ne [string]$instanceMarker.instanceId) {
+        $stableJournal = Read-StableRecoveryJson -Path $JournalPath -Description 'Current switch journal'
+        $journal = $stableJournal.Value
+        $journalDescriptor = $stableJournal.Descriptor
+        $operation = [string](Get-RequiredJournalProperty -Journal $journal -Name 'operation' -JournalPath $JournalPath)
+        if ($operation -cne $ExpectedOperation) { throw "Unexpected recovery journal operation in $JournalPath" }
+
+        $operationId = [string](Get-RequiredJournalProperty -Journal $journal -Name 'operationId' -JournalPath $JournalPath)
+        if ($operationId -notmatch '^[0-9a-fA-F]{32}$') { throw "Recovery journal operationId is invalid in $JournalPath" }
+        $journalInstanceId = [string](Get-RequiredJournalProperty -Journal $journal -Name 'instanceId' -JournalPath $JournalPath)
+        if ($journalInstanceId -notmatch '^[0-9a-fA-F]{32}$' -or
+            $null -eq $instanceMarker -or
+            $journalInstanceId -cne [string]$instanceMarker.instanceId -or
+            $journalInstanceId -cne [string]$recordedState.instanceId) {
             throw "Switch recovery journal belongs to a different CPA stack instance."
         }
-        $operationId = [string]$journal.operationId
-        if ($operationId -notmatch '^[0-9a-fA-F]{32}$') { throw "Recovery journal operationId is invalid in $JournalPath" }
-        if ($ExpectedOperation -eq "switch-manager") {
+
+        $phase = [string](Get-RequiredJournalProperty -Journal $journal -Name 'phase' -JournalPath $JournalPath)
+        $allowedPhases = if ($ExpectedOperation -eq 'switch-cpa') {
+            @('prepared', 'source-stopped', 'target-started', 'runtime-verified')
+        } else {
+            @('prepared', 'collector-disabled', 'source-stopped', 'target-started', 'runtime-verified')
+        }
+        if ($allowedPhases -cnotcontains $phase) { throw "Switch recovery journal phase is invalid in $JournalPath" }
+
+        $component = if ($ExpectedOperation -eq 'switch-cpa') { 'cpa' } else { 'manager' }
+        $componentStateProperty = $recordedState.PSObject.Properties[$component]
+        if ($null -eq $componentStateProperty) { throw "Current state is missing the recorded $component component." }
+        $componentState = $componentStateProperty.Value
+        $canonicalRuntime = if ($component -eq 'cpa') { $canonicalCpaRuntime } else { $canonicalManagerRuntime }
+        $canonicalExecutable = Join-Path $canonicalRuntime $(if ($component -eq 'cpa') { 'cli-proxy-api.exe' } else { 'cpa-manager-plus.exe' })
+        Assert-RecoveryPathEquals `
+            -Actual ([string](Get-RequiredJournalProperty -Journal $componentState -Name 'executable' -JournalPath $currentStatePath)) `
+            -Expected $canonicalExecutable `
+            -Description "Recorded $component executable"
+
+        $oldHash = [string](Get-RequiredJournalProperty -Journal $journal -Name 'oldHash' -JournalPath $JournalPath)
+        $newHash = [string](Get-RequiredJournalProperty -Journal $journal -Name 'newHash' -JournalPath $JournalPath)
+        $recordedHash = [string](Get-RequiredJournalProperty -Journal $componentState -Name 'sha256' -JournalPath $currentStatePath)
+        if ($oldHash -notmatch '^[0-9A-Fa-f]{64}$' -or
+            $newHash -notmatch '^[0-9A-Fa-f]{64}$' -or
+            $recordedHash -notmatch '^[0-9A-Fa-f]{64}$' -or
+            $oldHash -ieq $newHash) {
+            throw "Switch recovery journal hashes are invalid in $JournalPath"
+        }
+        $activeHash = Get-CpaStackFileHash -Path $canonicalExecutable
+        if ($activeHash -notmatch '^[0-9A-Fa-f]{64}$') { throw "Canonical $component executable is missing during recovery validation." }
+
+        if ($ExpectedOperation -eq 'switch-cpa') {
+            Assert-RecoveryPathEquals `
+                -Actual ([string](Get-RequiredJournalProperty -Journal $journal -Name 'sourceRuntime' -JournalPath $JournalPath)) `
+                -Expected $canonicalCpaRuntime `
+                -Description 'CPA switch sourceRuntime'
+            Assert-RecoveryPathEquals `
+                -Actual ([string](Get-RequiredJournalProperty -Journal $journal -Name 'targetRuntime' -JournalPath $JournalPath)) `
+                -Expected $canonicalCpaRuntime `
+                -Description 'CPA switch targetRuntime'
+            Assert-RecoveryPathEquals `
+                -Actual ([string](Get-RequiredJournalProperty -Journal $journal -Name 'sourceConfig' -JournalPath $JournalPath)) `
+                -Expected $canonicalCpaConfig `
+                -Description 'CPA switch sourceConfig'
+            $journalPort = [int](Get-RequiredJournalProperty -Journal $journal -Name 'port' -JournalPath $JournalPath)
+            if ($journalPort -ne $cpaFormalPort) {
+                throw 'CPA switch recovery journal formal port does not match stack configuration.'
+            }
+        } else {
+            Assert-RecoveryPathEquals `
+                -Actual ([string](Get-RequiredJournalProperty -Journal $journal -Name 'sourceRuntime' -JournalPath $JournalPath)) `
+                -Expected $canonicalManagerRuntime `
+                -Description 'Manager switch sourceRuntime'
+            Assert-RecoveryPathEquals `
+                -Actual ([string](Get-RequiredJournalProperty -Journal $journal -Name 'targetRuntime' -JournalPath $JournalPath)) `
+                -Expected $canonicalManagerRuntime `
+                -Description 'Manager switch targetRuntime'
+            Assert-RecoveryPathEquals `
+                -Actual ([string](Get-RequiredJournalProperty -Journal $journal -Name 'sourceData' -JournalPath $JournalPath)) `
+                -Expected $canonicalManagerData `
+                -Description 'Manager switch sourceData'
+            Assert-RecoveryPathEquals `
+                -Actual ([string](Get-RequiredJournalProperty -Journal $journal -Name 'targetData' -JournalPath $JournalPath)) `
+                -Expected $canonicalManagerData `
+                -Description 'Manager switch targetData'
+            $journalManagerPort = [int](Get-RequiredJournalProperty -Journal $journal -Name 'managerPort' -JournalPath $JournalPath)
+            $journalCpaPort = [int](Get-RequiredJournalProperty -Journal $journal -Name 'cpaPort' -JournalPath $JournalPath)
+            if ($journalManagerPort -ne $managerFormalPort -or $journalCpaPort -ne $cpaFormalPort) {
+                throw 'Manager switch recovery journal formal ports do not match stack configuration.'
+            }
             foreach ($field in @("cpaBaseUrl", "collectorEnabled", "pollIntervalMs", "usageStatisticsEnabled")) {
                 if ($null -eq $journal.managerBaseline -or $null -eq $journal.managerBaseline.PSObject.Properties[$field]) {
                     throw "Manager recovery journal is missing baseline field $field."
                 }
             }
         }
-        $pendingPath = [string]$journal.pendingPath
-        $component = if ($ExpectedOperation -eq "switch-cpa") { "cpa" } else { "manager" }
+        $pendingPropertyValue = Get-RequiredJournalProperty -Journal $journal -Name 'pendingPath' -JournalPath $JournalPath
+        $pendingPath = if ($null -eq $pendingPropertyValue) { $null } else { [string]$pendingPropertyValue }
         $destinationPath = if ($component -eq 'cpa') { Join-Path $rollbackRoot 'last-known-good\cpa' } else { Join-Path $rollbackRoot 'last-known-good\manager-plus' }
-        if (-not $pendingPath) {
-            return [pscustomobject]@{ Journal = $journal; Backup = $null; BackupLocation = 'none'; DestinationPath = $destinationPath; ValidationError = $null }
-        }
         $expectedLeaf = "pending-$component-$operationId"
         $rollbackFull = [System.IO.Path]::GetFullPath($rollbackRoot).TrimEnd('\')
-        $pendingFull = [System.IO.Path]::GetFullPath($pendingPath).TrimEnd('\')
-        if ((Split-Path -Parent $pendingFull).TrimEnd('\') -ine $rollbackFull -or (Split-Path -Leaf $pendingFull) -ine $expectedLeaf -or $pendingFull -ine (Join-Path $rollbackFull $expectedLeaf)) {
-            throw "Recovery journal pendingPath is not the exact expected rollback slot: $pendingPath"
+        $expectedPendingFull = Join-Path $rollbackFull $expectedLeaf
+        $pendingFull = $null
+        if (-not [string]::IsNullOrWhiteSpace($pendingPath)) {
+            $pendingFull = Get-NormalizedRecoveryPath -Path $pendingPath -Description "$ExpectedOperation pendingPath"
+            if ((Split-Path -Parent $pendingFull).TrimEnd('\') -ine $rollbackFull -or
+                (Split-Path -Leaf $pendingFull) -ine $expectedLeaf -or
+                $pendingFull -ine $expectedPendingFull) {
+                throw "Recovery journal pendingPath is not the exact expected rollback slot: $pendingPath"
+            }
+            Assert-CpaStackChildPath -Root $ControlRoot -Path $pendingFull
+        } elseif ($component -eq 'cpa') {
+            throw "$ExpectedOperation recovery journal is missing its canonical pendingPath."
+        }
+
+        $previousJournalPath = $JournalPath + '.previous'
+        $previousJournalDescriptor = [pscustomobject]@{
+            Path = [System.IO.Path]::GetFullPath($previousJournalPath)
+            Exists = $false
+            Sha256 = $null
+        }
+        if (Test-Path -LiteralPath $previousJournalPath -PathType Leaf) {
+            $stablePrevious = Read-StableRecoveryJson -Path $previousJournalPath -Description 'Previous switch journal'
+            $previous = $stablePrevious.Value
+            $previousJournalDescriptor = $stablePrevious.Descriptor
+            foreach ($field in @('schemaVersion', 'operation', 'operationId', 'parentOperationId', 'instanceId', 'createdAt', 'sourceRuntime', 'targetRuntime', 'oldHash', 'newHash')) {
+                $currentValue = Get-RequiredJournalProperty -Journal $journal -Name $field -JournalPath $JournalPath
+                $previousValue = Get-RequiredJournalProperty -Journal $previous -Name $field -JournalPath $previousJournalPath
+                if ([string]$currentValue -cne [string]$previousValue) {
+                    throw "Previous switch journal immutable field '$field' does not match the current transaction."
+                }
+            }
+            $componentFields = if ($component -eq 'cpa') {
+                @('sourceConfig', 'port', 'pendingPath', 'targetRuntimeManifestSha256', 'targetConfigSha256', 'targetHost')
+            } else {
+                @('sourceData', 'targetData', 'managerPort', 'cpaPort', 'collectorEnabled')
+            }
+            foreach ($field in $componentFields) {
+                $currentValue = Get-RequiredJournalProperty -Journal $journal -Name $field -JournalPath $JournalPath
+                $previousValue = Get-RequiredJournalProperty -Journal $previous -Name $field -JournalPath $previousJournalPath
+                if ([string]$currentValue -cne [string]$previousValue) {
+                    throw "Previous switch journal immutable field '$field' does not match the current transaction."
+                }
+            }
+            if ($component -eq 'manager') {
+                foreach ($field in @('cpaBaseUrl', 'collectorEnabled', 'pollIntervalMs', 'usageStatisticsEnabled')) {
+                    $currentValue = Get-RequiredJournalProperty -Journal $journal.managerBaseline -Name $field -JournalPath $JournalPath
+                    $previousValue = Get-RequiredJournalProperty -Journal $previous.managerBaseline -Name $field -JournalPath $previousJournalPath
+                    if ([string]$currentValue -cne [string]$previousValue) {
+                        throw "Previous Manager switch journal baseline field '$field' does not match the current transaction."
+                    }
+                }
+                $previousPendingValue = Get-RequiredJournalProperty -Journal $previous -Name 'pendingPath' -JournalPath $previousJournalPath
+                $previousPendingPath = if ($null -eq $previousPendingValue) { $null } else { [string]$previousPendingValue }
+                if (-not [string]::IsNullOrWhiteSpace($previousPendingPath)) {
+                    $previousPendingFull = Get-NormalizedRecoveryPath -Path $previousPendingPath -Description 'Previous Manager pendingPath'
+                    if ($previousPendingFull -ine $expectedPendingFull) {
+                        throw 'Previous Manager switch journal pendingPath is not the canonical transaction slot.'
+                    }
+                }
+            }
+            $phaseOrder = if ($component -eq 'cpa') {
+                @('prepared', 'source-stopped', 'target-started', 'runtime-verified')
+            } else {
+                @('prepared', 'collector-disabled', 'source-stopped', 'target-started', 'runtime-verified')
+            }
+            $previousPhase = [string](Get-RequiredJournalProperty -Journal $previous -Name 'phase' -JournalPath $previousJournalPath)
+            $currentPhaseIndex = [array]::IndexOf($phaseOrder, $phase)
+            $previousPhaseIndex = [array]::IndexOf($phaseOrder, $previousPhase)
+            if ($previousPhaseIndex -lt 0 -or $previousPhaseIndex -gt $currentPhaseIndex -or
+                ($currentPhaseIndex - $previousPhaseIndex) -gt 1) {
+                throw "Previous switch journal phase '$previousPhase' is not a legal predecessor of '$phase'."
+            }
+        }
+
+        Assert-SwitchPhaseState -Component $component -Phase $phase -RecordedHash $recordedHash -ActiveHash $activeHash `
+            -OldHash $oldHash -NewHash $newHash -PendingPath $pendingFull -Journal $journal -JournalPath $JournalPath
+        $disposition = Resolve-CpaStackSwitchDisposition `
+            -RecordedHash $recordedHash `
+            -ActiveHash $activeHash `
+            -OldHash $oldHash `
+            -NewHash $newHash
+
+        if (-not $pendingFull) {
+            return [pscustomobject]@{
+                Journal = $journal
+                Backup = $null
+                BackupLocation = 'none'
+                DestinationPath = $destinationPath
+                Disposition = $disposition
+                JournalDescriptor = $journalDescriptor
+                PreviousJournalDescriptor = $previousJournalDescriptor
+                BackupDescriptor = $null
+                ValidationError = $null
+            }
         }
         $backupPath = $null
         $backupLocation = 'none'
-        if (Test-Path -LiteralPath $pendingPath -PathType Container) {
-            $backupPath = $pendingPath
+        if (Test-Path -LiteralPath $pendingFull -PathType Container) {
+            $backupPath = $pendingFull
             $backupLocation = 'pending'
         } elseif (Test-Path -LiteralPath (Join-Path $destinationPath 'manifest.json') -PathType Leaf) {
             $destinationManifest = Read-CpaStackJson -Path (Join-Path $destinationPath 'manifest.json')
@@ -479,94 +999,128 @@ function Restore-CanonicalInterruptedState {
             }
         }
         if (-not $backupPath) {
-            return [pscustomobject]@{ Journal = $journal; Backup = $null; BackupLocation = 'none'; DestinationPath = $destinationPath; ValidationError = $null }
+            return [pscustomobject]@{
+                Journal = $journal
+                Backup = $null
+                BackupLocation = 'none'
+                DestinationPath = $destinationPath
+                Disposition = $disposition
+                JournalDescriptor = $journalDescriptor
+                PreviousJournalDescriptor = $previousJournalDescriptor
+                BackupDescriptor = $null
+                ValidationError = $null
+            }
         }
         try {
             Assert-CpaStackChildPath -Root $ControlRoot -Path $backupPath
             Assert-CpaStackPath -Path $backupPath
-            $manifest = Read-CpaStackJson -Path (Join-Path $backupPath "manifest.json")
+            $manifestPath = Join-Path $backupPath 'manifest.json'
+            $stableManifest = Read-StableRecoveryJson -Path $manifestPath -Description 'Recovery backup manifest'
+            $manifest = $stableManifest.Value
             if ([string]$manifest.operationId -ne [string]$journal.operationId) { throw "Pending operationId does not match its journal." }
+            $runtimeRoot = Join-Path $backupPath 'runtime'
+            $runtimeTreeSha256 = [string](Get-CpaStackTreeManifest -Root $runtimeRoot).sha256
+            $dataTreeSha256 = $null
+            $dataKey = $null
+            $dataKeySha256 = $null
+            $sqliteBackupDescriptor = $null
             if ($ExpectedOperation -eq "switch-cpa") {
                 $exe = Join-Path $backupPath "runtime\cli-proxy-api.exe"
                 if ((Get-CpaStackFileHash -Path $exe) -ne [string]$manifest.executableSha256 -or [string]$manifest.executableSha256 -ne [string]$journal.oldHash) {
                     throw "CPA pending executable hash validation failed."
                 }
+                Assert-RecoveryPathEquals -Actual ([string]$manifest.sourceRuntime) -Expected $canonicalCpaRuntime -Description 'CPA rollback manifest sourceRuntime'
             } else {
                 $exe = Join-Path $backupPath "runtime\cpa-manager-plus.exe"
                 $dataKey = Join-Path $backupPath "data\data.key"
                 if ((Get-CpaStackFileHash -Path $exe) -ne [string]$manifest.executableSha256 -or [string]$manifest.executableSha256 -ne [string]$journal.oldHash) { throw "Manager pending executable hash validation failed." }
                 if ((Get-CpaStackFileHash -Path $dataKey) -ne [string]$manifest.dataKeySha256) { throw "Manager pending data.key hash validation failed." }
-                $backupResult = Read-CpaStackJson -Path (Join-Path $backupPath "sqlite-backup.json")
+                Assert-RecoveryPathEquals -Actual ([string]$manifest.sourceRuntime) -Expected $canonicalManagerRuntime -Description 'Manager rollback manifest sourceRuntime'
+                Assert-RecoveryPathEquals -Actual ([string]$manifest.sourceData) -Expected $canonicalManagerData -Description 'Manager rollback manifest sourceData'
+                $stableBackupResult = Read-StableRecoveryJson -Path (Join-Path $backupPath 'sqlite-backup.json') -Description 'Recovery SQLite backup result'
+                $backupResult = $stableBackupResult.Value
                 if (-not $backupResult.success) { throw "Manager pending SQLite backup did not complete successfully." }
+                $dataTreeSha256 = [string](Get-CpaStackTreeManifest -Root (Join-Path $backupPath 'data')).sha256
+                $dataKeySha256 = [string]$manifest.dataKeySha256
+                $sqliteBackupDescriptor = $stableBackupResult.Descriptor
+            }
+            $backupDescriptor = [pscustomobject]@{
+                Root = [System.IO.Path]::GetFullPath($backupPath)
+                Manifest = $stableManifest.Descriptor
+                RuntimeTreeSha256 = $runtimeTreeSha256
+                ExecutablePath = [System.IO.Path]::GetFullPath($exe)
+                ExecutableSha256 = ([string]$manifest.executableSha256).ToUpperInvariant()
+                DataTreeSha256 = $dataTreeSha256
+                DataKeyPath = if ($null -eq $dataKey) { $null } else { [System.IO.Path]::GetFullPath($dataKey) }
+                DataKeySha256 = if ($null -eq $dataKeySha256) { $null } else { $dataKeySha256.ToUpperInvariant() }
+                SqliteBackupResult = $sqliteBackupDescriptor
             }
             return [pscustomobject]@{
                 Journal = $journal
                 Backup = Get-Item -LiteralPath $backupPath
                 BackupLocation = $backupLocation
                 DestinationPath = $destinationPath
+                Disposition = $disposition
                 ManagerSnapshot = if ($ExpectedOperation -eq 'switch-manager') { $backupResult } else { $null }
+                JournalDescriptor = $journalDescriptor
+                PreviousJournalDescriptor = $previousJournalDescriptor
+                BackupDescriptor = $backupDescriptor
                 ValidationError = $null
             }
         } catch {
-            if ($backupLocation -eq 'pending') { Quarantine-PendingPath -Path $pendingPath }
-            return [pscustomobject]@{ Journal = $journal; Backup = $null; BackupLocation = 'none'; DestinationPath = $destinationPath; ValidationError = $_.Exception.Message }
+            return [pscustomobject]@{
+                Journal = $journal
+                Backup = $null
+                BackupLocation = 'none'
+                DestinationPath = $destinationPath
+                Disposition = $disposition
+                JournalDescriptor = $journalDescriptor
+                PreviousJournalDescriptor = $previousJournalDescriptor
+                BackupDescriptor = $null
+                ValidationError = $_.Exception.Message
+            }
         }
     }
 
-    try {
-        $cpaRecovery = Read-ValidatedPending -JournalPath $cpaJournalPath -ExpectedOperation "switch-cpa"
-        $managerRecovery = Read-ValidatedPending -JournalPath $managerJournalPath -ExpectedOperation "switch-manager"
-    } catch {
-        if (Test-Path -LiteralPath $cpaJournalPath -PathType Leaf) {
-            [void](Stop-CpaStackProcessesByExecutablePath -ExpectedPath (Join-Path $CpaRuntime 'cli-proxy-api.exe'))
-        }
-        if (Test-Path -LiteralPath $managerJournalPath -PathType Leaf) {
-            [void](Stop-CpaStackProcessesByExecutablePath -ExpectedPath (Join-Path $ManagerRuntime 'cpa-manager-plus.exe'))
-        }
-        throw
-    }
-    $referencedPending = @()
-    if ($cpaRecovery -and $cpaRecovery.BackupLocation -eq 'pending') { $referencedPending += $cpaRecovery.Backup.FullName }
-    if ($managerRecovery -and $managerRecovery.BackupLocation -eq 'pending') { $referencedPending += $managerRecovery.Backup.FullName }
-
-    foreach ($orphan in Get-ChildItem -Force -LiteralPath $rollbackRoot -Directory -Filter "pending-*" -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^pending-(cpa|manager)-[0-9a-fA-F]{32}$' }) {
-        if ($referencedPending -notcontains $orphan.FullName) { Quarantine-PendingPath -Path $orphan.FullName }
-    }
-
-    if (-not $cpaRecovery -and -not $managerRecovery -and $Preflight.Cpa.Healthy -and $Preflight.Manager.Healthy) {
-        return
-    }
-
-    $recordedState = Read-CpaStackJson -Path $currentStatePath
-    function Get-RecoveryDisposition {
-        param($Recovery, [ValidateSet('cpa', 'manager')][string]$Component, [string]$Runtime)
-        if (-not $Recovery) { return 'none' }
-        $componentState = $recordedState.PSObject.Properties[$Component]
-        if ($null -eq $componentState -or $null -eq $componentState.Value.PSObject.Properties['sha256']) {
-            throw "Current state is missing the recorded $Component hash required for recovery."
-        }
-        $exeName = if ($Component -eq 'cpa') { 'cli-proxy-api.exe' } else { 'cpa-manager-plus.exe' }
-        $activeHash = Get-CpaStackFileHash -Path (Join-Path $Runtime $exeName)
-        if (-not $activeHash) { throw "$Component runtime executable is missing during recovery." }
-        return Resolve-CpaStackSwitchDisposition `
-            -RecordedHash ([string]$componentState.Value.sha256) `
-            -ActiveHash $activeHash `
-            -OldHash ([string]$Recovery.Journal.oldHash) `
-            -NewHash ([string]$Recovery.Journal.newHash)
-    }
-
-    $cpaDisposition = Get-RecoveryDisposition -Recovery $cpaRecovery -Component cpa -Runtime $CpaRuntime
-    $managerDisposition = Get-RecoveryDisposition -Recovery $managerRecovery -Component manager -Runtime $ManagerRuntime
+    $cpaRecovery = Read-ValidatedPending -JournalPath $cpaJournalPath -ExpectedOperation "switch-cpa"
+    $managerRecovery = Read-ValidatedPending -JournalPath $managerJournalPath -ExpectedOperation "switch-manager"
     foreach ($recovery in @($cpaRecovery, $managerRecovery)) {
         if ($recovery -and -not [string]::IsNullOrWhiteSpace([string]$recovery.ValidationError)) {
             throw "A switch recovery backup failed validation: $($recovery.ValidationError)"
         }
     }
 
+    $cpaDisposition = if ($cpaRecovery) { [string]$cpaRecovery.Disposition } else { 'none' }
+    $managerDisposition = if ($managerRecovery) { [string]$managerRecovery.Disposition } else { 'none' }
+    if ($cpaRecovery -and $cpaDisposition -notin @('restore-old', 'commit-new')) {
+        throw 'CPA switch recovery disposition is invalid.'
+    }
+    if ($managerRecovery -and $managerDisposition -notin @('restore-old', 'commit-new')) {
+        throw 'Manager switch recovery disposition is invalid.'
+    }
+
+    $referencedPending = @()
+    if ($cpaRecovery -and $cpaRecovery.BackupLocation -eq 'pending') { $referencedPending += $cpaRecovery.Backup.FullName }
+    if ($managerRecovery -and $managerRecovery.BackupLocation -eq 'pending') { $referencedPending += $managerRecovery.Backup.FullName }
+
+    $unreferencedPending = @(Get-ChildItem -Force -LiteralPath $rollbackRoot -Directory -Filter "pending-*" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^pending-(cpa|manager)-[0-9a-fA-F]{32}$' -and $referencedPending -inotcontains $_.FullName })
+    if ($unreferencedPending.Count -gt 0) {
+        throw "Unreferenced rollback pending artifacts require manual recovery: $(@($unreferencedPending.FullName) -join ', ')"
+    }
+    Assert-RecoveryDescriptors -Recovery $cpaRecovery -IncludeBackup
+    Assert-RecoveryDescriptors -Recovery $managerRecovery -IncludeBackup
+    if ($hasRecoveryArtifact) { $script:suppressResultPersistence = $false }
+
+    if (-not $cpaRecovery -and -not $managerRecovery -and $Preflight.Cpa.Healthy -and $Preflight.Manager.Healthy) {
+        return
+    }
+
     if ($cpaRecovery) {
         if ($cpaRecovery.Backup) {
             Assert-CpaStackProjectedTreePathBudget -Source (Join-Path $cpaRecovery.Backup.FullName 'runtime') -Destination $CpaRuntime
         }
+        Assert-RecoveryDescriptors -Recovery $cpaRecovery -IncludeBackup
         [void](Stop-CpaStackProcessesByExecutablePath -ExpectedPath (Join-Path $CpaRuntime 'cli-proxy-api.exe'))
     }
     if ($managerRecovery) {
@@ -574,6 +1128,7 @@ function Restore-CanonicalInterruptedState {
             Assert-CpaStackProjectedTreePathBudget -Source (Join-Path $managerRecovery.Backup.FullName 'runtime') -Destination $ManagerRuntime
             Assert-CpaStackProjectedTreePathBudget -Source (Join-Path $managerRecovery.Backup.FullName 'data') -Destination $ManagerData
         }
+        Assert-RecoveryDescriptors -Recovery $managerRecovery -IncludeBackup
         [void](Stop-CpaStackProcessesByExecutablePath -ExpectedPath (Join-Path $ManagerRuntime 'cpa-manager-plus.exe'))
     }
 
@@ -582,14 +1137,16 @@ function Restore-CanonicalInterruptedState {
             throw "Manager must be rolled back, but its validated backup is unavailable. $($managerRecovery.ValidationError)"
         }
         if ($managerRecovery.Backup) {
-            $listener = Get-CpaStackListener -Port 18317
+            Assert-RecoveryDescriptors -Recovery $managerRecovery -IncludeBackup
+            $listener = Get-CpaStackListener -Port $managerFormalPort
             $expectedExe = Join-Path $ManagerRuntime "cpa-manager-plus.exe"
-            if ($listener -and $listener.ExecutablePath -ine $expectedExe) { throw "Unexpected process owns 18317 during recovery." }
+            if ($listener -and $listener.ExecutablePath -ine $expectedExe) { throw "Unexpected process owns Manager formal port $managerFormalPort during recovery." }
             if ($listener) {
                 $listenerProcess = Get-CpaStackFixedListenerProcess -Listener $listener -ExpectedPath $expectedExe
-                try { Stop-CpaStackPort -Port 18317 -ExpectedPath $expectedExe -ExpectedProcess $listenerProcess -RequireExecutableWriteAccess }
+                try { Stop-CpaStackPort -Port $managerFormalPort -ExpectedPath $expectedExe -ExpectedProcess $listenerProcess -RequireExecutableWriteAccess }
                 finally { if ($listenerProcess -is [System.IDisposable]) { $listenerProcess.Dispose() } }
             }
+            Assert-RecoveryDescriptors -Recovery $managerRecovery -IncludeBackup
             $pendingManager = $managerRecovery.Backup
             if (Test-Path -LiteralPath $ManagerRuntime -PathType Container) {
                 foreach ($item in Get-ChildItem -Force -LiteralPath $ManagerRuntime) {
@@ -632,14 +1189,16 @@ function Restore-CanonicalInterruptedState {
             throw "CPA must be rolled back, but its validated backup is unavailable. $($cpaRecovery.ValidationError)"
         }
         if ($cpaRecovery.Backup) {
-            $listener = Get-CpaStackListener -Port 8317
+            Assert-RecoveryDescriptors -Recovery $cpaRecovery -IncludeBackup
+            $listener = Get-CpaStackListener -Port $cpaFormalPort
             $expectedExe = Join-Path $CpaRuntime "cli-proxy-api.exe"
-            if ($listener -and $listener.ExecutablePath -ine $expectedExe) { throw "Unexpected process owns 8317 during recovery." }
+            if ($listener -and $listener.ExecutablePath -ine $expectedExe) { throw "Unexpected process owns CPA formal port $cpaFormalPort during recovery." }
             if ($listener) {
                 $listenerProcess = Get-CpaStackFixedListenerProcess -Listener $listener -ExpectedPath $expectedExe
-                try { Stop-CpaStackPort -Port 8317 -ExpectedPath $expectedExe -ExpectedProcess $listenerProcess -RequireExecutableWriteAccess }
+                try { Stop-CpaStackPort -Port $cpaFormalPort -ExpectedPath $expectedExe -ExpectedProcess $listenerProcess -RequireExecutableWriteAccess }
                 finally { if ($listenerProcess -is [System.IDisposable]) { $listenerProcess.Dispose() } }
             }
+            Assert-RecoveryDescriptors -Recovery $cpaRecovery -IncludeBackup
             $pendingCpa = $cpaRecovery.Backup
             if (Test-Path -LiteralPath $CpaRuntime -PathType Container) {
                 foreach ($item in Get-ChildItem -Force -LiteralPath $CpaRuntime) {
@@ -657,7 +1216,7 @@ function Restore-CanonicalInterruptedState {
     if ($cpaRecovery) {
         Protect-CpaStackPrivateDirectory -Path $CpaRuntime
         Protect-CpaStackSecretFile -Path (Join-Path $CpaRuntime 'cli-proxy-api.exe')
-        Protect-CpaStackSecretFile -Path ([string]$cpaRecovery.Journal.sourceConfig)
+        Protect-CpaStackSecretFile -Path $canonicalCpaConfig
         Protect-CpaStackPrivateTree -Root (Join-Path $CpaRuntime 'auth')
         $recoveryPlugins = Join-Path $CpaRuntime 'plugins'
         if (Test-Path -LiteralPath $recoveryPlugins) { Protect-CpaStackPrivateTree -Root $recoveryPlugins }
@@ -716,12 +1275,14 @@ function Restore-CanonicalInterruptedState {
         if ($entry.Disposition -eq 'commit-new' -and -not $entry.Recovery.Backup) {
             throw "A committed runtime has no validated last-known-good backup. $($entry.Recovery.ValidationError)"
         }
+        Assert-RecoveryDescriptors -Recovery $entry.Recovery -IncludeBackup
         if ($entry.Recovery.BackupLocation -eq 'pending' -and (Test-Path -LiteralPath $entry.Recovery.Backup.FullName)) {
             [void](Commit-CpaStackDirectorySlot -ControlRoot $ControlRoot -PendingPath $entry.Recovery.Backup.FullName -DestinationPath $entry.Recovery.DestinationPath)
         }
-        foreach ($path in @($entry.JournalPath, ($entry.JournalPath + '.previous'))) {
-            if (Test-Path -LiteralPath $path -PathType Leaf) {
-                Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+        Assert-RecoveryJournalDescriptors -Recovery $entry.Recovery
+        foreach ($descriptor in @($entry.Recovery.JournalDescriptor, $entry.Recovery.PreviousJournalDescriptor)) {
+            if ([bool]$descriptor.Exists) {
+                Remove-Item -LiteralPath ([string]$descriptor.Path) -Force -ErrorAction Stop
             }
         }
     }
@@ -730,7 +1291,20 @@ function Restore-CanonicalInterruptedState {
 try {
     $operationMutex = Enter-CpaStackOperationLock
     Assert-CpaStackPath -Path $ControlRoot
-    Protect-CpaStackPrivateDirectory -Path $ControlRoot
+    $pendingAtEntry = @(Get-ChildItem -LiteralPath $stateDir -File -Filter '*.pending.json' -ErrorAction SilentlyContinue)
+    $rollbackPendingAtEntry = @(Get-ChildItem -LiteralPath (Join-Path $ControlRoot 'rollback') -Directory -Filter 'pending-*' -ErrorAction SilentlyContinue)
+    $upgradePreviousAtEntry = Test-Path -LiteralPath ($upgradeJournalPath + '.previous') -PathType Leaf
+    if ($pendingAtEntry.Count -gt 0 -or $rollbackPendingAtEntry.Count -gt 0 -or $upgradePreviousAtEntry) {
+        $rootAcl = Get-CpaStackFileSystemAcl -Path $ControlRoot
+        if (-not (Test-CpaStackPrivateAcl -Acl $rootAcl -Directory)) {
+            throw 'Pending recovery requires an already protected canonical root; refusing to repair ACLs before journal validation.'
+        }
+    } else {
+        Protect-CpaStackPrivateDirectory -Path $ControlRoot
+    }
+    if ($upgradePreviousAtEntry -and -not (Test-Path -LiteralPath $upgradeJournalPath -PathType Leaf)) {
+        throw 'An orphan upgrade journal previous generation requires manual recovery.'
+    }
     $instanceMarker = Ensure-CpaStackInstanceMarker -ControlRoot $ControlRoot
     Assert-CpaStackPath -Path $currentStatePath -PathType Leaf
     $identityState = Read-CpaStackJson -Path $currentStatePath
@@ -761,7 +1335,8 @@ try {
     }
 
     $pendingStateFiles = @(Get-ChildItem -LiteralPath $stateDir -File -Filter '*.pending.json' -ErrorAction SilentlyContinue)
-    if ($pendingStateFiles.Count -eq 0) {
+    $pendingRollbackDirectories = @(Get-ChildItem -LiteralPath (Join-Path $ControlRoot 'rollback') -Directory -Filter 'pending-*' -ErrorAction SilentlyContinue)
+    if ($pendingStateFiles.Count -eq 0 -and $pendingRollbackDirectories.Count -eq 0) {
         Repair-CpaStackRecordedExecutableAcl -CurrentState $identityState -Stack $stack -CpaRuntime $cpaRuntime -ManagerRuntime $managerRuntime
     }
     $preflight = Invoke-ChildPowerShellJson -Script (Join-Path $PSScriptRoot "Get-CpaStackState.ps1") -Arguments @("-ControlRoot", $ControlRoot) -AllowNonZero
@@ -771,18 +1346,21 @@ try {
         Restore-CanonicalInterruptedState -CpaRuntime $cpaRuntime -ManagerRuntime $managerRuntime -ManagerData $managerData -Preflight $preflight
         if ($hasUpgradeJournal) { [void](Recover-UpgradePreparationState -CpaRuntime $cpaRuntime -ManagerRuntime $managerRuntime) }
         $result.recoveredInterruptedState = $true
-        throw "Interrupted CPA stack state was recovered. Rerun the upgrade to start a fresh transaction."
+        if (-not $RecoverOnly) { throw "Interrupted CPA stack state was recovered. Rerun the upgrade to start a fresh transaction." }
     }
-    if ($hasUpgradeJournal) {
+    elseif ($hasUpgradeJournal) {
         [void](Recover-UpgradePreparationState -CpaRuntime $cpaRuntime -ManagerRuntime $managerRuntime)
         $result.recoveredInterruptedState = $true
-        throw "Interrupted candidate validation state was recovered. Rerun the upgrade to start a fresh transaction."
+        if (-not $RecoverOnly) { throw "Interrupted candidate validation state was recovered. Rerun the upgrade to start a fresh transaction." }
     }
-    if ($preflight.InterruptedState) {
+    elseif ($preflight.InterruptedState) {
         Restore-CanonicalInterruptedState -CpaRuntime $cpaRuntime -ManagerRuntime $managerRuntime -ManagerData $managerData -Preflight $preflight
         $result.recoveredInterruptedState = $true
-        throw "Interrupted CPA stack state was recovered. Rerun the upgrade to start a fresh transaction."
+        if (-not $RecoverOnly) { throw "Interrupted CPA stack state was recovered. Rerun the upgrade to start a fresh transaction." }
     }
+    if ($RecoverOnly) {
+        $result.success = $true
+    } else {
     if (-not $preflight.OverallHealthy -or $preflight.CanonicalEstablished -eq $false) {
         throw "Canonical preflight is not healthy."
     }
@@ -790,7 +1368,6 @@ try {
     $result.launcherUpdated = [bool]$launcherSync.changed
     foreach ($path in @($cpaRuntime, $managerRuntime, $managerData)) { Assert-CpaStackPath -Path $path }
     foreach ($path in @($cpaConfig, (Join-Path $cpaRuntime "cli-proxy-api.exe"), (Join-Path $managerRuntime "cpa-manager-plus.exe"))) { Assert-CpaStackPath -Path $path -PathType Leaf }
-    Assert-UpgradeTemporaryPortsFree
     Remove-UpgradeTemporaryWork
     Remove-OrphanedRollbackStaging
 
@@ -848,7 +1425,11 @@ try {
         }
     }
     if ($cpaNeedsUpgrade -or $managerNeedsUpgrade) {
+        $cpaFormalPort = [int]$stack.Cpa.Port
         $managerFormalPort = [int]$stack.Manager.Port
+        $candidatePortPlan = New-CpaStackCandidatePortPlan -FormalPort @($cpaFormalPort, $managerFormalPort)
+        $cpaCandidatePort = [int]$candidatePortPlan.Ports.CpaCandidate
+        $managerCandidatePort = [int]$candidatePortPlan.Ports.ManagerCandidate
         $managerFormalExe = Join-Path $managerRuntime 'cpa-manager-plus.exe'
         $managerFormalListener = Get-CpaStackListener -Port $managerFormalPort
         if (-not $managerFormalListener -or $managerFormalListener.ExecutablePath -ine $managerFormalExe) {
@@ -859,13 +1440,16 @@ try {
         $formalBaseline = Get-CpaStackManagerSetupBaseline -ManagerPort $managerFormalPort -ManagerAdminKey $secrets.managerAdminKey
         [void](Wait-CpaStackTrustedListener -Port $managerFormalPort -ExpectedPath $managerFormalExe -ExpectedProcessId $managerFormalListener.ProcessId -ExpectedHash $currentManagerHash -AllowedAddresses @([string]$stack.Manager.BindAddress) -Seconds 2)
         $upgradeJournal = [pscustomobject][ordered]@{
-            schemaVersion = 1
+            schemaVersion = 3
             operation = "upgrade-candidates"
+            operationId = [guid]::NewGuid().ToString('N')
             instanceId = [string]$instanceMarker.instanceId
             phase = "prepared"
             canonicalRoot = $ControlRoot
             cpaCandidateExe = $null
             managerCandidateExe = $null
+            cpaCandidatePort = $cpaCandidatePort
+            managerCandidatePort = $managerCandidatePort
             managerBaseline = [pscustomobject][ordered]@{
                 cpaBaseUrl = [string]$formalBaseline.cpaBaseUrl
                 collectorEnabled = [bool]$formalBaseline.collectorEnabled
@@ -890,8 +1474,9 @@ try {
             "-ActiveConfig", (Join-Path $cpaCandidateRuntime "config.yaml"),
             "-ActiveRuntime", $cpaRuntime,
             "-ExpectedCandidateHash", ([string]$cpaPackage.executableSha256),
-            "-ResultPath", (Join-Path $stateDir "cpa-8318-upgrade-test.json")
-        )
+            "-ResultPath", (Join-Path $stateDir "cpa-candidate-upgrade-test.json"),
+            "-Port", ([string]$cpaCandidatePort)
+        ) -AdditionalParameters @{ FormalPort = @($cpaFormalPort, $managerFormalPort) }
     }
 
     if (-not $managerNeedsUpgrade) {
@@ -906,11 +1491,16 @@ try {
             "-FormalRuntime", $managerRuntime,
             "-FormalData", $managerData,
             "-ExpectedCandidateHash", ([string]$managerPackage.executableSha256),
-            "-ResultPath", (Join-Path $stateDir "manager-18318-upgrade-test.json")
+            "-ResultPath", (Join-Path $stateDir "manager-candidate-upgrade-test.json"),
+            "-CpaPort", ([string]$cpaFormalPort),
+            "-FormalPort", ([string]$managerFormalPort),
+            "-TempPort", ([string]$managerCandidatePort)
         )
         if ($requireV111) { $managerTestArguments += "-RequireV111Schema" }
         $result.managerCandidate = Invoke-InProcessPowerShellJson -Script (Join-Path $PSScriptRoot "Test-ManagerCandidate.ps1") -Arguments $managerTestArguments
     }
+
+    Assert-UpgradeTemporaryPortsFree -Journal $upgradeJournal
 
     Assert-UpgradeSwitchPathBudget
 
@@ -925,6 +1515,7 @@ try {
             "-SourceConfig", $cpaConfig,
             "-ExpectedCandidateHash", ([string]$cpaPackage.executableSha256),
             "-ResultPath", $cpaSwitchPath,
+            "-Port", ([string]$cpaFormalPort),
             "-DeferFinalCommit"
         )
         $result.cpa = Read-CpaStackJson -Path $cpaSwitchPath
@@ -946,6 +1537,8 @@ try {
             "-CandidatePackageRoot", $managerPackage.packageRoot,
             "-ExpectedCandidateHash", ([string]$managerPackage.executableSha256),
             "-ResultPath", $managerSwitchPath,
+            "-ManagerPort", ([string]$managerFormalPort),
+            "-CpaPort", ([string]$cpaFormalPort),
             "-DeferFinalCommit"
         )
         if ($requireV111) { $managerSwitchArguments += "-RequireV111Schema" }
@@ -983,6 +1576,7 @@ try {
     } catch {
         $result.journalCleanupWarning = $_.Exception.Message
     }
+    }
 } catch {
     $result.error = $_.Exception.Message
     $switchJournalPresent = (Test-Path -LiteralPath (Join-Path $stateDir "switch-cpa.pending.json") -PathType Leaf) -or (Test-Path -LiteralPath (Join-Path $stateDir "switch-manager.pending.json") -PathType Leaf)
@@ -1009,7 +1603,7 @@ try {
         }
     }
 } finally {
-    if (Test-Path -LiteralPath $stateDir) {
+    if ((Test-Path -LiteralPath $stateDir) -and -not $suppressResultPersistence) {
         Write-CpaStackJson -Value $result -Path $resultPath
     }
     Exit-CpaStackOperationLock -Mutex $operationMutex

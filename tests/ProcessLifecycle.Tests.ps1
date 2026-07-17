@@ -3,14 +3,63 @@ $ErrorActionPreference = 'Stop'
 
 $repo = Split-Path -Parent $PSScriptRoot
 $commonPath = Join-Path $repo 'skills\cpa-safe-upgrade\scripts\CpaStack.Common.ps1'
+$productionGuardModule = Join-Path $repo 'tools\CpaStack.ProductionGuard.psm1'
 . $commonPath
+Import-Module $productionGuardModule -Force
 
 $temp = Join-Path ([System.IO.Path]::GetTempPath()) ('cpa-process-lifecycle-' + [guid]::NewGuid().ToString('N'))
 $captureProcess = $null
 $managedProcessId = 0
+$registrationFailureProcessId = 0
+$productionGuard = $null
+
+function Start-GuardedCaptureProcess {
+    param(
+        [string]$PowerShell,
+        [string]$Arguments,
+        [string]$ReadyPath,
+        [string]$GoPath,
+        [string]$StdoutPath,
+        [string]$StderrPath
+    )
+
+    foreach ($path in @($ReadyPath, $GoPath)) {
+        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+    }
+    $process = Start-Process -FilePath $PowerShell -ArgumentList $Arguments -WindowStyle Hidden `
+        -RedirectStandardOutput $StdoutPath -RedirectStandardError $StderrPath -PassThru
+    try {
+        $deadline = (Get-Date).AddSeconds(20)
+        while (-not (Test-Path -LiteralPath $ReadyPath -PathType Leaf) -and -not $process.HasExited -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 25
+        }
+        if (-not (Test-Path -LiteralPath $ReadyPath -PathType Leaf)) {
+            throw 'Nested capture did not reach its Job Object registration gate.'
+        }
+        [void](Register-CpaStackTestProcess -Guard $productionGuard -Process $process)
+        [System.IO.File]::WriteAllText($GoPath, 'go', [System.Text.UTF8Encoding]::new($false))
+        return $process
+    } catch {
+        if (-not $process.HasExited) {
+            $process.Kill()
+            [void]$process.WaitForExit(5000)
+        }
+        $process.Dispose()
+        throw
+    }
+}
 
 try {
     New-Item -ItemType Directory -Force -Path $temp | Out-Null
+    $listenerSnapshot = @(Get-CpaStackListenerSnapshot)
+    $productionStateHome = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'CPAStack'
+    $registration = Get-CpaStackProductionRegistration -ProductionStateHome $productionStateHome
+    $productionGuard = New-CpaStackProductionGuard `
+        -ProductionRoot @($registration.Roots) `
+        -ProductionStateHome @($productionStateHome) `
+        -ProductionPort @($registration.ProtectedPorts) `
+        -ListenerSnapshot $listenerSnapshot
+    [void](Assert-CpaStackTestIsolation -Guard $productionGuard -TestRoot $temp -TestStateHome (Join-Path $temp 'state'))
 
     $expectedExecutable = Join-Path $temp 'managed-service.exe'
     Set-Content -LiteralPath $expectedExecutable -Value 'fixture' -Encoding ASCII
@@ -141,6 +190,8 @@ try {
     $outputPath = Join-Path $temp 'capture.json'
     $captureStdoutPath = Join-Path $temp 'capture.stdout.log'
     $captureStderrPath = Join-Path $temp 'capture.stderr.log'
+    $captureReadyPath = Join-Path $temp 'capture.ready'
+    $captureGoPath = Join-Path $temp 'capture.go'
 
     Set-Content -LiteralPath $managedScript -Encoding ASCII -Value @'
 param(
@@ -164,18 +215,47 @@ param(
     [string]$ManagedScript,
     [string]$CommonPath,
     [string]$PidPath,
-    [string]$OutputPath
+    [string]$OutputPath,
+    [string]$ReadyPath,
+    [string]$GoPath
 )
 $ErrorActionPreference = 'Stop'
+[System.IO.File]::WriteAllText($ReadyPath, 'ready', [System.Text.UTF8Encoding]::new($false))
+$deadline = (Get-Date).AddSeconds(20)
+while (-not (Test-Path -LiteralPath $GoPath -PathType Leaf)) {
+    if ((Get-Date) -ge $deadline) { throw 'Timed out waiting for Job Object registration.' }
+    Start-Sleep -Milliseconds 25
+}
 $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
 $output = @(& $powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $ManagedScript -CommonPath $CommonPath -PidPath $PidPath 2>&1)
 [System.IO.File]::WriteAllLines($OutputPath, @($output | ForEach-Object { [string]$_ }), [System.Text.UTF8Encoding]::new($false))
 '@
 
     $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
-    $captureArguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -ManagedScript "{1}" -CommonPath "{2}" -PidPath "{3}" -OutputPath "{4}"' -f `
-        $captureScript, $managedScript, $commonPath, $pidPath, $outputPath
-    $captureProcess = Start-Process -FilePath $powershell -ArgumentList $captureArguments -WindowStyle Hidden -RedirectStandardOutput $captureStdoutPath -RedirectStandardError $captureStderrPath -PassThru
+    $registrationFailure = $null
+    try {
+        [void](Start-CpaStackProcess `
+            -FilePath $powershell `
+            -Arguments '-NoProfile -NonInteractive -Command "Start-Sleep -Seconds 120"' `
+            -WorkingDirectory $temp `
+            -MinimalEnvironment `
+            -StartedProcessRegistration {
+                param([System.Diagnostics.Process]$Process)
+                $script:registrationFailureProcessId = [int]$Process.Id
+                throw 'Synthetic started-process registration failure.'
+            })
+    } catch {
+        $registrationFailure = $_.Exception.Message
+    }
+    Assert-True ($registrationFailureProcessId -gt 0) 'Registration failure fixture starts a fixed long-lived process before the callback fails'
+    Assert-True ($registrationFailure -match 'registration failed' -and $registrationFailure -match 'terminated') "Registration failure reports both registration and exact-process cleanup. Failure=[$registrationFailure]"
+    Assert-True ($null -eq (Get-Process -Id $registrationFailureProcessId -ErrorAction SilentlyContinue)) 'A registration callback failure kills and waits for the exact newly-started process before returning'
+    $registrationFailureProcessId = 0
+
+    $captureArguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -ManagedScript "{1}" -CommonPath "{2}" -PidPath "{3}" -OutputPath "{4}" -ReadyPath "{5}" -GoPath "{6}"' -f `
+        $captureScript, $managedScript, $commonPath, $pidPath, $outputPath, $captureReadyPath, $captureGoPath
+    $captureProcess = Start-GuardedCaptureProcess -PowerShell $powershell -Arguments $captureArguments `
+        -ReadyPath $captureReadyPath -GoPath $captureGoPath -StdoutPath $captureStdoutPath -StderrPath $captureStderrPath
 
     $pidDeadline = (Get-Date).AddSeconds(20)
     while (-not (Test-Path -LiteralPath $pidPath -PathType Leaf) -and (Get-Date) -lt $pidDeadline) {
@@ -204,7 +284,6 @@ $output = @(& $powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy By
     }
     Assert-True ($null -eq (Get-Process -Id $managedProcessId -ErrorAction SilentlyContinue)) 'A started process without a listener is stopped through its fixed process object'
     $managedProcessId = 0
-    $captureProcess.Dispose()
     $captureProcess = $null
     Remove-Item -LiteralPath $pidPath, $outputPath -Force
 
@@ -236,9 +315,10 @@ $process = Start-ManagedProcess `
         ($standalonePrefix + [Environment]::NewLine + $standaloneFunctions + [Environment]::NewLine + $standaloneSuffix),
         [System.Text.UTF8Encoding]::new($false))
 
-    $captureArguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -ManagedScript "{1}" -CommonPath "{2}" -PidPath "{3}" -OutputPath "{4}"' -f `
-        $captureScript, $standaloneManagedScript, $commonPath, $pidPath, $outputPath
-    $captureProcess = Start-Process -FilePath $powershell -ArgumentList $captureArguments -WindowStyle Hidden -RedirectStandardOutput $captureStdoutPath -RedirectStandardError $captureStderrPath -PassThru
+    $captureArguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -ManagedScript "{1}" -CommonPath "{2}" -PidPath "{3}" -OutputPath "{4}" -ReadyPath "{5}" -GoPath "{6}"' -f `
+        $captureScript, $standaloneManagedScript, $commonPath, $pidPath, $outputPath, $captureReadyPath, $captureGoPath
+    $captureProcess = Start-GuardedCaptureProcess -PowerShell $powershell -Arguments $captureArguments `
+        -ReadyPath $captureReadyPath -GoPath $captureGoPath -StdoutPath $captureStdoutPath -StderrPath $captureStderrPath
     $pidDeadline = (Get-Date).AddSeconds(20)
     while (-not (Test-Path -LiteralPath $pidPath -PathType Leaf) -and (Get-Date) -lt $pidDeadline) {
         Start-Sleep -Milliseconds 100
@@ -252,9 +332,23 @@ $process = Start-ManagedProcess `
     Assert-True ([bool]$capturedResult.success) 'The standalone launcher returns structured success'
     Assert-True ($null -ne (Get-Process -Id $managedProcessId -ErrorAction SilentlyContinue)) 'The standalone managed process outlives its completed launcher'
 } finally {
+    $guardFailure = $null
+    if ($null -ne $productionGuard) {
+        try {
+            Close-CpaStackProductionGuard -Guard $productionGuard
+            $comparison = Compare-CpaStackProductionListenerSnapshot -Guard $productionGuard
+            if (-not $comparison.Unchanged) { $guardFailure = 'Process lifecycle tests changed a protected production listener.' }
+        } catch {
+            $guardFailure = $_.Exception.Message
+        }
+    }
     if ($managedProcessId -gt 0) {
         Stop-Process -Id $managedProcessId -Force -ErrorAction SilentlyContinue
         Wait-Process -Id $managedProcessId -Timeout 5 -ErrorAction SilentlyContinue
+    }
+    if ($registrationFailureProcessId -gt 0) {
+        Stop-Process -Id $registrationFailureProcessId -Force -ErrorAction SilentlyContinue
+        Wait-Process -Id $registrationFailureProcessId -Timeout 5 -ErrorAction SilentlyContinue
     }
     if ($null -ne $captureProcess) {
         try {
@@ -269,6 +363,7 @@ $process = Start-ManagedProcess `
         }
     }
     Remove-TestPathWithRetry -Path $temp
+    if (-not [string]::IsNullOrWhiteSpace($guardFailure)) { throw $guardFailure }
 }
 
 'Process lifecycle tests passed.'

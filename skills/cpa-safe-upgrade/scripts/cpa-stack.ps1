@@ -3,7 +3,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('status', 'doctor', 'plan', 'init', 'upgrade', 'start', 'register-root')]
+    [ValidateSet('status', 'doctor', 'plan', 'init', 'migrate', 'recover', 'upgrade', 'start', 'shortcut', 'lan', 'register-root')]
     [string]$Command = 'status',
 
     [Alias('ControlRoot')]
@@ -15,6 +15,13 @@ param(
     [string]$SourceManagerData,
     [string]$LegacyStartScript,
     [string]$SecretsInputPath,
+    [string]$RequestPath,
+    [ValidateSet('Check', 'Ensure', 'Set')]
+    [string]$Action,
+    [ValidateSet('Loopback', 'Lan')]
+    [string]$Mode,
+    [string]$ShortcutPath,
+    [switch]$AdoptExisting,
     [string]$DesktopShortcut,
     [switch]$UpdateDesktopShortcut,
     [switch]$ExposeToLan,
@@ -25,112 +32,19 @@ param(
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'CpaStack.Common.ps1')
+$moduleRoot = Join-Path (Split-Path -Parent $PSScriptRoot) 'modules'
+Import-Module (Join-Path $moduleRoot 'CpaStack.Inspection.psm1') -Force
+Import-Module (Join-Path $moduleRoot 'CpaStack.UpgradeTransaction.psm1') -Force
+Import-Module (Join-Path $moduleRoot 'CpaStack.MigrationTransaction.psm1') -Force
+Import-Module (Join-Path $moduleRoot 'CpaStack.Recovery.psm1') -Force
+Import-Module (Join-Path $moduleRoot 'CpaStack.Launcher.psm1') -Force
+Import-Module (Join-Path $moduleRoot 'CpaStack.LanConfiguration.psm1') -Force
+Import-Module (Join-Path $moduleRoot 'CpaStack.ManagedShortcut.psm1') -Force -Global
+Import-Module (Join-Path $moduleRoot 'CpaStack.Result.psm1') -Force -Global
+Import-Module (Join-Path $moduleRoot 'CpaStack.BundledHost.psm1') -Force -Global
 
 $resolvedRoot = $null
 $updaterVersion = Get-CpaStackUpdaterVersion
-
-function Get-JsonPropertyValue {
-    param(
-        $Object,
-        [string]$Name
-    )
-
-    if ($null -eq $Object) {
-        return $null
-    }
-
-    $property = $Object.PSObject.Properties[$Name]
-    if ($null -eq $property) {
-        return $null
-    }
-
-    return $property.Value
-}
-
-function Get-PublicCommandError {
-    param($Json, [int]$ExitCode, [string]$Operation)
-
-    $errorValue = Get-JsonPropertyValue -Object $Json -Name 'error'
-    if ($null -ne $errorValue) { return $errorValue }
-    if ($ExitCode -ne 0) {
-        return [ordered]@{
-            code = ($Operation + 'Failed')
-            message = "$Operation failed with exit code $ExitCode."
-        }
-    }
-    return $null
-}
-
-function Invoke-BundledScript {
-    param(
-        [Parameter(Mandatory = $true)][string]$Name,
-        [string[]]$Arguments = @(),
-        [switch]$AllowNonZero
-    )
-
-    $script = Join-Path $PSScriptRoot $Name
-    if (-not (Test-Path -LiteralPath $script -PathType Leaf)) {
-        throw "Bundled script is missing: $script"
-    }
-    $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
-    $previousModulePath = $env:PSModulePath
-    try {
-        $env:PSModulePath = Get-CpaStackWindowsPowerShellModulePath
-        $output = @(& $powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $script @Arguments 2>&1)
-        $exitCode = $LASTEXITCODE
-    } finally {
-        $env:PSModulePath = $previousModulePath
-    }
-    $json = $null
-    $combined = @($output | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
-    try { $json = $combined | ConvertFrom-Json } catch {}
-    foreach ($line in @($output | ForEach-Object { [string]$_ })) {
-        if ($json) { break }
-        $candidate = $line.Trim()
-        if ($candidate.StartsWith('{') -and $candidate.EndsWith('}')) {
-            try { $json = $candidate | ConvertFrom-Json } catch {}
-        }
-    }
-    if ($exitCode -ne 0 -and -not $AllowNonZero) {
-        $errorValue = Get-JsonPropertyValue -Object $json -Name 'Error'
-        $errorMessage = Get-JsonPropertyValue -Object $errorValue -Name 'Message'
-        $message = if ([string]::IsNullOrWhiteSpace([string]$errorMessage)) { $combined } else { [string]$errorMessage }
-        throw "${Name} failed with exit code ${exitCode}: $message"
-    }
-    return [pscustomobject]@{
-        ExitCode = $exitCode
-        Json = $json
-        Output = @($output | ForEach-Object { [string]$_ })
-    }
-}
-
-function Get-StatusResult {
-    $result = Invoke-BundledScript -Name 'Get-CpaStackState.ps1' -Arguments @('-ControlRoot', $resolvedRoot) -AllowNonZero
-    if (-not $result.Json) {
-        throw 'Status command did not return a JSON document.'
-    }
-    return $result.Json
-}
-
-function Get-InitArguments {
-    $arguments = @('-ControlRoot', $resolvedRoot)
-    foreach ($pair in @(
-        @('SourceCpaRuntime', $SourceCpaRuntime),
-        @('SourceCpaConfig', $SourceCpaConfig),
-        @('SourceManagerRuntime', $SourceManagerRuntime),
-        @('SourceManagerData', $SourceManagerData),
-        @('LegacyStartScript', $LegacyStartScript),
-        @('SecretsInputPath', $SecretsInputPath),
-        @('DesktopShortcut', $DesktopShortcut)
-    )) {
-        if (-not [string]::IsNullOrWhiteSpace([string]$pair[1])) {
-            $arguments += @('-' + [string]$pair[0], [string]$pair[1])
-        }
-    }
-    if ($UpdateDesktopShortcut) { $arguments += '-UpdateDesktopShortcut' }
-    if ($ExposeToLan) { $arguments += '-ExposeToLan' }
-    return $arguments
-}
 
 function Write-CommandResult {
     param($Value)
@@ -147,6 +61,43 @@ function Write-CommandResult {
     }
 }
 
+$commonParameterNames = @(
+    'Command', 'Root', 'Json',
+    'Verbose', 'Debug', 'ErrorAction', 'WarningAction', 'InformationAction',
+    'ErrorVariable', 'WarningVariable', 'InformationVariable',
+    'OutVariable', 'OutBuffer', 'PipelineVariable', 'ProgressAction'
+)
+$commandParameterNames = switch ($Command) {
+    { $_ -in @('status', 'doctor', 'plan', 'recover', 'register-root') } { @(); break }
+    'init' {
+        @('SourceCpaRuntime', 'SourceCpaConfig', 'SourceManagerRuntime', 'SourceManagerData',
+            'LegacyStartScript', 'SecretsInputPath', 'RequestPath', 'DesktopShortcut',
+            'UpdateDesktopShortcut', 'ExposeToLan')
+        break
+    }
+    'migrate' { @('RequestPath'); break }
+    'upgrade' {
+        @('SourceCpaRuntime', 'SourceCpaConfig', 'SourceManagerRuntime', 'SourceManagerData',
+            'LegacyStartScript', 'SecretsInputPath', 'DesktopShortcut', 'UpdateDesktopShortcut',
+            'ExposeToLan', 'AllowUnknownVersionReplacement')
+        break
+    }
+    'start' { @('NoBrowser'); break }
+    'shortcut' { @('Action', 'ShortcutPath', 'AdoptExisting'); break }
+    'lan' { @('Action', 'Mode'); break }
+}
+$allowedParameterNames = @($commonParameterNames) + @($commandParameterNames)
+$unsupportedParameterNames = @($PSBoundParameters.Keys | Where-Object { [string]$_ -notin $allowedParameterNames })
+if ($unsupportedParameterNames.Count -gt 0) {
+    $unsupportedRoot = if ([string]::IsNullOrWhiteSpace($Root)) { '<unresolved>' } else { [string]$Root }
+    $unsupportedResult = New-CpaStackResult -Operation $(if ($Command -in @('doctor', 'plan')) { 'status' } elseif ($Command -eq 'init') { 'migrate' } else { $Command }) `
+        -Success $false -Outcome Blocked -Changed $false -Root $unsupportedRoot `
+        -Error (New-CpaStackError -Code 'UnsupportedCommandParameter' `
+            -Message ("Command '$Command' does not accept: " + (($unsupportedParameterNames | Sort-Object) -join ', ')))
+    Write-CommandResult -Value $unsupportedResult
+    exit 1
+}
+
 try {
     $resolvedRoot = Resolve-CpaStackControlRoot -RequestedRoot $Root
     $targetDrive = [System.IO.Path]::GetPathRoot($resolvedRoot)
@@ -154,251 +105,191 @@ try {
         throw [System.IO.DriveNotFoundException]::new("Target drive does not exist: $targetDrive Choose an existing local NTFS/ReFS drive or mount it before retrying.")
     }
     $resolvedRoot = Assert-CpaStackSecureLocalRoot -Path $resolvedRoot
-    switch ($Command) {
-        { $_ -in @('status', 'doctor') } {
-            $state = Get-StatusResult
-            $stateError = Get-JsonPropertyValue -Object $state -Name 'Error'
-            $statusResult = [ordered]@{
-                schemaVersion = 1
-                command = $Command
-                success = [bool]$state.OverallHealthy
-                changed = $false
-                root = $resolvedRoot
-                state = $state
-                warnings = @()
-                error = $stateError
-            }
-            Write-CommandResult -Value $statusResult
-            if (-not $statusResult.success) { exit 1 }
-            break
+
+    # v0.1 command names remain as explicit v2 compatibility mappings for one release.
+    $hostAdapter = New-CpaStackBundledHost -ScriptsRoot $PSScriptRoot
+    if ($Command -in @('status', 'doctor', 'plan')) {
+        $compatibilityWarnings = @()
+        if ($Command -ne 'status') {
+            $compatibilityWarnings += "Command '$Command' is deprecated in v0.2.0; use 'status'. It will be removed in v0.3.0."
         }
-        'plan' {
-            $state = Get-StatusResult
-            $stateError = Get-JsonPropertyValue -Object $state -Name 'Error'
-            if ($stateError) {
-                $stateErrorMessage = Get-JsonPropertyValue -Object $stateError -Name 'Message'
-                if ([string]::IsNullOrWhiteSpace([string]$stateErrorMessage)) {
-                    throw 'Status failed.'
+        $inspection = Invoke-CpaStackInspection -Root $resolvedRoot -HostAdapter $hostAdapter -Operation status -Warnings $compatibilityWarnings
+        if ($Command -ne 'status') {
+            $inspection['deprecatedCommand'] = $Command
+        }
+        Write-CommandResult -Value $inspection
+        if (-not [bool]$inspection.success) { exit 1 }
+        exit 0
+    }
+    if ($Command -eq 'init') {
+        if ($UpdateDesktopShortcut -or $ExposeToLan -or -not [string]::IsNullOrWhiteSpace($DesktopShortcut)) {
+            $legacySplit = New-CpaStackResult -Operation migrate -Success $false -Outcome Blocked -Changed $false -Root $resolvedRoot `
+                -Warnings @("Command 'init' is deprecated in v0.2.0; use 'migrate'. It will be removed in v0.3.0.") `
+                -Error (New-CpaStackError -Code 'OperationSplitRequired' -Message 'Shortcut and LAN changes must use their explicit v2 operations.') `
+                -Extensions ([ordered]@{ deprecatedCommand = 'init' })
+            Write-CommandResult -Value $legacySplit
+            exit 1
+        }
+        $legacyRequestPath = $null
+        try {
+            if (-not [string]::IsNullOrWhiteSpace($RequestPath)) {
+                $legacyRequestPath = $RequestPath
+            } elseif (@($SourceCpaRuntime, $SourceCpaConfig, $SourceManagerRuntime, $SourceManagerData) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }) {
+                foreach ($required in @(
+                    [pscustomobject]@{ Name = 'SourceCpaRuntime'; Value = $SourceCpaRuntime },
+                    [pscustomobject]@{ Name = 'SourceCpaConfig'; Value = $SourceCpaConfig },
+                    [pscustomobject]@{ Name = 'SourceManagerRuntime'; Value = $SourceManagerRuntime },
+                    [pscustomobject]@{ Name = 'SourceManagerData'; Value = $SourceManagerData }
+                )) {
+                    if ([string]::IsNullOrWhiteSpace([string]$required.Value)) {
+                        throw "Deprecated init requires a complete explicit source. Missing=$($required.Name)"
+                    }
                 }
-                throw "Status failed: $stateErrorMessage"
-            }
-            $actions = @()
-            if ($state.InterruptedState) { $actions += 'recover-interrupted-operation' }
-            $legacyAdoptionRequired = [bool](Get-JsonPropertyValue -Object $state -Name 'LegacyCanonicalAdoptionRequired')
-            if ($legacyAdoptionRequired) {
-                $actions += 'adopt-legacy-canonical-stack'
-            } elseif ($state.MigrationRequired) {
-                $actions += 'initialize-canonical-stack'
-            }
-            if ($state.CanonicalEstablished -and -not $state.InterruptedState) { $actions += 'check-and-upgrade-official-releases' }
-            Write-CommandResult -Value ([ordered]@{
-                schemaVersion = 1
-                command = 'plan'
-                success = $true
-                changed = $false
-                root = $resolvedRoot
-                actions = $actions
-                state = $state
-                warnings = @('Plan is read-only. No service, file, shortcut, or setting was changed.')
-                error = $null
-            })
-            break
-        }
-        'register-root' {
-            $registerLock = $null
-            try {
-                $registerLock = Enter-CpaStackOperationLock -TimeoutSeconds 2
-                $rootToRegister = Assert-CpaStackSecureLocalRoot -Path $resolvedRoot
-                Set-CpaStackRegisteredRoot -ControlRoot $rootToRegister
-            } finally {
-                Exit-CpaStackOperationLock -Mutex $registerLock
-            }
-            Write-CommandResult -Value ([ordered]@{
-                schemaVersion = 1
-                command = 'register-root'
-                success = $true
-                changed = $true
-                root = $rootToRegister
-                warnings = @()
-                error = $null
-            })
-            break
-        }
-        'init' {
-            $init = Invoke-BundledScript -Name 'Initialize-CpaStack.ps1' -Arguments (Get-InitArguments) -AllowNonZero
-            if (-not $init.Json) { throw 'Initialization returned no JSON result.' }
-            $initSuccess = ($init.ExitCode -eq 0 -and [bool](Get-JsonPropertyValue -Object $init.Json -Name 'success'))
-            Write-CommandResult -Value ([ordered]@{
-                schemaVersion = 1
-                command = 'init'
-                success = $initSuccess
-                changed = $initSuccess
-                rolledBack = [bool](Get-JsonPropertyValue -Object $init.Json -Name 'rolledBack')
-                root = $resolvedRoot
-                initialization = $init.Json
-                warnings = @((Get-JsonPropertyValue -Object $init.Json -Name 'journalCleanupWarning') | Where-Object { $_ })
-                error = Get-PublicCommandError -Json $init.Json -ExitCode $init.ExitCode -Operation 'Initialization'
-            })
-            if (-not $initSuccess) { exit 1 }
-            break
-        }
-        'upgrade' {
-            $state = Get-StatusResult
-            $initialization = $null
-            $adoption = $null
-            $adoptPendingPath = Join-Path $resolvedRoot 'state\adopt.pending.json'
-            Assert-CpaStackChildPath -Root $resolvedRoot -Path $adoptPendingPath
-            $hasAdoptPending = Test-Path -LiteralPath $adoptPendingPath -PathType Leaf
-            $legacyAdoptionRequired = [bool](Get-JsonPropertyValue -Object $state -Name 'LegacyCanonicalAdoptionRequired') -or $hasAdoptPending
-            if ($legacyAdoptionRequired) {
-                $adopt = Invoke-BundledScript -Name 'Adopt-CpaStackLegacyCanonical.ps1' -Arguments @('-ControlRoot', $resolvedRoot) -AllowNonZero
-                if (-not $adopt.Json) { throw 'Legacy canonical adoption returned no JSON result.' }
-                $adoption = $adopt.Json
-                $adoptionSuccess = ($adopt.ExitCode -eq 0 -and [bool](Get-JsonPropertyValue -Object $adoption -Name 'success'))
-                if (-not $adoptionSuccess) {
-                    Write-CommandResult -Value ([ordered]@{
-                        schemaVersion = 1
-                        command = 'upgrade'
-                        success = $false
-                        changed = [bool](Get-JsonPropertyValue -Object $adoption -Name 'changed')
-                        rolledBack = $false
-                        root = $resolvedRoot
-                        adoption = $adoption
-                        initialization = $null
-                        upgrade = $null
-                        warnings = @((Get-JsonPropertyValue -Object $adoption -Name 'journalCleanupWarning') | Where-Object { $_ })
-                        error = Get-PublicCommandError -Json $adoption -ExitCode $adopt.ExitCode -Operation 'Legacy canonical adoption'
-                    })
-                    exit 1
+                $legacyRequestPath = Join-Path ([System.IO.Path]::GetTempPath()) ('cpa-migrate-compat-' + [guid]::NewGuid().ToString('N') + '.json')
+                $legacyRequest = [ordered]@{
+                    schemaVersion = 1
+                    sourceMode = 'Explicit'
+                    source = [ordered]@{
+                        cpaRuntime = $SourceCpaRuntime
+                        cpaConfig = $SourceCpaConfig
+                        managerRuntime = $SourceManagerRuntime
+                        managerData = $SourceManagerData
+                        legacyStartScript = $LegacyStartScript
+                    }
+                    secretsInputPath = $SecretsInputPath
                 }
-                $state = Get-StatusResult
-            }
-            $initializePendingPath = Join-Path $resolvedRoot 'state\initialize.pending.json'
-            Assert-CpaStackChildPath -Root $resolvedRoot -Path $initializePendingPath
-            $hasInitializePending = Test-Path -LiteralPath $initializePendingPath -PathType Leaf
-            $migrationRequired = [bool](Get-JsonPropertyValue -Object $state -Name 'MigrationRequired')
-            $stateHealthy = [bool](Get-JsonPropertyValue -Object $state -Name 'OverallHealthy')
-            if ($migrationRequired -or $hasInitializePending) {
-                if (-not $stateHealthy -and -not $hasInitializePending) {
-                    throw 'The existing CPA stack is not healthy enough to migrate. Run status and fix the reported checks first.'
+                [System.IO.File]::WriteAllText($legacyRequestPath, ($legacyRequest | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
+            } elseif (-not [string]::IsNullOrWhiteSpace($SecretsInputPath)) {
+                $legacyRequestPath = Join-Path ([System.IO.Path]::GetTempPath()) ('cpa-migrate-compat-' + [guid]::NewGuid().ToString('N') + '.json')
+                $legacyRequest = [ordered]@{
+                    schemaVersion = 1
+                    sourceMode = 'Auto'
+                    source = $null
+                    secretsInputPath = $SecretsInputPath
+                    ports = $null
                 }
-                $init = Invoke-BundledScript -Name 'Initialize-CpaStack.ps1' -Arguments (Get-InitArguments) -AllowNonZero
-                if (-not $init.Json) { throw 'Initialization returned no JSON result.' }
-                $initialization = $init.Json
-                $initSuccess = ($init.ExitCode -eq 0 -and [bool](Get-JsonPropertyValue -Object $initialization -Name 'success'))
-                if (-not $initSuccess) {
-                    Write-CommandResult -Value ([ordered]@{
-                        schemaVersion = 1
-                        command = 'upgrade'
-                        success = $false
-                        changed = $false
-                        rolledBack = [bool](Get-JsonPropertyValue -Object $initialization -Name 'rolledBack')
-                        root = $resolvedRoot
-                        adoption = $adoption
-                        initialization = $initialization
-                        upgrade = $null
-                        warnings = @((Get-JsonPropertyValue -Object $initialization -Name 'journalCleanupWarning') | Where-Object { $_ })
-                        error = Get-PublicCommandError -Json $initialization -ExitCode $init.ExitCode -Operation 'Initialization'
-                    })
-                    exit 1
-                }
-                $state = Get-StatusResult
+                [System.IO.File]::WriteAllText($legacyRequestPath, ($legacyRequest | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
             }
-            $upgradeArguments = @('-ControlRoot', $resolvedRoot)
-            if ($AllowUnknownVersionReplacement) { $upgradeArguments += '-AllowUnknownVersionReplacement' }
-            $upgrade = Invoke-BundledScript -Name 'Invoke-CpaStackUpgrade.ps1' -Arguments $upgradeArguments -AllowNonZero
-            if (-not $upgrade.Json) { throw 'Upgrade returned no JSON result.' }
-            $upgradeCpa = Get-JsonPropertyValue -Object $upgrade.Json -Name 'cpa'
-            $upgradeManager = Get-JsonPropertyValue -Object $upgrade.Json -Name 'manager'
-            $cpaSkipped = [bool](Get-JsonPropertyValue -Object $upgradeCpa -Name 'skipped')
-            $managerSkipped = [bool](Get-JsonPropertyValue -Object $upgradeManager -Name 'skipped')
-            $cpaRolledBack = [bool](Get-JsonPropertyValue -Object $upgradeCpa -Name 'rolledBack')
-            $managerRolledBack = [bool](Get-JsonPropertyValue -Object $upgradeManager -Name 'rolledBack')
-            $cleanupWarning = Get-JsonPropertyValue -Object $upgrade.Json -Name 'cleanupWarning'
-            $journalCleanupWarning = Get-JsonPropertyValue -Object $upgrade.Json -Name 'journalCleanupWarning'
-            $adoptionCleanupWarning = Get-JsonPropertyValue -Object $adoption -Name 'journalCleanupWarning'
-            $initializationCleanupWarning = Get-JsonPropertyValue -Object $initialization -Name 'journalCleanupWarning'
-            $launcherUpdated = [bool](Get-JsonPropertyValue -Object $upgrade.Json -Name 'launcherUpdated')
-            $upgradeSuccess = ($upgrade.ExitCode -eq 0 -and [bool](Get-JsonPropertyValue -Object $upgrade.Json -Name 'success'))
-            $cpaChanged = ($null -ne $upgradeCpa -and -not $cpaSkipped -and ($upgradeSuccess -or [bool](Get-JsonPropertyValue -Object $upgradeCpa -Name 'success')))
-            $managerChanged = ($null -ne $upgradeManager -and -not $managerSkipped -and ($upgradeSuccess -or [bool](Get-JsonPropertyValue -Object $upgradeManager -Name 'success')))
-            Write-CommandResult -Value ([ordered]@{
-                schemaVersion = 1
-                command = 'upgrade'
-                success = $upgradeSuccess
-                changed = [bool]($adoption -or $initialization -or $launcherUpdated -or $cpaChanged -or $managerChanged)
-                rolledBack = [bool]($cpaRolledBack -or $managerRolledBack)
-                root = $resolvedRoot
-                adoption = $adoption
-                initialization = $initialization
-                upgrade = $upgrade.Json
-                warnings = @(@($adoptionCleanupWarning, $initializationCleanupWarning, $cleanupWarning, $journalCleanupWarning) | Where-Object { $_ })
-                error = Get-PublicCommandError -Json $upgrade.Json -ExitCode $upgrade.ExitCode -Operation 'Upgrade'
-            })
-            if (-not $upgradeSuccess) { exit 1 }
-            break
-        }
-        'start' {
-            $startRoot = Assert-CpaStackSecureLocalRoot -Path $resolvedRoot
-            $marker = Ensure-CpaStackInstanceMarker -ControlRoot $startRoot
-            $canonicalStartScript = Join-Path $startRoot 'ops\Start-CPA-Stack.ps1'
-            $trustedStartScript = Join-Path $PSScriptRoot 'Start-CPA-Stack.ps1'
-            $configPath = Join-Path $startRoot 'config\stack.psd1'
-            $currentPath = Join-Path $startRoot 'state\current.json'
-            foreach ($path in @($canonicalStartScript, $configPath, $currentPath)) {
-                Assert-CpaStackChildPath -Root $startRoot -Path $path
-                Assert-CpaStackPath -Path $path -PathType Leaf
+            $legacyMigration = Invoke-CpaStackMigrationTransaction -Root $resolvedRoot -HostAdapter $hostAdapter -RequestPath $legacyRequestPath
+            $legacyMigration.warnings = @($legacyMigration.warnings) + @("Command 'init' is deprecated in v0.2.0; use 'migrate'. It will be removed in v0.3.0.")
+            $legacyMigration['deprecatedCommand'] = 'init'
+            Write-CommandResult -Value $legacyMigration
+            if (-not $legacyMigration.success) { exit 1 }
+            exit 0
+        } finally {
+            if ($legacyRequestPath -and $legacyRequestPath -ne $RequestPath -and (Test-Path -LiteralPath $legacyRequestPath)) {
+                Remove-Item -LiteralPath $legacyRequestPath -Force
             }
-            Assert-CpaStackPath -Path $trustedStartScript -PathType Leaf
-            $current = Read-CpaStackJson -Path $currentPath
-            if ([System.IO.Path]::GetFullPath([string]$current.canonicalRoot).TrimEnd('\') -ine $startRoot -or [string]$current.instanceId -ne [string]$marker.instanceId) {
-                throw 'The requested start root does not have matching canonical instance state.'
-            }
-            $arguments = @('-ConfigPath', $configPath)
-            if ($NoBrowser) { $arguments += '-NoBrowser' }
-            $start = Invoke-BundledScript -Name 'Start-CPA-Stack.ps1' -Arguments $arguments -AllowNonZero
-            if (-not $start.Json) { throw 'Start returned no JSON result.' }
-            $startSuccess = ($start.ExitCode -eq 0 -and [bool](Get-JsonPropertyValue -Object $start.Json -Name 'Success'))
-            $startCpa = Get-JsonPropertyValue -Object $start.Json -Name 'Cpa'
-            $startManager = Get-JsonPropertyValue -Object $start.Json -Name 'Manager'
-            $startChanged = $startSuccess -and (
-                [string](Get-JsonPropertyValue -Object $startCpa -Name 'Action') -eq 'Started' -or
-                [string](Get-JsonPropertyValue -Object $startManager -Name 'Action') -eq 'Started' -or
-                [string](Get-JsonPropertyValue -Object $start.Json -Name 'Browser') -eq 'Opened'
-            )
-            Write-CommandResult -Value ([ordered]@{
-                schemaVersion = 1
-                command = 'start'
-                success = $startSuccess
-                changed = [bool]$startChanged
-                root = $resolvedRoot
-                start = $start.Json
-                warnings = @()
-                error = Get-PublicCommandError -Json $start.Json -ExitCode $start.ExitCode -Operation 'Start'
-            })
-            if (-not $startSuccess) { exit 1 }
-            break
         }
     }
+    if ($Command -eq 'upgrade') {
+        $splitArguments = @(@(
+                $SourceCpaRuntime,
+                $SourceCpaConfig,
+                $SourceManagerRuntime,
+                $SourceManagerData,
+                $LegacyStartScript,
+                $SecretsInputPath,
+                $DesktopShortcut
+            ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+        if ($splitArguments.Count -gt 0 -or $UpdateDesktopShortcut -or $ExposeToLan) {
+            $splitResult = New-CpaStackResult -Operation upgrade -Success $false -Outcome Blocked -Changed $false -Root $resolvedRoot `
+                -Error (New-CpaStackError -Code 'OperationSplitRequired' -Message 'Migration, shortcut, and LAN changes must be authorized through their explicit v2 operations.')
+            Write-CommandResult -Value $splitResult
+            exit 1
+        }
+        $upgradeResult = Invoke-CpaStackUpgradeTransaction -Root $resolvedRoot -HostAdapter $hostAdapter `
+            -AllowUnknownVersionReplacement:$AllowUnknownVersionReplacement
+        Write-CommandResult -Value $upgradeResult
+        if (-not $upgradeResult.success) { exit 1 }
+        exit 0
+    }
+    if ($Command -eq 'migrate') {
+        $migrationResult = Invoke-CpaStackMigrationTransaction -Root $resolvedRoot -HostAdapter $hostAdapter -RequestPath $RequestPath
+        Write-CommandResult -Value $migrationResult
+        if (-not $migrationResult.success) { exit 1 }
+        exit 0
+    }
+    if ($Command -eq 'recover') {
+        $recoveryResult = Invoke-CpaStackRecovery -Root $resolvedRoot -HostAdapter $hostAdapter
+        Write-CommandResult -Value $recoveryResult
+        if (-not $recoveryResult.success) { exit 1 }
+        exit 0
+    }
+    if ($Command -eq 'start') {
+        $startResult = Invoke-CpaStackStartOperation -Root $resolvedRoot -HostAdapter $hostAdapter -NoBrowser:$NoBrowser
+        Write-CommandResult -Value $startResult
+        if (-not $startResult.success) { exit 1 }
+        exit 0
+    }
+    if ($Command -eq 'lan') {
+        if ($Action -ne 'Set' -or [string]::IsNullOrWhiteSpace($Mode)) {
+            $invalidLan = New-CpaStackResult -Operation lan -Success $false -Outcome Blocked -Changed $false -Root $resolvedRoot `
+                -Error (New-CpaStackError -Code 'InvalidLanRequest' -Message "LAN requires '-Action Set -Mode Loopback|Lan'.")
+            Write-CommandResult -Value $invalidLan
+            exit 1
+        }
+        $lanResult = Invoke-CpaStackLanOperation -Root $resolvedRoot -HostAdapter $hostAdapter -Action $Action -Mode $Mode
+        Write-CommandResult -Value $lanResult
+        if (-not $lanResult.success) { exit 1 }
+        exit 0
+    }
+    if ($Command -eq 'shortcut') {
+        if ($Action -notin @('Check', 'Ensure')) {
+            $invalidShortcut = New-CpaStackResult -Operation shortcut -Success $false -Outcome Blocked -Changed $false -Root $resolvedRoot `
+                -Error (New-CpaStackError -Code 'InvalidShortcutRequest' -Message "Shortcut requires '-Action Check|Ensure'.")
+            Write-CommandResult -Value $invalidShortcut
+            exit 1
+        }
+        if ([string]::IsNullOrWhiteSpace($ShortcutPath)) {
+            $shortcutName = 'CPA ' + (-join @(
+                [char]0x672C, [char]0x5730, [char]0x542F, [char]0x52A8,
+                [char]0xFF08, [char]0x65B0, [char]0x7248, [char]0xFF09
+            )) + '.lnk'
+            $ShortcutPath = Join-Path ([Environment]::GetFolderPath('Desktop')) $shortcutName
+        }
+        try {
+            $shortcutInner = Invoke-CpaStackManagedShortcut -Action $Action -Root $resolvedRoot -ShortcutPath $ShortcutPath -AdoptExisting:$AdoptExisting
+            $shortcutResult = New-CpaStackResult -Operation shortcut -Success $true -Outcome $(if ([bool]$shortcutInner.changed) { 'Changed' } else { 'NoChange' }) `
+                -Changed ([bool]$shortcutInner.changed) -Root $resolvedRoot -Extensions ([ordered]@{ shortcut = $shortcutInner })
+        } catch {
+            $shortcutCode = if ($_.Exception.Message -match '(?i)adoptable|conflict|unknown') { 'ShortcutOwnershipConflict' } else { 'ShortcutOperationFailed' }
+            $shortcutResult = New-CpaStackResult -Operation shortcut -Success $false -Outcome Blocked -Changed $false -Root $resolvedRoot `
+                -Error (New-CpaStackError -Code $shortcutCode -Message $_.Exception.Message -Type $_.Exception.GetType().FullName)
+        }
+        Write-CommandResult -Value $shortcutResult
+        if (-not $shortcutResult.success) { exit 1 }
+        exit 0
+    }
+    if ($Command -eq 'register-root') {
+        $registerLock = $null
+        try {
+            $registerLock = Enter-CpaStackOperationLock -TimeoutSeconds 2
+            Set-CpaStackRegisteredRoot -ControlRoot $resolvedRoot
+        } finally {
+            Exit-CpaStackOperationLock -Mutex $registerLock
+        }
+        $registerResult = New-CpaStackResult -Operation register-root -Success $true -Outcome Changed -Changed $true -Root $resolvedRoot `
+            -Warnings @("Command 'register-root' is deprecated in v0.2.0; install.ps1 manages root registration. It will be removed in v0.3.0.")
+        Write-CommandResult -Value $registerResult
+        exit 0
+    }
+
 } catch {
     $errorCode = switch ($_.Exception.GetType().FullName) {
         'System.IO.DriveNotFoundException' { 'TargetDriveNotFound' }
         'System.UnauthorizedAccessException' { 'AccessDenied' }
         default { 'CommandFailed' }
     }
-    Write-CommandResult -Value ([ordered]@{
-        schemaVersion = 1
-        command = $Command
-        success = $false
-        changed = $false
-        root = if ($resolvedRoot) { $resolvedRoot } else { $Root }
-        warnings = @()
-        error = [ordered]@{
-            code = $errorCode
-            type = $_.Exception.GetType().FullName
-            message = $_.Exception.Message
-        }
-    })
+    $failedOperation = switch ($Command) {
+        { $_ -in @('doctor', 'plan') } { 'status'; break }
+        'init' { 'migrate'; break }
+        default { $Command }
+    }
+    $failureRoot = if ($resolvedRoot) { [string]$resolvedRoot } elseif (-not [string]::IsNullOrWhiteSpace($Root)) { [string]$Root } else { '<unresolved>' }
+    Write-CommandResult -Value (New-CpaStackResult -Operation $failedOperation -Success $false -Outcome Blocked -Changed $false `
+        -Root $failureRoot `
+        -Error (New-CpaStackError -Code $errorCode -Type $_.Exception.GetType().FullName -Message $_.Exception.Message))
     exit 1
 }
 

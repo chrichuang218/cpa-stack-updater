@@ -11,12 +11,17 @@ param(
     [ValidatePattern('^[0-9A-Fa-f]{64}$')][string]$ExpectedTargetConfigHash,
     [string]$ExpectedTargetHost,
     [int]$Port = 8317,
+    [ValidatePattern('^[0-9A-Fa-f]{32}$')][string]$ParentOperationId,
     [switch]$DeferFinalCommit,
+    [scriptblock]$StartedProcessRegistration,
     [switch]$InProcess
 )
 
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "CpaStack.Common.ps1")
+if ($null -ne $StartedProcessRegistration -and -not $InProcess) {
+    throw '-StartedProcessRegistration is reserved for in-process callers.'
+}
 
 $sourceExe = Join-Path $SourceRuntime "cli-proxy-api.exe"
 $targetExe = Join-Path $TargetRuntime "cli-proxy-api.exe"
@@ -35,7 +40,13 @@ $fixedSourceProcess = $null
 $targetProcess = $null
 $sourceProcess = $null
 $result = [ordered]@{
+    schemaVersion = 1
+    operation  = "switch-cpa"
+    operationId = $null
+    parentOperationId = $ParentOperationId
+    instanceId = $null
     component  = "CPA"
+    port       = $Port
     success    = $false
     rolledBack = $false
     sourcePath = $sourceExe
@@ -56,7 +67,7 @@ $result = [ordered]@{
 
 function Start-CpaFormal {
     param([string]$Exe, [string]$Runtime, [string]$Config)
-    return Start-CpaStackProcess -FilePath $Exe -Arguments "-config `"$Config`"" -WorkingDirectory $Runtime -MinimalEnvironment
+    return Start-CpaStackProcess -FilePath $Exe -Arguments "-config `"$Config`"" -WorkingDirectory $Runtime -MinimalEnvironment -StartedProcessRegistration $StartedProcessRegistration
 }
 
 function Test-CpaFormal {
@@ -88,6 +99,7 @@ function Test-CpaFormal {
 
 try {
     $instanceMarker = Ensure-CpaStackInstanceMarker -ControlRoot $ControlRoot
+    $result.instanceId = [string]$instanceMarker.instanceId
     Assert-CpaStackPath -Path $SourceRuntime
     Assert-CpaStackPath -Path $sourceExe -PathType Leaf
     Assert-CpaStackPath -Path $SourceConfig -PathType Leaf
@@ -171,16 +183,21 @@ try {
         Assert-CpaStackJsonWritePathBudget -Paths @($journalPath, $ResultPath)
     }
 
+    $result.operationId = $operationId
+
     Assert-CpaStackChildPath -Root $ControlRoot -Path $journalPath
     $journal = [ordered]@{
+        schemaVersion = 1
         operation = "switch-cpa"
         operationId = $operationId
+        parentOperationId = $ParentOperationId
         instanceId = [string]$instanceMarker.instanceId
         phase = "prepared"
         createdAt = (Get-Date).ToString("o")
         sourceRuntime = $SourceRuntime
         targetRuntime = $TargetRuntime
         sourceConfig = $SourceConfig
+        port = $Port
         pendingPath = $pending
         oldHash = $result.oldHash
         newHash = $result.newHash

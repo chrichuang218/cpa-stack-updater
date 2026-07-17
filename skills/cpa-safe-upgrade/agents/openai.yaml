@@ -1,4 +1,4 @@
 interface:
   display_name: "CPA Safe Upgrade"
-  short_description: "安全迁移并自动升级 CPA 与 Manager Plus"
-  default_prompt: "使用 $cpa-safe-upgrade 发现我的 CPA 安装，并执行可回滚的安全自动升级。"
+  short_description: "安全迁移、恢复、升级 CPA Stack 与本地 Skill"
+  default_prompt: "使用 $cpa-safe-upgrade 按我明确授权的意图安全检查、迁移、恢复、升级或管理 CPA Stack。"

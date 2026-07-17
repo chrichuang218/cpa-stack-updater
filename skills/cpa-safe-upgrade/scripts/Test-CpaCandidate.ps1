@@ -6,15 +6,22 @@ param(
     [string]$ActiveRuntime,
     [Parameter(Mandatory = $true)][string]$ResultPath,
     [Parameter(Mandatory = $true)][ValidatePattern('^[0-9A-Fa-f]{64}$')][string]$ExpectedCandidateHash,
-    [int]$Port = 8318,
+    [Parameter(Mandatory = $true)][ValidateRange(1, 65535)][int]$Port,
+    [int[]]$FormalPort = @(),
+    [scriptblock]$StartedProcessRegistration,
     [switch]$InProcess
 )
 
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "CpaStack.Common.ps1")
+if ($null -ne $StartedProcessRegistration -and -not $InProcess) {
+    throw '-StartedProcessRegistration is reserved for in-process callers.'
+}
+
+[void](Assert-CpaStackCandidatePort -Port $Port -FormalPort $FormalPort)
 
 $candidateExe = Join-Path $CandidateRuntime "cli-proxy-api.exe"
-$testRoot = Join-Path $ControlRoot ("work\cpa-8318-" + [guid]::NewGuid().ToString("N"))
+$testRoot = Join-Path $ControlRoot ("work\cpa-candidate-" + [guid]::NewGuid().ToString("N"))
 $testConfig = Join-Path $testRoot "config.yaml"
 $result = [ordered]@{
     component = "CPA"
@@ -63,7 +70,7 @@ try {
     $updated = $updated.Replace($ActiveRuntime, $CandidateRuntime).Replace($ActiveRuntime.Replace('\', '/'), $CandidateRuntime.Replace('\', '/'))
     [System.IO.File]::WriteAllText($testConfig, $updated, [System.Text.UTF8Encoding]::new($false))
 
-    $process = Start-CpaStackProcess -FilePath $candidateExe -Arguments "-config `"$testConfig`"" -WorkingDirectory $CandidateRuntime -MinimalEnvironment
+    $process = Start-CpaStackProcess -FilePath $candidateExe -Arguments "-config `"$testConfig`"" -WorkingDirectory $CandidateRuntime -MinimalEnvironment -StartedProcessRegistration $StartedProcessRegistration
     [void](Wait-CpaStackTrustedListener -Port $Port -ExpectedPath $candidateExe -ExpectedProcessId $process.Id -ExpectedHash $ExpectedCandidateHash -AllowedAddresses @('127.0.0.1') -Seconds 35)
     $secrets = Get-CpaStackSecrets -ControlRoot $ControlRoot
     $managementHeaders = @{ Authorization = "Bearer $($secrets.cpaManagementKey)" }
