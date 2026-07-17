@@ -133,6 +133,15 @@ try {
     foreach ($name in @('CpaStack.Common.ps1', 'Adopt-CpaStackLegacyCanonical.ps1', 'Start-CPA-Stack.ps1')) {
         Copy-Item -LiteralPath (Join-Path $repo ('skills\cpa-safe-upgrade\scripts\' + $name)) -Destination $harness
     }
+    $harnessInstaller = Join-Path $temp 'installer'
+    New-Item -ItemType Directory -Force -Path $harnessInstaller | Out-Null
+    $bootstrapTemplatePath = Join-Path $harnessInstaller 'Start-CPA-Stack.bootstrap.ps1'
+    Copy-Item -LiteralPath (Join-Path $repo 'skills\cpa-safe-upgrade\installer\Start-CPA-Stack.bootstrap.ps1') -Destination $bootstrapTemplatePath
+    $bootstrapTemplate = [System.IO.File]::ReadAllText($bootstrapTemplatePath, [System.Text.UTF8Encoding]::new($false, $true))
+    $harnessCodexHome = Split-Path -Parent (Split-Path -Parent $temp)
+    $encodedHarnessHome = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([System.IO.Path]::GetFullPath($harnessCodexHome).TrimEnd('\')))
+    $expectedBootstrapPath = Join-Path $temp 'expected-bootstrap.ps1'
+    [System.IO.File]::WriteAllText($expectedBootstrapPath, $bootstrapTemplate.Replace('__CPA_STACK_CODEX_HOME_BASE64__', $encodedHarnessHome), [System.Text.UTF8Encoding]::new($false))
     $adoptionHarnessPath = Join-Path $harness 'Adopt-CpaStackLegacyCanonical.ps1'
     $adoptionHarnessText = [System.IO.File]::ReadAllText($adoptionHarnessPath, [System.Text.UTF8Encoding]::new($false, $true))
     Assert-Equal 3 ([regex]::Matches($adoptionHarnessText, '(?<!\d)8317(?!\d)').Count) 'Source adoption contract contains three CPA formal-port references'
@@ -255,7 +264,7 @@ exit 1
     Assert-True ([string]$marker.instanceId -match '^[0-9a-fA-F]{32}$') 'Adoption creates a valid instance id'
     Assert-Equal ([string]$marker.instanceId) ([string]$current.instanceId) 'Marker and current state share the adopted instance id'
     Assert-False (Test-Path -LiteralPath (Join-Path $root 'state\adopt.pending.json')) 'Adoption removes its pending journal after commit'
-    Assert-Equal (Get-CpaStackFileHash -Path (Join-Path $harness 'Start-CPA-Stack.ps1')) (Get-CpaStackFileHash -Path (Join-Path $root 'ops\Start-CPA-Stack.ps1')) 'Adoption refreshes the canonical launcher'
+    Assert-Equal (Get-CpaStackFileHash -Path $expectedBootstrapPath) (Get-CpaStackFileHash -Path (Join-Path $root 'ops\Start-CPA-Stack.ps1')) 'Adoption refreshes the canonical fast bootstrap'
     Assert-CpaStackPrivateTree -Root (Join-Path $root 'runtime\cli-proxy-api\plugins') -Description 'Adopted CPA plugins'
 
     Remove-Item -LiteralPath (Join-Path $root '.cpa-stack-instance.json') -Force
@@ -276,7 +285,7 @@ exit 1
     $replayedMarker = Read-CpaStackJson -Path (Join-Path $root '.cpa-stack-instance.json')
     Assert-Equal ([string]$current.instanceId) ([string]$replayedMarker.instanceId) 'Adoption replay uses the journal-bound instance id'
     Assert-False (Test-Path -LiteralPath (Join-Path $root 'state\adopt.pending.json')) 'Adoption replay removes its pending journal'
-    Assert-Equal (Get-CpaStackFileHash -Path (Join-Path $harness 'Start-CPA-Stack.ps1')) (Get-CpaStackFileHash -Path (Join-Path $root 'ops\Start-CPA-Stack.ps1')) 'Adoption replay finishes launcher synchronization'
+    Assert-Equal (Get-CpaStackFileHash -Path $expectedBootstrapPath) (Get-CpaStackFileHash -Path (Join-Path $root 'ops\Start-CPA-Stack.ps1')) 'Adoption replay finishes fast-bootstrap synchronization'
 
     $aclTarget = Join-Path $root 'ops\Start-CPA-Stack.ps1'
     $permissiveAcl = Get-CpaStackFileSystemAcl -Path $aclTarget
