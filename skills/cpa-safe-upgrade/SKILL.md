@@ -55,7 +55,13 @@ managed root 优先使用用户明确给出的 `-Root`，否则让 CLI 按 `CPA_
 
 真正的安全失败仍立即停止：updater Release 查询/校验/安装/重执行失败、歧义 journal、未知端口 owner、不可信 ACL/reparse、checksum、候选健康、磁盘/路径预算、SQLite 水位或自动回滚失败。不要吞错、伪成功或自动放宽这些门禁。
 
-用于 Windows 定时任务时直接以 `-NonInteractive` 调用同一个 `upgrade` 命令。调用本身同时授权按固定信任链更新 updater，无需逐次确认。退出码 `0` 表示 updater/runtime 升级成功或已经最新；非零表示真实失败。命令不读取 stdin、不打开浏览器；下一次调度会自动处理单一可恢复 pending。
+用于 Windows 定时任务时，通过 PowerShell 宿主以 `-NonInteractive` 调用同一个 `upgrade` 命令；`-NonInteractive` 是宿主参数，必须放在 `-File` 之前，不能传给 `cpa-stack.ps1`：
+
+```powershell
+& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $cpaCli upgrade -Json
+```
+
+调用本身同时授权按固定信任链更新 updater，无需逐次确认。退出码 `0` 表示 updater/runtime 升级成功或已经最新；非零表示真实失败。命令不读取 stdin、不打开浏览器；下一次调度会自动处理单一可恢复 pending。
 
 `start` 只启动已接管且无 pending 的栈，不会隐式恢复：
 
