@@ -50,6 +50,7 @@ Assert-False ($skill.Contains('& "$PSScriptRoot\scripts\cpa-stack.ps1"')) 'Inter
 Assert-True ($skill.Contains('$skillRoot = Split-Path -Parent')) 'SKILL.md derives an explicit skill root from its own path'
 Assert-True ($skill.Contains('$cpaCli = Join-Path $skillRoot ''scripts\cpa-stack.ps1''')) 'SKILL.md derives one stable public CLI path'
 Assert-True ([regex]::Matches($skill, [regex]::Escape('& $cpaCli')).Count -ge 8) 'Runtime examples use only the stable public CLI'
+Assert-True ($skill.Contains('& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $cpaCli upgrade -Json')) 'Scheduled upgrade passes NonInteractive to the PowerShell host before the CLI script path'
 Assert-False ($skill -match '&\s+\$cpaCli\s+(?:doctor|plan|init|register-root)\b') 'Primary Skill workflow teaches only supported commands'
 Assert-False ($skill -match '-(?:UpdateDesktopShortcut|ExposeToLan|AllowUnknownVersionReplacement|AdoptExisting)\b') 'Primary Skill workflow teaches no removed compatibility switches'
 Assert-True ($skill -match "install\.ps1'\s+-Action\s+Check" -and $skill -match "install\.ps1'\s+-Action\s+Update") 'Skill self-update is limited to explicit local installer Check and Update actions'
