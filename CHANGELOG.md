@@ -1,5 +1,10 @@
 # 更新记录
 
+## 1.1.5 - 2026-07-26
+
+- 修复自动更新默认下载闭包使用 `GetNewClosure()` 后丢失模块命令作用域，导致发现新版本时无法解析安全下载函数并以 `UpdaterReleaseValidationFailed` 停止的问题。
+- 自更新回归测试现在通过生产 `SaveRelease` host seam 使用本地发行 fixture，覆盖 PowerShell 7 与 Windows PowerShell 5.1，且不连接或占用正式端口。
+
 ## 1.1.4 - 2026-07-26
 
 - 修复 Windows 瞬时访问拒绝导致 CPA/Manager 回滚快照 staging 原子改名失败的问题；兼容 Windows PowerShell 5.1 把 sharing violation 折叠为通用 I/O 错误的行为，目录移动只在源存在且目标不存在时进行固定上限重试，路径状态不明确或持续失败时仍立即关闭门禁。

@@ -132,7 +132,7 @@ function Save-CpaStackUpdaterRelease {
         $Download = {
             param([string]$Uri, [string]$Path, [Int64]$MaximumBytes)
             Invoke-CpaStackSecureDownload -Uri $Uri -Destination $Path -MaximumBytes $MaximumBytes
-        }.GetNewClosure()
+        }
     }
     if (Test-Path -LiteralPath $Destination) {
         Remove-Item -LiteralPath $Destination -Recurse -Force

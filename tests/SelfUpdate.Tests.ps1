@@ -43,6 +43,39 @@ try {
     Assert-True (Test-Path -LiteralPath (Join-Path $prepared 'install.ps1') -PathType Leaf) 'Validated updater release exposes its local installer'
     Assert-Equal ([string]$package.version) ([System.IO.File]::ReadAllText((Join-Path $prepared 'VERSION')).Trim()) 'Validated updater release preserves its bound version'
 
+    $selfUpdateModule = Get-Module CpaStack.SelfUpdate
+    $originalSecureDownload = & $selfUpdateModule { ${function:Invoke-CpaStackSecureDownload} }
+    $fixtureAssetBytes = [System.IO.File]::ReadAllBytes($package.assetPath)
+    $fixtureChecksumsBytes = [System.IO.File]::ReadAllBytes($package.checksumsPath)
+    & $selfUpdateModule {
+        param([byte[]]$AssetBytes, [byte[]]$ChecksumsBytes)
+        $script:FixtureAssetBytes = $AssetBytes
+        $script:FixtureChecksumsBytes = $ChecksumsBytes
+        Set-Item -Path 'Function:script:Invoke-CpaStackSecureDownload' -Value {
+            param([string]$Uri, [string]$Destination, [Int64]$MaximumBytes)
+            [byte[]]$content = if ($Uri.EndsWith('/checksums.txt', [System.StringComparison]::Ordinal)) {
+                $script:FixtureChecksumsBytes
+            } else {
+                $script:FixtureAssetBytes
+            }
+            if ($content.LongLength -gt $MaximumBytes) {
+                throw 'Fixture download exceeds its advertised limit.'
+            }
+            [System.IO.File]::WriteAllBytes($Destination, $content)
+        }
+    } $fixtureAssetBytes $fixtureChecksumsBytes
+    try {
+        $productionHost = New-CpaStackSelfUpdateHost
+        $hostPrepared = & $productionHost.SaveRelease $release (Join-Path $temp 'host-prepared')
+        Assert-True (Test-Path -LiteralPath (Join-Path $hostPrepared 'install.ps1') -PathType Leaf) 'Production self-update host retains access to the module-scoped secure downloader'
+    } finally {
+        & $selfUpdateModule {
+            param([scriptblock]$OriginalSecureDownload)
+            Set-Item -Path 'Function:script:Invoke-CpaStackSecureDownload' -Value $OriginalSecureDownload
+            Remove-Variable -Scope Script -Name FixtureAssetBytes, FixtureChecksumsBytes -ErrorAction SilentlyContinue
+        } $originalSecureDownload
+    }
+
     $badRelease = $release.PSObject.Copy()
     $badDocument = $release.Document.PSObject.Copy()
     $badAssets = @($release.Document.assets | ForEach-Object { $_.PSObject.Copy() })
@@ -98,7 +131,11 @@ try {
     Assert-False ([bool]$failed.success) 'Updater release query failure is explicit'
     Assert-Equal 'UpdaterReleaseCheckFailed' ([string]$failed.error.code) 'Updater release query failure has a stable code'
 } finally {
-    if (Test-Path -LiteralPath $temp) { Remove-TestPathWithRetry -Path $temp }
+    if (Test-Path -LiteralPath $temp) {
+        # Release archives can remain briefly locked while Windows security
+        # software scans the newly written ZIP and checksums files.
+        Remove-TestPathWithRetry -Path $temp -Attempts 80
+    }
 }
 
 'Self-update tests passed.'
