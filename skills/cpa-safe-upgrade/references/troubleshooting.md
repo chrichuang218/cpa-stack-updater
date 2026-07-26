@@ -54,6 +54,8 @@ CLI 返回 `TargetDriveNotFound` 时，选择真实存在的本地 NTFS/ReFS 盘
 
 用 `status` 确认 stack config 中的正式端口、健康状态和 last-known-good。自动回滚成功属于受控升级失败，不等于数据丢失。只报告版本、exe hash、检查项和脱敏错误。
 
+Windows 安全软件或文件系统过滤器可能在回滚快照刚完成时短暂拒绝目录改名；Windows PowerShell 5.1 还会把 sharing violation 折叠为通用 I/O 错误。updater 只在源目录仍存在且目标仍不存在时做固定上限重试；路径状态发生歧义、持续拒绝或非 I/O 错误仍立即失败，不能手工移动 staging/pending 目录绕过事务。
+
 ## 升级已经完成但命令长时间不返回
 
 不要并发启动第二个升级，也不要使用递归结束进程的命令。先确认配置中的正式端口仍由记录的 executable 占用，再检查 operation lock、pending journal 和结构化状态。只有在无 pending、操作锁已释放且正式服务仍健康时，才可单独结束无工作的外层 `cpa-stack.ps1` 进程；不得连带结束正式 CPA 或 Manager。

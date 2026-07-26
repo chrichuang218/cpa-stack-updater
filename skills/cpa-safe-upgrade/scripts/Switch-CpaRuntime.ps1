@@ -209,7 +209,7 @@ try {
     }
     Write-CpaStackJson -Value $journal -Path $journalPath
     if ($sameRuntime) {
-        Move-Item -LiteralPath $snapshotStaging -Destination $pending -ErrorAction Stop
+        Move-CpaStackDirectoryWithRetry -SourcePath $snapshotStaging -DestinationPath $pending
         $snapshotStaging = $null
         $journal.phase = "prepared"
         Write-CpaStackJson -Value $journal -Path $journalPath

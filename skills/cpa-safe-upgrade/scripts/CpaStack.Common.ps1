@@ -2582,6 +2582,43 @@ function Resolve-CpaStackSwitchDisposition {
     throw "Switch recovery state is ambiguous. Recorded=$recorded Active=$active Old=$old New=$new"
 }
 
+function Move-CpaStackDirectoryWithRetry {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourcePath,
+        [Parameter(Mandatory = $true)][string]$DestinationPath,
+        [ValidateRange(1, 20)][int]$MaximumAttempts = 8,
+        [ValidateRange(0, 5000)][int]$DelayMilliseconds = 250,
+        [scriptblock]$MoveAction
+    )
+
+    if ($null -eq $MoveAction) {
+        $MoveAction = {
+            param([string]$Source, [string]$Destination)
+            Move-Item -LiteralPath $Source -Destination $Destination -ErrorAction Stop
+        }
+    }
+
+    for ($attempt = 1; $attempt -le $MaximumAttempts; $attempt++) {
+        try {
+            & $MoveAction $SourcePath $DestinationPath
+            return
+        } catch {
+            $exception = $_.Exception
+            $retryable = ($exception -is [System.UnauthorizedAccessException]) -or
+                ($exception -is [System.IO.IOException])
+            if (-not $retryable -or $attempt -ge $MaximumAttempts) { throw }
+
+            # A directory move is atomic. Any observed path transition after an
+            # exception is ambiguous and must not be treated as a transient lock.
+            if (-not (Test-Path -LiteralPath $SourcePath -PathType Container) -or
+                (Test-Path -LiteralPath $DestinationPath)) {
+                throw
+            }
+            Start-Sleep -Milliseconds $DelayMilliseconds
+        }
+    }
+}
+
 function Commit-CpaStackDirectorySlot {
     param(
         [Parameter(Mandatory = $true)][string]$ControlRoot,
@@ -2598,14 +2635,14 @@ function Commit-CpaStackDirectorySlot {
     $previousPath = $DestinationPath + ".previous-" + [guid]::NewGuid().ToString("N")
     $movedPrevious = $false
     if (Test-Path -LiteralPath $DestinationPath) {
-        Move-Item -LiteralPath $DestinationPath -Destination $previousPath -ErrorAction Stop
+        Move-CpaStackDirectoryWithRetry -SourcePath $DestinationPath -DestinationPath $previousPath
         $movedPrevious = $true
     }
     try {
-        Move-Item -LiteralPath $PendingPath -Destination $DestinationPath -ErrorAction Stop
+        Move-CpaStackDirectoryWithRetry -SourcePath $PendingPath -DestinationPath $DestinationPath
     } catch {
         if ($movedPrevious -and -not (Test-Path -LiteralPath $DestinationPath) -and (Test-Path -LiteralPath $previousPath)) {
-            Move-Item -LiteralPath $previousPath -Destination $DestinationPath -ErrorAction Stop
+            Move-CpaStackDirectoryWithRetry -SourcePath $previousPath -DestinationPath $DestinationPath
             $movedPrevious = $false
         }
         throw

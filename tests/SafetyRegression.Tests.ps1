@@ -112,6 +112,58 @@ try {
         Resolve-CpaStackSwitchDisposition -RecordedHash $newHash -ActiveHash $oldHash -OldHash $oldHash -NewHash $newHash
     } 'Switch recovery state is ambiguous' 'A new recorded hash with the old active binary is ambiguous'
 
+    $moveRetrySource = Join-Path $temp 'move-retry-source'
+    $moveRetryDestination = Join-Path $temp 'move-retry-destination'
+    New-Item -ItemType Directory -Force -Path $moveRetrySource | Out-Null
+    Set-Content -LiteralPath (Join-Path $moveRetrySource 'snapshot.txt') -Value 'rollback snapshot' -Encoding ASCII
+    $moveRetryState = [pscustomobject]@{ Attempts = 0 }
+    $moveRetryAction = {
+        param([string]$Source, [string]$Destination)
+        $moveRetryState.Attempts++
+        if ($moveRetryState.Attempts -lt 3) {
+            # Windows PowerShell 5.1 collapses sharing violations from Move-Item
+            # into a generic IOException without the native Win32 error code.
+            throw [System.IO.IOException]::new('Synthetic transient directory lock.')
+        }
+        Move-Item -LiteralPath $Source -Destination $Destination -ErrorAction Stop
+    }.GetNewClosure()
+    Move-CpaStackDirectoryWithRetry -SourcePath $moveRetrySource -DestinationPath $moveRetryDestination `
+        -MaximumAttempts 4 -DelayMilliseconds 1 -MoveAction $moveRetryAction
+    Assert-Equal 3 $moveRetryState.Attempts 'A transient directory I/O failure is retried with a fixed bound'
+    Assert-True (Test-Path -LiteralPath (Join-Path $moveRetryDestination 'snapshot.txt') -PathType Leaf) 'A retried directory move commits the complete source tree'
+
+    $moveDeniedSource = Join-Path $temp 'move-denied-source'
+    $moveDeniedDestination = Join-Path $temp 'move-denied-destination'
+    New-Item -ItemType Directory -Force -Path $moveDeniedSource | Out-Null
+    $moveDeniedState = [pscustomobject]@{ Attempts = 0 }
+    $moveDeniedAction = {
+        param([string]$Source, [string]$Destination)
+        $moveDeniedState.Attempts++
+        throw [System.UnauthorizedAccessException]::new('Synthetic persistent directory lock.')
+    }.GetNewClosure()
+    Assert-ThrowsMatch {
+        Move-CpaStackDirectoryWithRetry -SourcePath $moveDeniedSource -DestinationPath $moveDeniedDestination `
+            -MaximumAttempts 3 -DelayMilliseconds 1 -MoveAction $moveDeniedAction
+    } 'Synthetic persistent directory lock' 'A persistent access denial still fails closed'
+    Assert-Equal 3 $moveDeniedState.Attempts 'A persistent access denial stops at the configured attempt bound'
+    Assert-True (Test-Path -LiteralPath $moveDeniedSource -PathType Container) 'A failed retried move preserves the source directory'
+    Assert-False (Test-Path -LiteralPath $moveDeniedDestination) 'A failed retried move does not invent a destination directory'
+
+    $moveInvalidSource = Join-Path $temp 'move-invalid-source'
+    $moveInvalidDestination = Join-Path $temp 'move-invalid-destination'
+    New-Item -ItemType Directory -Force -Path $moveInvalidSource | Out-Null
+    $moveInvalidState = [pscustomobject]@{ Attempts = 0 }
+    $moveInvalidAction = {
+        param([string]$Source, [string]$Destination)
+        $moveInvalidState.Attempts++
+        throw [System.InvalidOperationException]::new('Synthetic non-transient move failure.')
+    }.GetNewClosure()
+    Assert-ThrowsMatch {
+        Move-CpaStackDirectoryWithRetry -SourcePath $moveInvalidSource -DestinationPath $moveInvalidDestination `
+            -MaximumAttempts 4 -DelayMilliseconds 1 -MoveAction $moveInvalidAction
+    } 'Synthetic non-transient move failure' 'A non-transient move failure is not retried'
+    Assert-Equal 1 $moveInvalidState.Attempts 'A non-transient move failure stops immediately'
+
     $rootTarget = Join-Path $temp 'root-target'
     $rootJunction = Join-Path $temp 'root-junction'
     New-Item -ItemType Directory -Force -Path $rootTarget | Out-Null
