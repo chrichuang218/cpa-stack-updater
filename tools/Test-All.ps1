@@ -131,7 +131,7 @@ function Invoke-CpaStackIsolatedPowerShellTest {
         [Parameter(Mandatory = $true)][string]$CommonPath,
         [Parameter(Mandatory = $true)]$Guard,
         [Parameter(Mandatory = $true)][int[]]$ProtectedPort,
-        [ValidateRange(1, 3600)][int]$TimeoutSeconds = 1200
+        [ValidateRange(1, 5400)][int]$TimeoutSeconds = 1200
     )
 
     New-Item -ItemType Directory -Force -Path $CaseRoot | Out-Null
@@ -291,7 +291,7 @@ function Invoke-CpaStackGuardedTestCase {
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$ProductionRoot,
         [Parameter(Mandatory = $true)][string]$ProductionStateHome,
         [Parameter(Mandatory = $true)][int[]]$ProductionPort,
-        [ValidateRange(1, 3600)][int]$TimeoutSeconds = 1200
+        [ValidateRange(1, 5400)][int]$TimeoutSeconds = 1200
     )
 
     Assert-CpaStackProductionBaseline `
@@ -383,7 +383,8 @@ $productionArtifactsBefore = Get-CpaStackProductionArtifactSnapshot `
     -ProductionStateHome $productionStateHome `
     -ListenerSnapshot $listenerSnapshot `
     -ProductionPort $productionPorts
-$suiteRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('cst-' + [guid]::NewGuid().ToString('N'))
+# Keep the isolated root short enough for Windows PowerShell 5.1 Archive internals.
+$suiteRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('cst-' + [guid]::NewGuid().ToString('N').Substring(0, 12))
 New-Item -ItemType Directory -Force -Path $suiteRoot | Out-Null
 [void](Assert-CpaStackTestIsolation `
     -Guard $productionGuard `
@@ -400,6 +401,7 @@ try {
         'tests\DynamicPorts.Tests.ps1',
         'tests\ManagedShortcutV2.Tests.ps1',
         'tests\LanConfiguration.Tests.ps1',
+        'tests\Maintenance.Tests.ps1',
         'tests\SelfUpdate.Tests.ps1',
         'tests\CliV2.Tests.ps1',
         'tests\Static.Tests.ps1',
@@ -411,7 +413,8 @@ try {
         'tests\Adoption.Tests.ps1',
         'tests\InstallV2.Tests.ps1',
         'tests\Install.Tests.ps1',
-        'tests\TransactionIntegration.Tests.ps1'
+        'tests\TransactionIntegration.Core.Tests.ps1',
+        'tests\MaintenanceTransaction.Tests.ps1'
     )
     $testIndex = 0
     foreach ($test in $tests) {
@@ -451,7 +454,9 @@ try {
             -ProductionRoot $productionRoots `
             -ProductionStateHome $productionStateHome `
             -ProductionPort $productionPorts `
-            -TimeoutSeconds $(if ($test -ceq 'tests\TransactionIntegration.Tests.ps1') { 2700 } else { 1200 })
+            -TimeoutSeconds $(if ($test -cin @('tests\TransactionIntegration.Core.Tests.ps1', 'tests\MaintenanceTransaction.Tests.ps1')) {
+                if ($PSVersionTable.PSEdition -eq 'Core') { 5400 } else { 2700 }
+            } else { 1200 })
     }
 
     $pythonTestPath = Join-Path $suiteRoot 'python-regression-tests.ps1'

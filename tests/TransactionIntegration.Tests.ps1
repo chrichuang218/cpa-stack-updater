@@ -2,7 +2,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('All', 'CpaSuccess', 'CpaRollback', 'CpaHangCleanup', 'ManagerRollback', 'ManagerMigrationRollback', 'ManagerMigrationTamper', 'ManagerRecoveryGate', 'TransitionHealth', 'PendingGate', 'RecoveryJournalGuard', 'LanSuccess', 'LanRollback', 'LanRecovery', 'UpgradeCandidateRecovery')]
+    [ValidateSet('All', 'Core', 'CpaSuccess', 'CpaRollback', 'CpaHangCleanup', 'ManagerRollback', 'ManagerMigrationRollback', 'ManagerMigrationTamper', 'ManagerRecoveryGate', 'TransitionHealth', 'PendingGate', 'RecoveryJournalGuard', 'LanSuccess', 'LanRollback', 'LanRecovery', 'UpgradeCandidateRecovery', 'Maintenance', 'MaintenanceIdentity', 'MaintenanceResultWarning', 'MaintenanceLifecycle', 'MaintenanceRecovery', 'MaintenanceRollbackFailure', 'MaintenancePendingGuard', 'MaintenanceCommitRecovery')]
     [string]$Case = 'All'
 )
 
@@ -65,6 +65,19 @@ public static class Program
             managerMode = Path.GetFileNameWithoutExtension(
                 System.Diagnostics.Process.GetCurrentProcess().MainModule.FileName
             ).IndexOf("manager", StringComparison.OrdinalIgnoreCase) >= 0;
+
+            if (managerMode && args.Length > 0 &&
+                string.Equals(args[0], "cleanup-derived", StringComparison.OrdinalIgnoreCase))
+            {
+                return RunCleanupDerived(args);
+            }
+
+            string failNextStart = Path.Combine(workingDirectory, "fail-next-start.once");
+            if (managerMode && File.Exists(failNextStart))
+            {
+                File.Delete(failNextStart);
+                throw new InvalidOperationException("Synthetic one-shot Manager restart failure.");
+            }
 
             string startRecordDirective = Path.Combine(workingDirectory, "start-record-path.txt");
             if (File.Exists(startRecordDirective))
@@ -180,6 +193,37 @@ public static class Program
             ReadOptional(Path.Combine(dataDirectory, "collector-state.txt"), collectorFallback).Trim()
         );
         return Int32.Parse(address.Substring(separator + 1));
+    }
+
+    private static int RunCleanupDerived(string[] args)
+    {
+        string requestedDatabase = null;
+        for (int index = 1; index < args.Length - 1; index++)
+        {
+            if (string.Equals(args[index], "--db-path", StringComparison.OrdinalIgnoreCase))
+            {
+                requestedDatabase = args[index + 1].Trim('"');
+                break;
+            }
+        }
+        if (string.IsNullOrWhiteSpace(requestedDatabase) || !File.Exists(requestedDatabase))
+        {
+            throw new InvalidOperationException("cleanup-derived requires an existing --db-path.");
+        }
+
+        string countPath = Path.Combine(workingDirectory, "cleanup-count.txt");
+        int count = Int32.Parse(ReadOptional(countPath, "0").Trim()) + 1;
+        File.WriteAllText(countPath, count.ToString());
+        if (behavior.IndexOf("cleanup-fail", StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            File.AppendAllText(requestedDatabase, "maintenance-fixture-tamper");
+            return 23;
+        }
+        if (behavior.IndexOf("cleanup-restart-once", StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            File.WriteAllText(Path.Combine(workingDirectory, "fail-next-start.once"), "fail");
+        }
+        return 0;
     }
 
     private static void Handle(TcpClient client)
@@ -554,6 +598,31 @@ function New-SqliteFixture {
     }
 }
 
+function New-MaintenanceSqliteFixture {
+    param([string]$Path)
+
+    $python = Get-CpaStackPythonCommand
+    $code = @'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute('CREATE TABLE usage_events (id INTEGER PRIMARY KEY, timestamp_ms INTEGER NOT NULL, request_service_tier TEXT, response_service_tier TEXT, cache_input_mode TEXT, normalized_uncached_input_tokens INTEGER, normalized_total_input_tokens INTEGER, normalized_cache_read_tokens INTEGER, normalized_cache_creation_tokens INTEGER)')
+c.execute('CREATE TABLE settings (name TEXT PRIMARY KEY, value TEXT)')
+c.execute('CREATE TABLE model_prices (name TEXT PRIMARY KEY, prompt_configured INTEGER, completion_configured INTEGER, cache_read_configured INTEGER, cache_creation_configured INTEGER)')
+c.execute('CREATE TABLE usage_account_model_rollups (id INTEGER)')
+c.execute('CREATE TABLE usage_rollup_checkpoints (id INTEGER)')
+c.execute('CREATE TABLE usage_dashboard_hourly_rollups (id INTEGER)')
+c.execute('INSERT INTO usage_events (id, timestamp_ms) VALUES (1, 1000)')
+c.execute('INSERT INTO settings (name, value) VALUES (?, ?)', ('fixture', 'ready'))
+c.commit()
+c.close()
+'@
+    $arguments = @($python.Prefix) + @('-c', $code, $Path)
+    & $python.Path @arguments
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw 'Failed to create the Manager SQLite fixture.'
+    }
+}
+
 function Invoke-IsolatedLanCommand {
     param(
         [Parameter(Mandatory = $true)][string]$ControlRoot,
@@ -760,11 +829,69 @@ function Remove-IsolatedInterruptedScript {
     }
 }
 
+function Complete-IsolatedInvocation {
+    param(
+        [Parameter(Mandatory = $true)]$Invocation,
+        [int]$TimeoutSeconds = 180
+    )
+
+    try {
+        if (-not $Invocation.Process.WaitForExit($TimeoutSeconds * 1000)) {
+            throw "Isolated command exceeded its $TimeoutSeconds second timeout."
+        }
+        $stdout = if (Test-Path -LiteralPath $Invocation.StdoutPath -PathType Leaf) {
+            [System.IO.File]::ReadAllText($Invocation.StdoutPath)
+        } else { '' }
+        $stderr = if (Test-Path -LiteralPath $Invocation.StderrPath -PathType Leaf) {
+            [System.IO.File]::ReadAllText($Invocation.StderrPath)
+        } else { '' }
+        $documents = @()
+        foreach ($line in @($stdout -split '\r?\n')) {
+            $candidate = $line.Trim()
+            if (-not ($candidate.StartsWith('{') -and $candidate.EndsWith('}'))) { continue }
+            $document = $null
+            try { $document = $candidate | ConvertFrom-Json } catch { $document = $null }
+            if ($null -ne $document) { $documents += $document }
+        }
+        if ($documents.Count -ne 1) {
+            throw "Isolated command returned $($documents.Count) JSON documents. Output=[$stdout] Error=[$stderr]"
+        }
+        return [pscustomobject]@{
+            ExitCode = [int]$Invocation.Process.ExitCode
+            Result = $documents[0]
+            Output = $stdout
+            ErrorOutput = $stderr
+        }
+    } finally {
+        Remove-IsolatedInterruptedScript -Invocation $Invocation
+        $Invocation.Process.Dispose()
+    }
+}
+
+function Start-IsolatedMaintenanceCommand {
+    param([Parameter(Mandatory = $true)][string]$ControlRoot)
+
+    return Start-IsolatedInterruptedScript -TargetScript $isolatedLanEntry -Parameters ([ordered]@{
+        Command = 'maintenance'
+        Root = $ControlRoot
+        Action = 'CleanupDerived'
+        Json = $true
+    })
+}
+
+function Invoke-IsolatedMaintenanceCommand {
+    param([Parameter(Mandatory = $true)][string]$ControlRoot)
+
+    $invocation = Start-IsolatedMaintenanceCommand -ControlRoot $ControlRoot
+    return Complete-IsolatedInvocation -Invocation $invocation
+}
+
 function New-LanTransactionFixture {
     param(
         [Parameter(Mandatory = $true)][string]$Binary,
         [Parameter(Mandatory = $true)][string]$Name,
-        [string]$CpaBehavior = 'good'
+        [string]$CpaBehavior = 'good',
+        [switch]$MaintenanceSchema
     )
 
     $fixture = New-ManagedRoot -Name $Name
@@ -792,7 +919,11 @@ function New-LanTransactionFixture {
     Write-Utf8Text -Path (Join-Path $managerRuntime 'cpa-port.txt') -Value ([string]$cpaPort)
     Write-Utf8Text -Path (Join-Path $managerData 'data.key') -Value 'fixture-data-key'
     Write-Utf8Text -Path (Join-Path $managerData 'collector-state.txt') -Value 'true'
-    New-SqliteFixture -Path (Join-Path $managerData 'usage.sqlite')
+    if ($MaintenanceSchema) {
+        New-MaintenanceSqliteFixture -Path (Join-Path $managerData 'usage.sqlite')
+    } else {
+        New-SqliteFixture -Path (Join-Path $managerData 'usage.sqlite')
+    }
     Write-CpaConfig -Path $cpaConfig -Port $cpaPort
     Write-StackConfig -Path $stackConfig -CpaPort $cpaPort -ManagerPort $managerPort
     Copy-Item -LiteralPath $isolatedStartStackScript -Destination (Join-Path $root 'ops\Start-CPA-Stack.ps1')
@@ -890,6 +1021,542 @@ function Invoke-LanConfigurationSuccessTest {
     } finally {
         Stop-OwnedFixturePort -Port $fixture.CpaPort -ManagedRoot $fixture.Root
         Stop-OwnedFixturePort -Port $fixture.ManagerPort -ManagedRoot $fixture.Root
+    }
+}
+
+function Invoke-MaintenanceIdentityGateTest {
+    param([Parameter(Mandatory = $true)][string]$Binary)
+
+    $fixture = New-LanTransactionFixture -Binary $Binary -Name 'maintenance-identity' -MaintenanceSchema
+    $maintenanceScript = Join-Path (Split-Path -Parent $isolatedLanEntry) 'Invoke-CpaStackMaintenance.ps1'
+    $originalScript = [System.IO.File]::ReadAllText($maintenanceScript, [System.Text.UTF8Encoding]::new($false, $true))
+    $needle = '        $result.managerStopped = Stop-MaintenanceManager -Context $context'
+    Assert-Equal 1 ([regex]::Matches($originalScript, [regex]::Escape($needle)).Count) 'Maintenance identity fixture has one pre-stop seam'
+    $holdCode = @'
+        [System.IO.File]::WriteAllText($env:CPA_STACK_TEST_MAINTENANCE_HOLD_READY_PATH, 'ready', [System.Text.UTF8Encoding]::new($false))
+        while (-not (Test-Path -LiteralPath $env:CPA_STACK_TEST_MAINTENANCE_HOLD_RELEASE_PATH -PathType Leaf)) {
+            Start-Sleep -Milliseconds 50
+        }
+'@
+    Write-Utf8Text -Path $maintenanceScript -Value ($originalScript.Replace($needle, $holdCode.TrimEnd() + [Environment]::NewLine + $needle))
+
+    $readyPath = Join-Path $testRunRoot ([guid]::NewGuid().ToString('N') + '.maintenance-ready')
+    $releasePath = Join-Path $testRunRoot ([guid]::NewGuid().ToString('N') + '.maintenance-release')
+    $previousReady = $env:CPA_STACK_TEST_MAINTENANCE_HOLD_READY_PATH
+    $previousRelease = $env:CPA_STACK_TEST_MAINTENANCE_HOLD_RELEASE_PATH
+    $invocation = $null
+    $replacement = $null
+    try {
+        $env:CPA_STACK_TEST_MAINTENANCE_HOLD_READY_PATH = $readyPath
+        $env:CPA_STACK_TEST_MAINTENANCE_HOLD_RELEASE_PATH = $releasePath
+        $invocation = Start-IsolatedMaintenanceCommand -ControlRoot $fixture.Root
+        $deadline = (Get-Date).AddSeconds(60)
+        while (-not (Test-Path -LiteralPath $readyPath -PathType Leaf) -and
+            -not $invocation.Process.HasExited -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 50
+        }
+        Assert-True (Test-Path -LiteralPath $readyPath -PathType Leaf) 'Maintenance reaches the pre-stop identity seam'
+
+        Stop-OwnedFixturePort -Port $fixture.ManagerPort -ManagedRoot $fixture.Root
+        $managerRuntime = Join-Path $fixture.Root 'runtime\manager-plus'
+        $replacement = Start-ManagerFixture `
+            -Executable (Join-Path $managerRuntime 'cpa-manager-plus.exe') `
+            -Runtime $managerRuntime `
+            -Data (Join-Path $fixture.Root 'data\manager-plus') `
+            -Port $fixture.ManagerPort
+        Write-Utf8Text -Path $releasePath -Value 'release'
+
+        $run = Complete-IsolatedInvocation -Invocation $invocation
+        $invocation = $null
+        Assert-True ($run.ExitCode -ne 0) 'Manager PID replacement blocks maintenance'
+        Assert-False ([bool]$run.Result.success) 'Manager PID replacement reports failure'
+        Assert-Equal 'MaintenanceProcessChanged' ([string]$run.Result.error.code) 'Manager PID replacement has a stable error code'
+        $replacement.Refresh()
+        Assert-False ([bool]$replacement.HasExited) 'Maintenance does not stop the replacement Manager process'
+        Assert-Equal ([int]$replacement.Id) ([int](Get-CpaStackListener -Port $fixture.ManagerPort).ProcessId) 'Replacement Manager remains the formal listener'
+    } finally {
+        $env:CPA_STACK_TEST_MAINTENANCE_HOLD_READY_PATH = $previousReady
+        $env:CPA_STACK_TEST_MAINTENANCE_HOLD_RELEASE_PATH = $previousRelease
+        Write-Utf8Text -Path $maintenanceScript -Value $originalScript
+        if ($null -ne $invocation) {
+            Remove-IsolatedInterruptedScript -Invocation $invocation
+            $invocation.Process.Dispose()
+        }
+        if ($null -ne $replacement) { $replacement.Dispose() }
+        Stop-OwnedFixturePort -Port $fixture.CpaPort -ManagedRoot $fixture.Root
+        Stop-OwnedFixturePort -Port $fixture.ManagerPort -ManagedRoot $fixture.Root
+        foreach ($path in @($readyPath, $releasePath)) {
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+        }
+    }
+}
+
+function Invoke-MaintenanceResultPersistenceWarningTest {
+    param([Parameter(Mandatory = $true)][string]$Binary)
+
+    $fixture = New-LanTransactionFixture -Binary $Binary -Name 'maintenance-result-warning' -MaintenanceSchema
+    $resultPath = Join-Path $fixture.Root 'state\maintenance-result.json'
+    Write-Utf8Text -Path $resultPath -Value '{}'
+    Protect-CpaStackSecretFile -Path $resultPath
+    $resultHandle = [System.IO.File]::Open(
+        $resultPath,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        [System.IO.FileShare]::ReadWrite)
+    try {
+        $run = Invoke-IsolatedMaintenanceCommand -ControlRoot $fixture.Root
+        Assert-Equal 0 $run.ExitCode "Maintenance remains successful when only result persistence fails. Output=[$($run.Output)] Error=[$($run.ErrorOutput)]"
+        Assert-True ([bool]$run.Result.success) 'Committed maintenance remains successful after result persistence failure'
+        Assert-True (@($run.Result.warnings | Where-Object { [string]$_ -match 'result file.*persist' }).Count -eq 1) 'Result persistence failure is exposed as one warning'
+        Assert-True ([bool]$run.Result.maintenance.databaseVerified) 'Result persistence warning preserves database verification evidence'
+        Assert-True ([bool]$run.Result.maintenance.managerRestarted) 'Result persistence warning preserves restart evidence'
+        Assert-True ($null -ne (Get-CpaStackListener -Port $fixture.CpaPort)) 'Result persistence warning leaves CPA healthy'
+        Assert-True ($null -ne (Get-CpaStackListener -Port $fixture.ManagerPort)) 'Result persistence warning leaves Manager healthy'
+    } finally {
+        $resultHandle.Dispose()
+        Stop-OwnedFixturePort -Port $fixture.CpaPort -ManagedRoot $fixture.Root
+        Stop-OwnedFixturePort -Port $fixture.ManagerPort -ManagedRoot $fixture.Root
+    }
+}
+
+function Assert-MaintenanceFixtureDatabase {
+    param([Parameter(Mandatory = $true)][string]$Root)
+
+    $validator = Join-Path (Split-Path -Parent $isolatedLanEntry) 'Test-ManagerData.ps1'
+    $database = Join-Path $Root 'data\manager-plus\usage.sqlite'
+    $output = @(& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+        -File $validator -DatabasePath $database 2>&1)
+    $exitCode = $LASTEXITCODE
+    $document = (@($output | ForEach-Object { [string]$_ }) -join [Environment]::NewLine) | ConvertFrom-Json
+    Assert-Equal 0 $exitCode 'Maintenance fixture database passes the bundled validator'
+    Assert-True ([bool]$document.success) 'Maintenance fixture database remains valid'
+    Assert-Equal 1 ([Int64]$document.database.usage_events.count) 'Maintenance preserves the authoritative request count'
+    return $document
+}
+
+function Assert-MaintenanceFixtureHealthy {
+    param([Parameter(Mandatory = $true)]$Fixture)
+
+    Assert-True ($null -ne (Get-CpaStackListener -Port $Fixture.CpaPort)) 'Maintenance leaves CPA healthy'
+    Assert-True ($null -ne (Get-CpaStackListener -Port $Fixture.ManagerPort)) 'Maintenance leaves Manager healthy'
+    Assert-False (Test-Path -LiteralPath (Join-Path $Fixture.Root 'state\maintenance.pending.json')) 'Maintenance leaves no pending journal'
+    Assert-False (Test-Path -LiteralPath (Join-Path $Fixture.Root 'state\maintenance.pending.json.previous')) 'Maintenance leaves no previous journal'
+    [void](Assert-MaintenanceFixtureDatabase -Root $Fixture.Root)
+}
+
+function Invoke-MaintenanceLifecycleTest {
+    param([Parameter(Mandatory = $true)][string]$Binary)
+
+    $successFixture = New-LanTransactionFixture -Binary $Binary -Name 'maintenance-success' -MaintenanceSchema
+    try {
+        $beforeCpa = Get-CpaStackListener -Port $successFixture.CpaPort
+        $beforeManager = Get-CpaStackListener -Port $successFixture.ManagerPort
+        $success = Invoke-IsolatedMaintenanceCommand -ControlRoot $successFixture.Root
+        Assert-Equal 0 $success.ExitCode "Maintenance succeeds. Output=[$($success.Output)] Error=[$($success.ErrorOutput)]"
+        Assert-True ([bool]$success.Result.success) 'Successful maintenance reports success'
+        Assert-Equal 'Changed' ([string]$success.Result.outcome) 'Successful maintenance reports Changed'
+        Assert-True ([bool]$success.Result.maintenance.databaseVerified) 'Successful maintenance verifies the database'
+        Assert-True ([bool]$success.Result.maintenance.backupRetained) 'Successful maintenance retains a validated backup'
+        Assert-Equal 1 ([int](Get-Content -Raw (Join-Path $successFixture.Root 'runtime\manager-plus\cleanup-count.txt')).Trim()) 'Successful maintenance runs cleanup-derived once'
+        Assert-Equal ([int]$beforeCpa.ProcessId) ([int](Get-CpaStackListener -Port $successFixture.CpaPort).ProcessId) 'Successful maintenance does not restart CPA'
+        Assert-True ([int]$beforeManager.ProcessId -ne [int](Get-CpaStackListener -Port $successFixture.ManagerPort).ProcessId) 'Successful maintenance restarts Manager'
+        Assert-MaintenanceFixtureHealthy -Fixture $successFixture
+    } finally {
+        Stop-OwnedFixturePort -Port $successFixture.CpaPort -ManagedRoot $successFixture.Root
+        Stop-OwnedFixturePort -Port $successFixture.ManagerPort -ManagedRoot $successFixture.Root
+    }
+
+    $cleanupFailureFixture = New-LanTransactionFixture -Binary $Binary -Name 'maintenance-cleanup-rollback' -MaintenanceSchema
+    try {
+        Write-Utf8Text -Path (Join-Path $cleanupFailureFixture.Root 'runtime\manager-plus\behavior.txt') -Value 'cleanup-fail'
+        $failure = Invoke-IsolatedMaintenanceCommand -ControlRoot $cleanupFailureFixture.Root
+        Assert-Equal 1 $failure.ExitCode 'Synthetic cleanup failure returns nonzero'
+        Assert-False ([bool]$failure.Result.success) 'Synthetic cleanup failure reports failure'
+        Assert-Equal 'RolledBack' ([string]$failure.Result.outcome) 'Synthetic cleanup failure reports RolledBack'
+        Assert-True ([bool]$failure.Result.rolledBack) 'Synthetic cleanup failure restores the backup'
+        Assert-Equal 'CleanupDerivedFailed' ([string]$failure.Result.error.code) 'Synthetic cleanup failure preserves the stable code'
+        $databaseText = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes((Join-Path $cleanupFailureFixture.Root 'data\manager-plus\usage.sqlite')))
+        Assert-False ($databaseText.Contains('maintenance-fixture-tamper')) 'Rollback removes the failed cleanup mutation'
+        Assert-MaintenanceFixtureHealthy -Fixture $cleanupFailureFixture
+    } finally {
+        Stop-OwnedFixturePort -Port $cleanupFailureFixture.CpaPort -ManagedRoot $cleanupFailureFixture.Root
+        Stop-OwnedFixturePort -Port $cleanupFailureFixture.ManagerPort -ManagedRoot $cleanupFailureFixture.Root
+    }
+
+    $restartFailureFixture = New-LanTransactionFixture -Binary $Binary -Name 'maintenance-restart-rollback' -MaintenanceSchema
+    try {
+        Write-Utf8Text -Path (Join-Path $restartFailureFixture.Root 'runtime\manager-plus\behavior.txt') -Value 'cleanup-restart-once'
+        $failure = Invoke-IsolatedMaintenanceCommand -ControlRoot $restartFailureFixture.Root
+        Assert-Equal 1 $failure.ExitCode 'Synthetic first restart failure returns nonzero'
+        Assert-Equal 'RolledBack' ([string]$failure.Result.outcome) 'Synthetic first restart failure reports RolledBack'
+        Assert-Equal 'MaintenanceRestartFailed' ([string]$failure.Result.error.code) 'Synthetic first restart failure has a stable stage-specific code'
+        Assert-Equal 'restart' ([string]$failure.Result.error.phase) 'Synthetic first restart failure reports the restart phase'
+        Assert-True ([bool]$failure.Result.maintenance.managerRestarted) 'Rollback restarts Manager after the one-shot failure'
+        Assert-False (Test-Path -LiteralPath (Join-Path $restartFailureFixture.Root 'runtime\manager-plus\fail-next-start.once')) 'One-shot restart failure is consumed'
+        Assert-MaintenanceFixtureHealthy -Fixture $restartFailureFixture
+    } finally {
+        Stop-OwnedFixturePort -Port $restartFailureFixture.CpaPort -ManagedRoot $restartFailureFixture.Root
+        Stop-OwnedFixturePort -Port $restartFailureFixture.ManagerPort -ManagedRoot $restartFailureFixture.Root
+    }
+}
+
+function New-MaintenanceHardInterruptedFixture {
+    param(
+        [Parameter(Mandatory = $true)][string]$Binary,
+        [Parameter(Mandatory = $true)][ValidateSet('source-stopped', 'cleaned')][string]$Phase,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    $fixture = New-LanTransactionFixture -Binary $Binary -Name $Name -MaintenanceSchema
+    $maintenanceScript = Join-Path (Split-Path -Parent $isolatedLanEntry) 'Invoke-CpaStackMaintenance.ps1'
+    $originalScript = [System.IO.File]::ReadAllText($maintenanceScript, [System.Text.UTF8Encoding]::new($false, $true))
+    $needle = if ($Phase -eq 'cleaned') {
+        '        Write-MaintenanceJournal -Journal $journal -Phase cleaned'
+    } else {
+        "        Write-MaintenanceJournal -Journal `$journal -Phase '$Phase'"
+    }
+    Assert-Equal 1 ([regex]::Matches($originalScript, [regex]::Escape($needle)).Count) "Maintenance hard-interruption fixture has one $Phase seam"
+    $holdCode = @'
+        [System.IO.File]::WriteAllText($env:CPA_STACK_TEST_MAINTENANCE_HARD_READY_PATH, 'ready', [System.Text.UTF8Encoding]::new($false))
+        while ($true) { Start-Sleep -Milliseconds 100 }
+'@
+    Write-Utf8Text -Path $maintenanceScript -Value ($originalScript.Replace($needle, $needle + [Environment]::NewLine + $holdCode.TrimEnd()))
+
+    $readyPath = Join-Path $testRunRoot ([guid]::NewGuid().ToString('N') + '.maintenance-hard-ready')
+    $previousReady = $env:CPA_STACK_TEST_MAINTENANCE_HARD_READY_PATH
+    $invocation = $null
+    $job = $null
+    try {
+        $env:CPA_STACK_TEST_MAINTENANCE_HARD_READY_PATH = $readyPath
+        $invocation = Start-IsolatedMaintenanceCommand -ControlRoot $fixture.Root
+        $job = [CpaStackUpdater.ProductionGuard.KillOnCloseJob]::new()
+        $job.Assign($invocation.Process)
+        $deadline = (Get-Date).AddSeconds(90)
+        while (-not (Test-Path -LiteralPath $readyPath -PathType Leaf) -and
+            -not $invocation.Process.HasExited -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 50
+        }
+        Assert-True (Test-Path -LiteralPath $readyPath -PathType Leaf) "Maintenance reaches persisted $Phase before hard interruption"
+        $job.Dispose()
+        $job = $null
+        Assert-True ($invocation.Process.WaitForExit(10000)) 'Hard interruption stops the maintenance process tree'
+    } finally {
+        $env:CPA_STACK_TEST_MAINTENANCE_HARD_READY_PATH = $previousReady
+        Write-Utf8Text -Path $maintenanceScript -Value $originalScript
+        if ($null -ne $job) { $job.Dispose() }
+        if ($null -ne $invocation) {
+            Remove-IsolatedInterruptedScript -Invocation $invocation
+            $invocation.Process.Dispose()
+        }
+    }
+
+    Assert-True (Test-Path -LiteralPath (Join-Path $fixture.Root 'state\maintenance.pending.json') -PathType Leaf) "Hard interruption retains the $Phase maintenance journal"
+    Assert-True ($null -eq (Get-CpaStackListener -Port $fixture.ManagerPort)) "Hard interruption at $Phase leaves Manager stopped for recovery"
+    return [pscustomobject]@{ Fixture = $fixture; ReadyPath = $readyPath }
+}
+
+function Invoke-MaintenanceHardInterruptionCase {
+    param(
+        [Parameter(Mandatory = $true)][string]$Binary,
+        [Parameter(Mandatory = $true)][ValidateSet('source-stopped', 'cleaned')][string]$Phase
+    )
+
+    $interrupted = New-MaintenanceHardInterruptedFixture -Binary $Binary -Phase $Phase -Name ('maintenance-hard-' + $Phase)
+    $fixture = $interrupted.Fixture
+
+    try {
+        $recovery = Invoke-IsolatedMaintenanceCommand -ControlRoot $fixture.Root
+        Assert-Equal 0 $recovery.ExitCode "Rerun recovers and completes $Phase maintenance. Output=[$($recovery.Output)] Error=[$($recovery.ErrorOutput)]"
+        Assert-True ([bool]$recovery.Result.success) 'Maintenance rerun succeeds after hard interruption'
+        Assert-True ([bool]$recovery.Result.recovered) 'Maintenance rerun reports recovered=true'
+        $expectedCleanupCount = if ($Phase -eq 'cleaned') { 2 } else { 1 }
+        Assert-Equal $expectedCleanupCount ([int](Get-Content -Raw (Join-Path $fixture.Root 'runtime\manager-plus\cleanup-count.txt')).Trim()) "Maintenance rerun executes the expected cleanup count after $Phase"
+        Assert-MaintenanceFixtureHealthy -Fixture $fixture
+    } finally {
+        Stop-OwnedFixturePort -Port $fixture.CpaPort -ManagedRoot $fixture.Root
+        Stop-OwnedFixturePort -Port $fixture.ManagerPort -ManagedRoot $fixture.Root
+        if (Test-Path -LiteralPath $interrupted.ReadyPath) { Remove-Item -LiteralPath $interrupted.ReadyPath -Force }
+    }
+}
+
+function Invoke-MaintenanceRecoveryTest {
+    param([Parameter(Mandatory = $true)][string]$Binary)
+
+    Invoke-MaintenanceHardInterruptionCase -Binary $Binary -Phase 'source-stopped'
+    Invoke-MaintenanceHardInterruptionCase -Binary $Binary -Phase cleaned
+}
+
+function Invoke-MaintenanceRollbackFailureTest {
+    param([Parameter(Mandatory = $true)][string]$Binary)
+
+    $fixture = New-LanTransactionFixture -Binary $Binary -Name 'maintenance-rollback-failure' -MaintenanceSchema
+    $maintenanceScript = Join-Path (Split-Path -Parent $isolatedLanEntry) 'Invoke-CpaStackMaintenance.ps1'
+    $originalScript = [System.IO.File]::ReadAllText($maintenanceScript, [System.Text.UTF8Encoding]::new($false, $true))
+    $needle = '        $result.managerStopped = Stop-MaintenanceManager -Context $context -ExpectedProcessId $context.ProcessId'
+    Assert-Equal 1 ([regex]::Matches($originalScript, [regex]::Escape($needle)).Count) 'Maintenance rollback-failure fixture has one pre-stop seam'
+    $holdCode = @'
+        [System.IO.File]::WriteAllText($env:CPA_STACK_TEST_MAINTENANCE_ROLLBACK_READY_PATH, 'ready', [System.Text.UTF8Encoding]::new($false))
+        while (-not (Test-Path -LiteralPath $env:CPA_STACK_TEST_MAINTENANCE_ROLLBACK_RELEASE_PATH -PathType Leaf)) {
+            Start-Sleep -Milliseconds 50
+        }
+'@
+    Write-Utf8Text -Path $maintenanceScript -Value ($originalScript.Replace($needle, $holdCode.TrimEnd() + [Environment]::NewLine + $needle))
+    Write-Utf8Text -Path (Join-Path $fixture.Root 'runtime\manager-plus\behavior.txt') -Value 'cleanup-fail'
+
+    $readyPath = Join-Path $testRunRoot ([guid]::NewGuid().ToString('N') + '.maintenance-rollback-ready')
+    $releasePath = Join-Path $testRunRoot ([guid]::NewGuid().ToString('N') + '.maintenance-rollback-release')
+    $previousReady = $env:CPA_STACK_TEST_MAINTENANCE_ROLLBACK_READY_PATH
+    $previousRelease = $env:CPA_STACK_TEST_MAINTENANCE_ROLLBACK_RELEASE_PATH
+    $invocation = $null
+    try {
+        $env:CPA_STACK_TEST_MAINTENANCE_ROLLBACK_READY_PATH = $readyPath
+        $env:CPA_STACK_TEST_MAINTENANCE_ROLLBACK_RELEASE_PATH = $releasePath
+        $invocation = Start-IsolatedMaintenanceCommand -ControlRoot $fixture.Root
+        $deadline = (Get-Date).AddSeconds(60)
+        while (-not (Test-Path -LiteralPath $readyPath -PathType Leaf) -and
+            -not $invocation.Process.HasExited -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 50
+        }
+        Assert-True (Test-Path -LiteralPath $readyPath -PathType Leaf) 'Maintenance reaches the rollback-failure seam'
+        $pending = @(Get-ChildItem -LiteralPath (Join-Path $fixture.Root 'rollback') -Directory -Filter 'pending-maintenance-*')
+        Assert-Equal 1 $pending.Count 'Maintenance has one bound pending backup before stop'
+        Add-Content -LiteralPath (Join-Path $pending[0].FullName 'data.key') -Value 'tampered' -Encoding ASCII
+        Write-Utf8Text -Path $releasePath -Value 'release'
+        $run = Complete-IsolatedInvocation -Invocation $invocation
+        $invocation = $null
+        Assert-Equal 1 $run.ExitCode 'Tampered rollback backup returns nonzero'
+        Assert-Equal 'MaintenanceRollbackFailed' ([string]$run.Result.error.code) 'Tampered rollback backup reports the stable failure code'
+        Assert-True (Test-Path -LiteralPath (Join-Path $fixture.Root 'state\maintenance.pending.json') -PathType Leaf) 'Rollback failure retains the maintenance journal'
+        Assert-True (Test-Path -LiteralPath $pending[0].FullName -PathType Container) 'Rollback failure retains the tampered backup'
+        Assert-True ($null -eq (Get-CpaStackListener -Port $fixture.ManagerPort)) 'Rollback failure does not invent a healthy Manager state'
+        Assert-True ($null -ne (Get-CpaStackListener -Port $fixture.CpaPort)) 'Rollback failure leaves CPA unchanged'
+    } finally {
+        $env:CPA_STACK_TEST_MAINTENANCE_ROLLBACK_READY_PATH = $previousReady
+        $env:CPA_STACK_TEST_MAINTENANCE_ROLLBACK_RELEASE_PATH = $previousRelease
+        Write-Utf8Text -Path $maintenanceScript -Value $originalScript
+        if ($null -ne $invocation) {
+            Remove-IsolatedInterruptedScript -Invocation $invocation
+            $invocation.Process.Dispose()
+        }
+        Stop-OwnedFixturePort -Port $fixture.CpaPort -ManagedRoot $fixture.Root
+        Stop-OwnedFixturePort -Port $fixture.ManagerPort -ManagedRoot $fixture.Root
+        foreach ($path in @($readyPath, $releasePath)) {
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+        }
+    }
+}
+
+function Invoke-MaintenancePendingRecoveryGuardTest {
+    param([Parameter(Mandatory = $true)][string]$Binary)
+
+    $damaged = New-MaintenanceHardInterruptedFixture -Binary $Binary -Phase 'source-stopped' -Name 'maintenance-pending-damaged'
+    try {
+        $pending = @(Get-ChildItem -LiteralPath (Join-Path $damaged.Fixture.Root 'rollback') -Directory -Filter 'pending-maintenance-*')
+        Assert-Equal 1 $pending.Count 'Interrupted maintenance retains one pending backup'
+        Add-Content -LiteralPath (Join-Path $pending[0].FullName 'data.key') -Value 'tampered' -Encoding ASCII
+        $recovery = Invoke-IsolatedMaintenanceCommand -ControlRoot $damaged.Fixture.Root
+        Assert-Equal 1 $recovery.ExitCode 'Damaged pending backup recovery returns nonzero'
+        Assert-Equal 'MaintenanceRollbackFailed' ([string]$recovery.Result.error.code) 'Damaged pending backup reports rollback failure'
+        Assert-True (Test-Path -LiteralPath (Join-Path $damaged.Fixture.Root 'state\maintenance.pending.json') -PathType Leaf) 'Damaged pending recovery retains the journal'
+        Assert-True (Test-Path -LiteralPath $pending[0].FullName -PathType Container) 'Damaged pending recovery retains backup evidence'
+        Assert-True ($null -eq (Get-CpaStackListener -Port $damaged.Fixture.ManagerPort)) 'Damaged pending recovery leaves Manager stopped rather than inventing success'
+    } finally {
+        Stop-OwnedFixturePort -Port $damaged.Fixture.CpaPort -ManagedRoot $damaged.Fixture.Root
+        Stop-OwnedFixturePort -Port $damaged.Fixture.ManagerPort -ManagedRoot $damaged.Fixture.Root
+        if (Test-Path -LiteralPath $damaged.ReadyPath) { Remove-Item -LiteralPath $damaged.ReadyPath -Force }
+    }
+
+    $foreign = New-MaintenanceHardInterruptedFixture -Binary $Binary -Phase 'source-stopped' -Name 'maintenance-pending-foreign'
+    try {
+        $newInstanceId = [guid]::NewGuid().ToString('N')
+        $markerPath = Join-Path $foreign.Fixture.Root '.cpa-stack-instance.json'
+        $currentPath = Join-Path $foreign.Fixture.Root 'state\current.json'
+        $marker = Read-CpaStackJson -Path $markerPath
+        $current = Read-CpaStackJson -Path $currentPath
+        $marker.instanceId = $newInstanceId
+        $current.instanceId = $newInstanceId
+        Write-CpaStackJson -Value $marker -Path $markerPath
+        Write-CpaStackJson -Value $current -Path $currentPath
+        $recovery = Invoke-IsolatedMaintenanceCommand -ControlRoot $foreign.Fixture.Root
+        Assert-Equal 1 $recovery.ExitCode 'Foreign maintenance journal recovery returns nonzero'
+        Assert-Equal 'MaintenanceRollbackFailed' ([string]$recovery.Result.error.code) 'Foreign maintenance journal reports rollback failure'
+        Assert-True (Test-Path -LiteralPath (Join-Path $foreign.Fixture.Root 'state\maintenance.pending.json') -PathType Leaf) 'Foreign journal remains for diagnosis'
+        Assert-True ($null -eq (Get-CpaStackListener -Port $foreign.Fixture.ManagerPort)) 'Foreign journal does not start or stop a new Manager instance'
+    } finally {
+        Stop-OwnedFixturePort -Port $foreign.Fixture.CpaPort -ManagedRoot $foreign.Fixture.Root
+        Stop-OwnedFixturePort -Port $foreign.Fixture.ManagerPort -ManagedRoot $foreign.Fixture.Root
+        if (Test-Path -LiteralPath $foreign.ReadyPath) { Remove-Item -LiteralPath $foreign.ReadyPath -Force }
+    }
+
+    $poisoned = New-MaintenanceHardInterruptedFixture -Binary $Binary -Phase 'source-stopped' -Name 'maintenance-pending-path-poisoned'
+    try {
+        $pending = @(Get-ChildItem -LiteralPath (Join-Path $poisoned.Fixture.Root 'rollback') -Directory -Filter 'pending-maintenance-*')
+        Assert-Equal 1 $pending.Count 'Path-poisoned maintenance retains one pending backup'
+        $manifestPath = Join-Path $pending[0].FullName 'manifest.json'
+        $manifest = Read-CpaStackJson -Path $manifestPath
+        $decoyDirectory = Join-Path $poisoned.Fixture.Root 'data\maintenance-decoy'
+        New-Item -ItemType Directory -Force -Path $decoyDirectory | Out-Null
+        Protect-CpaStackPrivateDirectory -Path $decoyDirectory
+        $decoyDatabase = Join-Path $decoyDirectory 'usage.sqlite'
+        Copy-Item -LiteralPath (Join-Path $pending[0].FullName 'usage.sqlite') -Destination $decoyDatabase
+        Protect-CpaStackSecretFile -Path $decoyDatabase
+        $cpaListenerBefore = Get-CpaStackListener -Port $poisoned.Fixture.CpaPort
+        Assert-True ($null -ne $cpaListenerBefore) 'Path-poisoning fixture begins with a healthy CPA listener'
+        $manifest.executable = Join-Path $poisoned.Fixture.Root 'runtime\cli-proxy-api\cli-proxy-api.exe'
+        $manifest.database = $decoyDatabase
+        $manifest.managerPort = $poisoned.Fixture.CpaPort
+        Write-CpaStackJson -Value $manifest -Path $manifestPath
+
+        $recovery = Invoke-IsolatedMaintenanceCommand -ControlRoot $poisoned.Fixture.Root
+        Assert-Equal 1 $recovery.ExitCode 'Path-poisoned backup recovery returns nonzero'
+        Assert-Equal 'MaintenanceRollbackFailed' ([string]$recovery.Result.error.code) 'Path-poisoned backup reports rollback failure'
+        Assert-True (Test-Path -LiteralPath (Join-Path $poisoned.Fixture.Root 'state\maintenance.pending.json') -PathType Leaf) 'Path-poisoned recovery retains the journal'
+        Assert-True (Test-Path -LiteralPath $pending[0].FullName -PathType Container) 'Path-poisoned recovery retains backup evidence'
+        $cpaListenerAfter = Get-CpaStackListener -Port $poisoned.Fixture.CpaPort
+        Assert-True ($null -ne $cpaListenerAfter) 'Path-poisoned recovery does not stop the CPA listener'
+        Assert-Equal ([int]$cpaListenerBefore.ProcessId) ([int]$cpaListenerAfter.ProcessId) 'Path-poisoned recovery leaves the original CPA process untouched'
+        Assert-True ($null -eq (Get-CpaStackListener -Port $poisoned.Fixture.ManagerPort)) 'Path-poisoned recovery leaves Manager stopped for explicit diagnosis'
+    } finally {
+        Stop-OwnedFixturePort -Port $poisoned.Fixture.CpaPort -ManagedRoot $poisoned.Fixture.Root
+        Stop-OwnedFixturePort -Port $poisoned.Fixture.ManagerPort -ManagedRoot $poisoned.Fixture.Root
+        if (Test-Path -LiteralPath $poisoned.ReadyPath) { Remove-Item -LiteralPath $poisoned.ReadyPath -Force }
+    }
+}
+
+function Invoke-MaintenanceCommitRecoveryTest {
+    param([Parameter(Mandatory = $true)][string]$Binary)
+
+    $fixture = New-LanTransactionFixture -Binary $Binary -Name 'maintenance-commit-recovery' -MaintenanceSchema
+    $maintenanceScript = Join-Path (Split-Path -Parent $isolatedLanEntry) 'Invoke-CpaStackMaintenance.ps1'
+    $originalScript = [System.IO.File]::ReadAllText($maintenanceScript, [System.Text.UTF8Encoding]::new($false, $true))
+    $needle = '    $Journal.backupPath = Retain-MaintenanceBackup -Backup $Backup -OperationId $OperationId'
+    Assert-Equal 1 ([regex]::Matches($originalScript, [regex]::Escape($needle)).Count) 'Maintenance commit fixture has one post-retain seam'
+    $holdCode = @'
+        [System.IO.File]::WriteAllText($env:CPA_STACK_TEST_MAINTENANCE_COMMIT_READY_PATH, 'ready', [System.Text.UTF8Encoding]::new($false))
+        while (-not (Test-Path -LiteralPath $env:CPA_STACK_TEST_MAINTENANCE_COMMIT_RELEASE_PATH -PathType Leaf)) {
+            Start-Sleep -Milliseconds 50
+        }
+'@
+    Write-Utf8Text -Path $maintenanceScript -Value ($originalScript.Replace($needle, $needle + [Environment]::NewLine + $holdCode.TrimEnd()))
+
+    $readyPath = Join-Path $testRunRoot ([guid]::NewGuid().ToString('N') + '.maintenance-commit-ready')
+    $releasePath = Join-Path $testRunRoot ([guid]::NewGuid().ToString('N') + '.maintenance-commit-release')
+    $previousReady = $env:CPA_STACK_TEST_MAINTENANCE_COMMIT_READY_PATH
+    $previousRelease = $env:CPA_STACK_TEST_MAINTENANCE_COMMIT_RELEASE_PATH
+    $invocation = $null
+    $journalHandle = $null
+    try {
+        $env:CPA_STACK_TEST_MAINTENANCE_COMMIT_READY_PATH = $readyPath
+        $env:CPA_STACK_TEST_MAINTENANCE_COMMIT_RELEASE_PATH = $releasePath
+        $invocation = Start-IsolatedMaintenanceCommand -ControlRoot $fixture.Root
+        $deadline = (Get-Date).AddSeconds(90)
+        while (-not (Test-Path -LiteralPath $readyPath -PathType Leaf) -and
+            -not $invocation.Process.HasExited -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 50
+        }
+        Assert-True (Test-Path -LiteralPath $readyPath -PathType Leaf) 'Maintenance reaches post-retain commit seam'
+        $journalPath = Join-Path $fixture.Root 'state\maintenance.pending.json'
+        $journalHandle = [System.IO.File]::Open($journalPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        Write-Utf8Text -Path $releasePath -Value 'release'
+        $first = Complete-IsolatedInvocation -Invocation $invocation
+        $invocation = $null
+        Assert-Equal 1 $first.ExitCode 'Locked commit journal returns nonzero without rolling back committed maintenance'
+        Assert-Equal 'MaintenanceCommitIncomplete' ([string]$first.Result.error.code) 'Locked commit journal reports an incomplete commit'
+        Assert-False ([bool]$first.Result.rolledBack) 'Commit cleanup failure does not undo validated maintenance'
+        Assert-True (Test-Path -LiteralPath $journalPath -PathType Leaf) 'Incomplete commit retains its journal'
+        Assert-True ($null -ne (Get-CpaStackListener -Port $fixture.ManagerPort)) 'Incomplete commit leaves Manager healthy'
+        $journalHandle.Dispose()
+        $journalHandle = $null
+
+        Write-Utf8Text -Path $maintenanceScript -Value $originalScript
+        $recovery = Invoke-IsolatedMaintenanceCommand -ControlRoot $fixture.Root
+        Assert-Equal 0 $recovery.ExitCode "Commit recovery rerun succeeds. Output=[$($recovery.Output)] Error=[$($recovery.ErrorOutput)]"
+        Assert-True ([bool]$recovery.Result.recovered) 'Commit recovery rerun reports recovered=true'
+        Assert-MaintenanceFixtureHealthy -Fixture $fixture
+    } finally {
+        $env:CPA_STACK_TEST_MAINTENANCE_COMMIT_READY_PATH = $previousReady
+        $env:CPA_STACK_TEST_MAINTENANCE_COMMIT_RELEASE_PATH = $previousRelease
+        Write-Utf8Text -Path $maintenanceScript -Value $originalScript
+        if ($null -ne $journalHandle) { $journalHandle.Dispose() }
+        if ($null -ne $invocation) {
+            Remove-IsolatedInterruptedScript -Invocation $invocation
+            $invocation.Process.Dispose()
+        }
+        Stop-OwnedFixturePort -Port $fixture.CpaPort -ManagedRoot $fixture.Root
+        Stop-OwnedFixturePort -Port $fixture.ManagerPort -ManagedRoot $fixture.Root
+        foreach ($path in @($readyPath, $releasePath)) {
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+        }
+    }
+}
+
+function Invoke-MaintenanceCommittedJournalCleanupTest {
+    param([Parameter(Mandatory = $true)][string]$Binary)
+
+    $fixture = New-LanTransactionFixture -Binary $Binary -Name 'maintenance-committed-cleanup' -MaintenanceSchema
+    $maintenanceScript = Join-Path (Split-Path -Parent $isolatedLanEntry) 'Invoke-CpaStackMaintenance.ps1'
+    $originalScript = [System.IO.File]::ReadAllText($maintenanceScript, [System.Text.UTF8Encoding]::new($false, $true))
+    $needle = '    Write-MaintenanceJournal -Journal $Journal -Phase committed'
+    Assert-Equal 1 ([regex]::Matches($originalScript, [regex]::Escape($needle)).Count) 'Committed cleanup fixture has one persisted committed seam'
+    $holdCode = @'
+    [System.IO.File]::WriteAllText($env:CPA_STACK_TEST_MAINTENANCE_COMMITTED_READY_PATH, 'ready', [System.Text.UTF8Encoding]::new($false))
+    while (-not (Test-Path -LiteralPath $env:CPA_STACK_TEST_MAINTENANCE_COMMITTED_RELEASE_PATH -PathType Leaf)) {
+        Start-Sleep -Milliseconds 50
+    }
+'@
+    Write-Utf8Text -Path $maintenanceScript -Value ($originalScript.Replace($needle, $needle + [Environment]::NewLine + $holdCode.TrimEnd()))
+
+    $readyPath = Join-Path $testRunRoot ([guid]::NewGuid().ToString('N') + '.maintenance-committed-ready')
+    $releasePath = Join-Path $testRunRoot ([guid]::NewGuid().ToString('N') + '.maintenance-committed-release')
+    $previousReady = $env:CPA_STACK_TEST_MAINTENANCE_COMMITTED_READY_PATH
+    $previousRelease = $env:CPA_STACK_TEST_MAINTENANCE_COMMITTED_RELEASE_PATH
+    $invocation = $null
+    $previousJournalHandle = $null
+    try {
+        $env:CPA_STACK_TEST_MAINTENANCE_COMMITTED_READY_PATH = $readyPath
+        $env:CPA_STACK_TEST_MAINTENANCE_COMMITTED_RELEASE_PATH = $releasePath
+        $invocation = Start-IsolatedMaintenanceCommand -ControlRoot $fixture.Root
+        $deadline = (Get-Date).AddSeconds(90)
+        while (-not (Test-Path -LiteralPath $readyPath -PathType Leaf) -and
+            -not $invocation.Process.HasExited -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 50
+        }
+        Assert-True (Test-Path -LiteralPath $readyPath -PathType Leaf) 'Maintenance persists committed before journal cleanup'
+        $journalPath = Join-Path $fixture.Root 'state\maintenance.pending.json'
+        $previousJournalPath = $journalPath + '.previous'
+        Assert-True (Test-Path -LiteralPath $previousJournalPath -PathType Leaf) 'Committed journal has a previous generation to clean'
+        $previousJournalHandle = [System.IO.File]::Open($previousJournalPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        Write-Utf8Text -Path $releasePath -Value 'release'
+        $first = Complete-IsolatedInvocation -Invocation $invocation
+        $invocation = $null
+        Assert-Equal 1 $first.ExitCode 'Locked previous journal returns nonzero after committed is durable'
+        Assert-Equal 'MaintenanceCommitIncomplete' ([string]$first.Result.error.code) 'Committed journal cleanup failure reports incomplete commit'
+        Assert-False ([bool]$first.Result.rolledBack) 'Committed journal cleanup failure does not roll back validated maintenance'
+        Assert-True (Test-Path -LiteralPath $journalPath -PathType Leaf) 'Failed previous-journal cleanup preserves the committed current journal'
+        Assert-Equal 'committed' ([string](Read-CpaStackJson -Path $journalPath).phase) 'Preserved current journal records the committed phase'
+        Assert-True ($null -ne (Get-CpaStackListener -Port $fixture.ManagerPort)) 'Committed cleanup failure leaves Manager healthy'
+        $previousJournalHandle.Dispose()
+        $previousJournalHandle = $null
+
+        Write-Utf8Text -Path $maintenanceScript -Value $originalScript
+        $recovery = Invoke-IsolatedMaintenanceCommand -ControlRoot $fixture.Root
+        Assert-Equal 0 $recovery.ExitCode "Committed cleanup recovery rerun succeeds. Output=[$($recovery.Output)] Error=[$($recovery.ErrorOutput)]"
+        Assert-True ([bool]$recovery.Result.recovered) 'Committed cleanup recovery reports recovered=true'
+        Assert-MaintenanceFixtureHealthy -Fixture $fixture
+    } finally {
+        $env:CPA_STACK_TEST_MAINTENANCE_COMMITTED_READY_PATH = $previousReady
+        $env:CPA_STACK_TEST_MAINTENANCE_COMMITTED_RELEASE_PATH = $previousRelease
+        Write-Utf8Text -Path $maintenanceScript -Value $originalScript
+        if ($null -ne $previousJournalHandle) { $previousJournalHandle.Dispose() }
+        if ($null -ne $invocation) {
+            Remove-IsolatedInterruptedScript -Invocation $invocation
+            $invocation.Process.Dispose()
+        }
+        Stop-OwnedFixturePort -Port $fixture.CpaPort -ManagedRoot $fixture.Root
+        Stop-OwnedFixturePort -Port $fixture.ManagerPort -ManagedRoot $fixture.Root
+        foreach ($path in @($readyPath, $releasePath)) {
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+        }
     }
 }
 
@@ -2326,47 +2993,69 @@ try {
     Compile-StubExecutable -BuildId 'fixture-new' -OutputPath $newBinary
     Assert-False -Condition ((Get-CpaStackFileHash -Path $oldBinary) -eq (Get-CpaStackFileHash -Path $newBinary)) -Message 'fixture builds must have distinct executable hashes'
 
-    if ($Case -in @('All', 'CpaSuccess')) {
+    if ($Case -in @('All', 'Core', 'CpaSuccess')) {
         Invoke-CpaSwitchSuccessTest -OldBinary $oldBinary -NewBinary $newBinary
     }
-    if ($Case -in @('All', 'CpaRollback')) {
+    if ($Case -in @('All', 'Core', 'CpaRollback')) {
         Invoke-CpaSwitchRollbackTest -OldBinary $oldBinary -NewBinary $newBinary
     }
-    if ($Case -in @('All', 'CpaHangCleanup')) {
+    if ($Case -in @('All', 'Core', 'CpaHangCleanup')) {
         Invoke-CpaHangBeforeListenCleanupTest -OldBinary $oldBinary -NewBinary $newBinary
     }
-    if ($Case -in @('All', 'ManagerRollback')) {
+    if ($Case -in @('All', 'Core', 'ManagerRollback')) {
         Invoke-ManagerSwitchRollbackTest -OldBinary $oldBinary -NewBinary $newBinary
     }
-    if ($Case -in @('All', 'ManagerMigrationRollback')) {
+    if ($Case -in @('All', 'Core', 'ManagerMigrationRollback')) {
         Invoke-ManagerMigrationRollbackTest -OldBinary $oldBinary -NewBinary $newBinary
     }
-    if ($Case -in @('All', 'ManagerMigrationTamper')) {
+    if ($Case -in @('All', 'Core', 'ManagerMigrationTamper')) {
         Invoke-ManagerMigrationTamperGateTest -OldBinary $oldBinary -NewBinary $newBinary
     }
-    if ($Case -in @('All', 'ManagerRecoveryGate')) {
+    if ($Case -in @('All', 'Core', 'ManagerRecoveryGate')) {
         Invoke-ManagerRecoverySourceGateTest -OldBinary $oldBinary
     }
-    if ($Case -in @('All', 'TransitionHealth')) {
+    if ($Case -in @('All', 'Core', 'TransitionHealth')) {
         Invoke-TransitionHealthTest -OldBinary $oldBinary -NewBinary $newBinary
     }
-    if ($Case -in @('All', 'PendingGate')) {
+    if ($Case -in @('All', 'Core', 'PendingGate')) {
         Invoke-PendingJournalStartupGateTest -OldBinary $oldBinary
     }
-    if ($Case -in @('All', 'RecoveryJournalGuard')) {
+    if ($Case -in @('All', 'Core', 'RecoveryJournalGuard')) {
         Invoke-RecoveryJournalValidationGuardTest -OldBinary $oldBinary -NewBinary $newBinary
     }
-    if ($Case -in @('All', 'LanSuccess')) {
+    if ($Case -in @('All', 'Core', 'LanSuccess')) {
         Invoke-LanConfigurationSuccessTest -Binary $oldBinary
     }
-    if ($Case -in @('All', 'LanRollback')) {
+    if ($Case -in @('All', 'Core', 'LanRollback')) {
         Invoke-LanConfigurationRollbackTest -Binary $oldBinary
     }
-    if ($Case -in @('All', 'LanRecovery')) {
+    if ($Case -in @('All', 'Core', 'LanRecovery')) {
         Invoke-LanHardInterruptionRecoveryTest -Binary $oldBinary
     }
-    if ($Case -in @('All', 'UpgradeCandidateRecovery')) {
+    if ($Case -in @('All', 'Core', 'UpgradeCandidateRecovery')) {
         Invoke-UpgradeCandidateHardInterruptionRecoveryTest -OldBinary $oldBinary -NewBinary $newBinary
+    }
+    if ($Case -in @('All', 'Maintenance', 'MaintenanceIdentity')) {
+        Invoke-MaintenanceIdentityGateTest -Binary $oldBinary
+    }
+    if ($Case -in @('All', 'Maintenance', 'MaintenanceResultWarning')) {
+        Invoke-MaintenanceResultPersistenceWarningTest -Binary $oldBinary
+    }
+    if ($Case -in @('All', 'Maintenance', 'MaintenanceLifecycle')) {
+        Invoke-MaintenanceLifecycleTest -Binary $oldBinary
+    }
+    if ($Case -in @('All', 'Maintenance', 'MaintenanceRecovery')) {
+        Invoke-MaintenanceRecoveryTest -Binary $oldBinary
+    }
+    if ($Case -in @('All', 'Maintenance', 'MaintenanceRollbackFailure')) {
+        Invoke-MaintenanceRollbackFailureTest -Binary $oldBinary
+    }
+    if ($Case -in @('All', 'Maintenance', 'MaintenancePendingGuard')) {
+        Invoke-MaintenancePendingRecoveryGuardTest -Binary $oldBinary
+    }
+    if ($Case -in @('All', 'Maintenance', 'MaintenanceCommitRecovery')) {
+        Invoke-MaintenanceCommitRecoveryTest -Binary $oldBinary
+        Invoke-MaintenanceCommittedJournalCleanupTest -Binary $oldBinary
     }
 
     Write-Host 'Transaction integration tests passed.'

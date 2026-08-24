@@ -1,6 +1,6 @@
 ---
 name: cpa-safe-upgrade
-description: 在 Windows 上安全检查、迁移、恢复、启动或升级 CLIProxyAPI/CPA 与 CPA Manager Plus，在 upgrade 前从固定官方 Release 自动验证并更新本 Skill，也支持可信本地发行目录的原子手工更新、CPA 桌面快捷方式管理和显式 LAN 切换。仅当用户明确要求升级、迁移、恢复、更新 cpa-safe-upgrade、生成或修复 CPA 快捷方式、改变 LAN 暴露，或显式调用 cpa-safe-upgrade 时使用；普通端口查询、监控页面问题和未伴随上述目标的日常启动不要触发。
+description: 在 Windows 上安全检查、迁移、恢复、启动、升级或离线维护 CLIProxyAPI/CPA 与 CPA Manager Plus，包括数据库提示 cleanup-derived、查询索引或旧派生数据维护；在 upgrade 前从固定官方 Release 自动验证并更新本 Skill，也支持可信本地发行目录的原子手工更新、CPA 桌面快捷方式管理和显式 LAN 切换。仅当用户明确要求上述操作、看到数据库维护未完成提示，或显式调用 cpa-safe-upgrade 时使用；普通端口查询和未伴随上述目标的监控页面问题不要触发。
 ---
 
 # CPA Safe Upgrade
@@ -68,6 +68,16 @@ managed root 优先使用用户明确给出的 `-Root`，否则让 CLI 按 `CPA_
 ```powershell
 & $cpaCli start -Root '<managed root>' -NoBrowser
 ```
+
+## Manager 离线数据库维护
+
+用户看到“数据库升级维护尚未完成”“查询索引待完成”“离线清理任务待完成”或 `cleanup-derived` 提示时，使用公开维护事务：
+
+```powershell
+& $cpaCli maintenance -Action CleanupDerived -Root '<managed root>' -Json
+```
+
+维护事务固定执行 `preflight → SQLite online backup → 固定 Manager 进程 → stop → cleanup-derived → 权威数据与 quick_check 校验 → restart`。它使用当前 canonical Manager 二进制和正式数据库，不接受用户提供的 exe、数据库或端口路径。失败时自动恢复已验证备份并重启；硬中断后重跑同一命令先恢复，再重新维护。不要直接结束 Manager、手工调用 runtime binary，或从 Web 面板在线清理。
 
 ## 桌面快速启动与独立操作
 

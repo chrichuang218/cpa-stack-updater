@@ -273,6 +273,8 @@ try {
 
     $allowed = Join-Path $safeRoot 'work\current'
     Assert-CpaStackChildPath -Root $safeRoot -Path $allowed
+    Assert-CpaStackChildPath -Root $safeRoot -Path (Join-Path $safeRoot ('rollback\staging-maintenance-' + ('a' * 32)))
+    Assert-CpaStackChildPath -Root $safeRoot -Path (Join-Path $safeRoot ('rollback\pending-maintenance-' + ('b' * 32)))
     Assert-Throws { Assert-CpaStackChildPath -Root $safeRoot -Path (Join-Path $safeRoot 'data\unrelated') } 'Unmanaged data slot is rejected'
     Assert-Throws { Assert-CpaStackChildPath -Root $safeRoot -Path (Join-Path $safeRoot 'work\other') } 'Unmanaged work slot is rejected'
 

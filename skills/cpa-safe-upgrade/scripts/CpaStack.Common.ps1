@@ -2480,7 +2480,7 @@ function Assert-CpaStackChildPath {
         '^logs\\[^\\]+(?:\\.*)?$',
         '^ops\\[^\\]+(?:\\.*)?$',
         '^releases\\current(?:\\.*)?$',
-        '^rollback\\(?:last-known-good|legacy-migration|lan\\[0-9a-fA-F]{32}|(?:staging|pending)-(?:cpa|manager)-[0-9a-fA-F]{32})(?:\\.*)?$',
+        '^rollback\\(?:last-known-good|legacy-migration|lan\\[0-9a-fA-F]{32}|(?:staging|pending)-(?:cpa|manager|maintenance)-[0-9a-fA-F]{32})(?:\\.*)?$',
         '^runtime\\(?:cli-proxy-api|manager-plus)(?:\\.*)?$',
         '^state\\[^\\]+(?:\\.*)?$',
         '^work\\(?:current|cpa-(?:candidate|\d{1,5})-[0-9a-fA-F]{32}|manager-(?:candidate|\d{1,5})-[0-9a-fA-F]{32}|manager-formal-verification-[0-9a-fA-F]{32}|mv-[0-9a-fA-F]{32})(?:\\.*)?$'

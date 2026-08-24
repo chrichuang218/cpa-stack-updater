@@ -38,6 +38,8 @@ CLI 返回 `TargetDriveNotFound` 时，选择真实存在的本地 NTFS/ReFS 盘
 
 不要删除 journal 或手工覆盖 runtime。直接针对同一 root 运行 `cpa-stack.ps1 upgrade -Json`；它会自动调用一次受限 recovery-only 流程，验证 instanceId、路径、exe/`data.key` hash、Manager 数据水位与服务状态后继续。若返回 `ManualRecoveryRequired`，保留 journal 和结构化错误并停止。
 
+`maintenance.pending.json` 属于离线数据库维护事务；重跑 `cpa-stack.ps1 maintenance -Action CleanupDerived -Json`，它会先验证并恢复备份、重启服务，再重新维护。不要用普通 `recover`、手工删除 journal 或直接复制数据库。
+
 ## 无法证明版本单调
 
 公开 `upgrade` 会自动允许用已验证的 latest stable 替换无法可靠识别版本或来源的旧 binary，不需要额外参数或确认。release checksum、候选健康、SQLite 水位和失败回滚仍按原安全门禁执行。

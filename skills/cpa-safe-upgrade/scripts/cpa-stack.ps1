@@ -3,14 +3,14 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('status', 'migrate', 'recover', 'upgrade', 'start', 'shortcut', 'lan')]
+    [ValidateSet('status', 'migrate', 'recover', 'upgrade', 'start', 'maintenance', 'shortcut', 'lan')]
     [string]$Command = 'status',
 
     [Alias('ControlRoot')]
     [string]$Root,
 
     [string]$RequestPath,
-    [ValidateSet('Check', 'Ensure', 'Set')]
+    [ValidateSet('Check', 'Ensure', 'Set', 'CleanupDerived')]
     [string]$Action,
     [ValidateSet('Loopback', 'Lan')]
     [string]$Mode,
@@ -28,6 +28,7 @@ Import-Module (Join-Path $moduleRoot 'CpaStack.MigrationTransaction.psm1') -Forc
 Import-Module (Join-Path $moduleRoot 'CpaStack.Recovery.psm1') -Force
 Import-Module (Join-Path $moduleRoot 'CpaStack.Launcher.psm1') -Force
 Import-Module (Join-Path $moduleRoot 'CpaStack.LanConfiguration.psm1') -Force
+Import-Module (Join-Path $moduleRoot 'CpaStack.Maintenance.psm1') -Force
 Import-Module (Join-Path $moduleRoot 'CpaStack.ManagedShortcut.psm1') -Force -Global
 Import-Module (Join-Path $moduleRoot 'CpaStack.Result.psm1') -Force -Global
 Import-Module (Join-Path $moduleRoot 'CpaStack.BundledHost.psm1') -Force -Global
@@ -372,6 +373,7 @@ $commandParameterNames = switch ($Command) {
     'migrate' { @('RequestPath'); break }
     'upgrade' { @('RequestPath'); break }
     'start' { @('NoBrowser'); break }
+    'maintenance' { @('Action'); break }
     'shortcut' { @('Action', 'ShortcutPath'); break }
     'lan' { @('Action', 'Mode'); break }
 }
@@ -474,6 +476,18 @@ try {
         $startResult = Invoke-CpaStackStartOperation -Root $resolvedRoot -HostAdapter $hostAdapter -NoBrowser:$NoBrowser
         Write-CommandResult -Value $startResult
         if (-not $startResult.success) { exit 1 }
+        exit 0
+    }
+    if ($Command -eq 'maintenance') {
+        if ($Action -ne 'CleanupDerived') {
+            $invalidMaintenance = New-CpaStackResult -Operation maintenance -Success $false -Outcome Blocked -Changed $false -Root $resolvedRoot `
+                -Error (New-CpaStackError -Code 'InvalidMaintenanceRequest' -Message "Maintenance requires '-Action CleanupDerived'.")
+            Write-CommandResult -Value $invalidMaintenance
+            exit 1
+        }
+        $maintenanceResult = Invoke-CpaStackMaintenanceOperation -Root $resolvedRoot -HostAdapter $hostAdapter -Action $Action
+        Write-CommandResult -Value $maintenanceResult
+        if (-not $maintenanceResult.success) { exit 1 }
         exit 0
     }
     if ($Command -eq 'lan') {

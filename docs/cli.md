@@ -76,6 +76,16 @@ Windows 定时任务应使用 `powershell.exe -NoLogo -NoProfile -NonInteractive
 
 启动或复用已接管栈。pending transaction 会返回 `RecoveryRequired`，不会自动恢复。
 
+### maintenance
+
+```powershell
+& $cpaCli maintenance -Action CleanupDerived [-Root <path>] [-Json]
+```
+
+处理 Manager Plus 的“数据库升级维护尚未完成”、查询索引或旧派生数据提示。事务只使用 canonical 配置中的当前 Manager 二进制和正式 `usage.sqlite`，不接受外部路径；先建立一致性 SQLite 备份，再固定并停止已验证的 Manager 进程，执行 `cleanup-derived`，校验 `quick_check`、权威请求水位、关键表、exe 与 `data.key`，最后重启并验证服务。
+
+清理失败时恢复备份并重启，返回 `RolledBack`；自动恢复失败时保留受保护 journal 和备份并返回稳定错误。硬中断后重跑同一命令会先恢复旧事务，再重新执行维护。CPA 服务和 LAN 配置不变。
+
 ### shortcut
 
 ```powershell

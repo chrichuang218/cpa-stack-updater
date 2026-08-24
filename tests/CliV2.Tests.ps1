@@ -97,7 +97,8 @@ Set-Content -LiteralPath (Join-Path `$ControlRoot '$name.called') -Value 'called
     foreach ($invalidInvocation in @(
         [pscustomobject]@{ Command = 'status'; Arguments = @('-Mode', 'Lan'); Operation = 'status' },
         [pscustomobject]@{ Command = 'migrate'; Arguments = @('-Mode', 'Lan'); Operation = 'migrate' },
-        [pscustomobject]@{ Command = 'upgrade'; Arguments = @('-Mode', 'Lan'); Operation = 'upgrade' }
+        [pscustomobject]@{ Command = 'upgrade'; Arguments = @('-Mode', 'Lan'); Operation = 'upgrade' },
+        [pscustomobject]@{ Command = 'maintenance'; Arguments = @('-Mode', 'Lan'); Operation = 'maintenance' }
     )) {
         $invalidArguments = @([string]$invalidInvocation.Command, '-Root', $managedRoot) + @($invalidInvocation.Arguments) + @('-Json')
         $invalid = Invoke-TestCli @invalidArguments
@@ -242,6 +243,30 @@ param([string]$ConfigPath, [switch]$NoBrowser)
     Assert-Equal 'start' $start.Json.operation 'Start identifies the operation'
     Assert-Equal 'Changed' $start.Json.outcome 'Starting a stopped program reports Changed'
     Assert-Equal 'Started' $start.Json.start.Manager.Action 'Start retains structured launcher evidence'
+
+    @'
+param([string]$ControlRoot, [ValidateSet('CleanupDerived')][string]$Action)
+[pscustomobject]@{
+    format_version = 1
+    operation = 'cleanup-derived'
+    success = $true
+    changed = $true
+    rolledBack = $false
+    recovered = $false
+    managerStopped = $true
+    managerRestarted = $true
+    databaseVerified = $true
+    action = $Action
+    error = $null
+} | ConvertTo-Json -Compress
+'@ | Set-Content -LiteralPath (Join-Path $scripts 'Invoke-CpaStackMaintenance.ps1') -Encoding UTF8
+
+    $maintenance = Invoke-TestCli maintenance -Action CleanupDerived -Root $managedRoot -Json
+    Assert-Equal 0 $maintenance.ExitCode ('Maintenance exits successfully. Output=' + ($maintenance.Output -join ' | '))
+    Assert-Equal 2 $maintenance.Json.schemaVersion 'Maintenance uses the v2 result envelope'
+    Assert-Equal 'maintenance' $maintenance.Json.operation 'Maintenance identifies the operation'
+    Assert-Equal 'Changed' $maintenance.Json.outcome 'Successful offline cleanup reports Changed'
+    Assert-Equal 'CleanupDerived' $maintenance.Json.maintenance.action 'Maintenance passes the requested action as one argument'
 
     @'
 param([string]$ControlRoot, [ValidateSet('Loopback', 'Lan')][string]$Mode)

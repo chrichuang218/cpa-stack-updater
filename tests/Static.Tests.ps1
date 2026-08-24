@@ -84,11 +84,27 @@ Assert-True ($start -match '\[CpaStack\.NativeProcessV1\]::Start') 'Canonical se
 
 $cli = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\cpa-stack.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
 $launcherModule = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'modules\CpaStack.Launcher.psm1'), [System.Text.UTF8Encoding]::new($false, $true))
+$maintenance = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\Invoke-CpaStackMaintenance.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
 Assert-True ($launcherModule -match "Invoke-CpaStackBundled\s+-HostAdapter\s+\`$HostAdapter\s+-Name\s+'Start-CPA-Stack\.ps1'") 'Public start executes the bundled trusted launcher through its host adapter'
 Assert-False ($cli -match 'function\s+(?:Invoke-BundledScript|Get-StatusResult|Get-InitArguments)') 'Public CLI contains no duplicate v0.1 execution implementation'
 Assert-False ($cli -match "'doctor'|'plan'|'init'|'register-root'") 'Public CLI contains no legacy command aliases'
 Assert-False ($cli -match '\$(?:SourceCpaRuntime|SourceCpaConfig|SourceManagerRuntime|SourceManagerData|LegacyStartScript|SecretsInputPath|DesktopShortcut|UpdateDesktopShortcut|ExposeToLan)\b') 'Public CLI contains no legacy combined-operation parameters'
 Assert-False ($cli -match '\[switch\]\$(?:AllowUnknownVersionReplacement|AdoptExisting)\b') 'Public CLI contains no no-op compatibility switches'
+Assert-True ($cli -match "'maintenance'" -and $cli -match "'CleanupDerived'") 'Public CLI exposes the bounded offline maintenance action'
+Assert-False ($cli -match '\$(?:DatabasePath|ManagerExecutable|ManagerPort)\b') 'Public maintenance does not accept runtime paths or ports'
+Assert-True ($maintenance.IndexOf('Invoke-CpaStackSqliteBackup', [System.StringComparison]::Ordinal) -lt $maintenance.IndexOf('Stop-MaintenanceManager -Context $context', [System.StringComparison]::Ordinal)) 'Maintenance creates a verified SQLite backup before stopping Manager'
+Assert-True ($maintenance.IndexOf('Stop-MaintenanceManager -Context $context', [System.StringComparison]::Ordinal) -lt $maintenance.IndexOf('$context.Executable cleanup-derived', [System.StringComparison]::Ordinal)) 'Maintenance fixes and stops Manager before offline cleanup'
+Assert-True ($maintenance.IndexOf('$context.Executable cleanup-derived', [System.StringComparison]::Ordinal) -lt $maintenance.LastIndexOf('Test-MaintenanceDatabase -Database $context.Database', [System.StringComparison]::Ordinal)) 'Maintenance validates the database after cleanup'
+Assert-True ($maintenance -match 'Get-CpaStackFixedListenerProcess' -and $maintenance -match 'ExpectedProcess\s+\$process') 'Maintenance stops only the fixed canonical Manager process'
+Assert-True ($maintenance -match 'ExpectedProcessId\s+\$context\.ProcessId' -and $maintenance -match 'MaintenanceProcessChanged') 'Initial maintenance stop remains bound to the preflight Manager PID'
+Assert-True ([regex]::Matches($maintenance, 'instanceId\s*=\s*\$instanceId').Count -ge 2) 'Maintenance manifest and journal bind to the canonical instance'
+Assert-True ($maintenance -match '\[System\.IO\.File\]::Replace' -and $maintenance -match 'MaintenanceRollbackFailed') 'Maintenance has an atomic database restore path and explicit rollback failure'
+Assert-True ($maintenance -match 'Start-CPA-Stack\.ps1' -and $maintenance -match 'OperationLockHandle\s+\$operationLock') 'Maintenance restarts under the live global operation lock'
+Assert-True ($maintenance -match 'Protect-CpaStackPrivateTree\s+-Root\s+\$Context\.DataDirectory') 'Maintenance re-protects restored Manager data before restart'
+Assert-True ($maintenance -match 'Push-Location\s+-LiteralPath\s+\$context\.WorkingDirectory') 'Offline cleanup runs from the canonical Manager working directory'
+Assert-False ($maintenance -match 'catch\s*\{\s*\}') 'Maintenance does not silently swallow failures'
+Assert-True ($maintenance -match "Phase\s+committing" -and $maintenance -match "Phase\s+committed" -and $maintenance -match 'retainedPath') 'Maintenance commit remains recoverable across backup retention and journal cleanup'
+Assert-True ($maintenance -match 'MaintenanceCommitIncomplete' -and $maintenance -match 'MaintenanceRestartFailed') 'Maintenance reports stable commit and restart failure stages'
 Assert-False ($start -match 'CPA_STACK_START_PROGRESS_PATH|Get-CpaStackStartProgressPath|AppendAllText\(\$startProgressPath') 'Canonical start contains no orphaned temp-file progress channel'
 
 $common = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\CpaStack.Common.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
@@ -215,7 +231,9 @@ Assert-True ($upgrade.IndexOf('Repair-CpaStackRecordedExecutableAcl', [System.St
 Assert-True ($upgrade.IndexOf('Assert-UpgradeSwitchPathBudget', $upgrade.IndexOf('try {', [System.StringComparison]::Ordinal), [System.StringComparison]::Ordinal) -lt $upgrade.IndexOf('Set-UpgradeJournalPhase -Phase "switching-cpa"', [System.StringComparison]::Ordinal)) 'Upgrade budgets both components before the first formal switch'
 
 $testAll = [System.IO.File]::ReadAllText((Join-Path $repo 'tools\Test-All.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
-Assert-True ($testAll -match "TransactionIntegration\.Tests\.ps1'\) \{ 2700 \} else \{ 1200 \}") 'Only the full transaction integration file receives the measured 45-minute timeout'
+Assert-True ($testAll -match "TransactionIntegration\.Core\.Tests\.ps1" -and $testAll -match "MaintenanceTransaction\.Tests\.ps1") 'Full regression shards core and maintenance transactions without dropping scenarios'
+Assert-True ($testAll -match "PSEdition\s+-eq\s+'Core'\)\s*\{\s*5400\s*\}\s*else\s*\{\s*2700") 'PS7 keeps both transaction shards with a larger bounded timeout'
+Assert-Equal 2 ([regex]::Matches($testAll, 'ValidateRange\(1, 5400\)').Count) 'Both guarded test seams accept the PS7 transaction timeout'
 Assert-True ($initialize.IndexOf('Assert-InitializationSwitchPathBudget', $initialize.IndexOf('try {', [System.StringComparison]::Ordinal), [System.StringComparison]::Ordinal) -lt $initialize.IndexOf('Set-InitializeJournalPhase -Phase "switching"', [System.StringComparison]::Ordinal)) 'Initialization budgets both components before the first formal switch'
 Assert-True ($upgrade.LastIndexOf('$result | ConvertTo-Json', [System.StringComparison]::Ordinal) -lt $upgrade.LastIndexOf('if (-not $result.success)', [System.StringComparison]::Ordinal)) 'Upgrade emits its structured result before a non-zero exit'
 foreach ($journalScript in @('Adopt-CpaStackLegacyCanonical.ps1', 'Initialize-CpaStack.ps1', 'Invoke-CpaStackUpgrade.ps1', 'Switch-CpaRuntime.ps1', 'Switch-ManagerRuntime.ps1')) {

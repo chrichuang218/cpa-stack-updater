@@ -1,5 +1,22 @@
 # 更新记录
 
+## 1.2.1 - 2026-08-25
+
+- 将 `staging-maintenance-<operationId>` 与 `pending-maintenance-<operationId>` 加入 managed rollback 固定槽白名单，修复 1.2.0 在创建备份前被路径门禁拒绝的问题；其他任意 rollback 路径继续拒绝。
+- maintenance 预检失败保留经过统一错误 seam 脱敏的具体原因，便于定位安全门禁而不输出数据库内容。
+- 首次停服绑定预检 Manager PID；PID 变化时不停止替换进程，并以 `MaintenanceProcessChanged` 关闭 prepared 事务。
+- 离线命令固定使用 canonical Manager working directory；数据库恢复后重新加固 owner/DACL，确保硬中断恢复可继续维护。
+- 结果文件持久化失败改为结构化 warning，不再静默吞错或把已提交成功的维护伪报失败。
+- journal、manifest、current state 与 instance marker 绑定同一 `instanceId`；损坏备份或跨实例 pending 以 `MaintenanceRollbackFailed` 保留现场。
+- 备份归档采用 `committing → committed` 可恢复提交，journal 清理失败返回 `MaintenanceCommitIncomplete`，重跑可从 retained backup 收敛而不回滚已验证维护。
+- 新增真实进程/SQLite failure-injection，覆盖成功、cleanup/restart 回滚、两阶段硬中断恢复、备份损坏、PID 替换和结果文件锁；完整回归拆分 core/maintenance transaction shard，PS5 各保留 2700 秒上限，PS7 各使用 5400 秒上限。
+
+## 1.2.0 - 2026-08-23
+
+- 新增公开 `maintenance -Action CleanupDerived` 事务，安全处理 Manager Plus 数据库索引与旧派生数据维护提示。
+- 维护在停服前建立一致性 SQLite 备份并固定正式 Manager 进程，清理后验证权威请求水位、关键表、`quick_check`、exe 与 `data.key`，再恢复服务；失败自动回滚，硬中断可重跑收敛。
+- CLI、Skill、文档和回归测试统一禁止用户提供运行时二进制、数据库或端口路径，LAN 与 CPA 服务配置保持不变。
+
 ## 1.1.5 - 2026-07-26
 
 - 修复自动更新默认下载闭包使用 `GetNewClosure()` 后丢失模块命令作用域，导致发现新版本时无法解析安全下载函数并以 `UpdaterReleaseValidationFailed` 停止的问题。

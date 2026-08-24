@@ -26,7 +26,7 @@ https://github.com/chrichuang218/cpa-stack-updater
 使用 $cpa-safe-upgrade 升级 CPA。
 ```
 
-以后只需说“升级 CPA”“检查 CPA”或“创建 CPA 桌面启动方式”。根目录只在首次安装、切换实例或隔离测试时指定。升级会先验证并更新 Skill，再自动处理恢复、首次迁移、稳定版替换和快捷方式维护，不重复询问；LAN 仍需单独授权。
+以后只需说“升级 CPA”“检查 CPA”“处理数据库维护提示”或“创建 CPA 桌面启动方式”。根目录只在首次安装、切换实例或隔离测试时指定。升级会先验证并更新 Skill，再自动处理恢复、首次迁移、稳定版替换和快捷方式维护，不重复询问；LAN 仍需单独授权。
 
 ## 使用截图
 
@@ -156,6 +156,17 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli start -Root $roo
 ```
 
 `start` 不会隐式恢复 pending transaction。
+
+### 3. Manager 离线数据库维护
+
+管理页面提示查询索引或旧派生数据维护未完成时，执行受控离线事务：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli maintenance `
+  -Action CleanupDerived -Root $root -Json
+```
+
+命令自动备份正式 SQLite、验证并停止当前 Manager、使用同版本二进制执行 `cleanup-derived`、校验权威请求数据并重启。失败时恢复备份；不要从 Web 面板在线清理或手工拼接数据库路径。
 
 ## 桌面快速启动
 
