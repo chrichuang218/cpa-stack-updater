@@ -646,13 +646,14 @@ function Invoke-JsonProbe {
             }
         }
 
+        $failure = New-CpaStackHttpFailureDiagnostic -Uri $Uri -Failure $_
         return [pscustomobject]@{
             Attempted = $true
             Reachable = $false
             StatusCode = $null
             Json = $null
             JsonValid = $false
-            ErrorKind = $_.Exception.GetType().Name
+            ErrorKind = $failure.failureKind
         }
     }
 }
@@ -713,24 +714,29 @@ function Get-CpaStatus {
     $models = Get-JsonPropertyValue -Object $probe.Json -Name 'data'
     $modelCount = if ($null -eq $models) { 0 } else { @($models).Count }
 
-    $healthy = (
-        (Test-Path -LiteralPath $Settings.Cpa.Executable -PathType Leaf) -and
-        (Test-Path -LiteralPath $Settings.Cpa.WorkingDirectory -PathType Container) -and
-        (Test-Path -LiteralPath $Settings.Cpa.Config -PathType Leaf) -and
-        $configPort -eq $Settings.Cpa.Port -and
-        $listeners.Count -eq 1 -and
-        $pathMatches -and
-        $addressMatches -and
-        $hashMatches -and
-        $postListenerTrusted -and
-        $TrustStateReady -and
-        $probe.StatusCode -eq 200 -and
-        $modelCount -gt 0
-    )
+    $checks = [ordered]@{
+        ExecutableExists = (Test-Path -LiteralPath $Settings.Cpa.Executable -PathType Leaf)
+        WorkingDirectoryExists = (Test-Path -LiteralPath $Settings.Cpa.WorkingDirectory -PathType Container)
+        ConfigExists = (Test-Path -LiteralPath $Settings.Cpa.Config -PathType Leaf)
+        ConfigPortMatches = ($configPort -eq $Settings.Cpa.Port)
+        SingleListener = ($listeners.Count -eq 1)
+        ListenerPathMatches = $pathMatches
+        ListenerAddressMatches = $addressMatches
+        ExecutableHashMatches = $hashMatches
+        ListenerStable = $postListenerTrusted
+        TrustStateReady = $TrustStateReady
+        HttpHealthy = ($probe.StatusCode -eq 200)
+        ModelsPresent = ($modelCount -gt 0)
+    }
+    $healthy = @($checks.Values | Where-Object { -not $_ }).Count -eq 0
 
     return [pscustomobject]@{
         Healthy = $healthy
         Port = $Settings.Cpa.Port
+        Checks = $checks
+        HttpChecks = [ordered]@{
+            '/v1/models' = $probe | Select-Object Attempted, StatusCode, JsonValid, ErrorKind
+        }
         Expected = [pscustomobject]@{
             Executable = $Settings.Cpa.Executable
             ExecutableExists = (Test-Path -LiteralPath $Settings.Cpa.Executable -PathType Leaf)
@@ -823,36 +829,41 @@ function Get-ManagerStatus {
     $dbPathMatches = Test-PathEqual -Left $dbPath -Right $expectedDbPath
     $collectorStateMatches = (-not $Settings.Manager.RequestMonitoringEnabled -or $collectorState -eq 'running')
 
-    $healthy = (
-        (Test-Path -LiteralPath $Settings.Manager.Executable -PathType Leaf) -and
-        (Test-Path -LiteralPath $Settings.Manager.WorkingDirectory -PathType Container) -and
-        (Test-Path -LiteralPath $Settings.Manager.DataDirectory -PathType Container) -and
-        (Test-Path -LiteralPath $expectedDbPath -PathType Leaf) -and
-        (Test-Path -LiteralPath (Join-Path $Settings.Manager.DataDirectory 'data.key') -PathType Leaf) -and
-        $listeners.Count -eq 1 -and
-        $pathMatches -and
-        $addressMatches -and
-        $hashMatches -and
-        $postListenerTrusted -and
-        $TrustStateReady -and
-        $healthProbe.StatusCode -eq 200 -and
-        $infoProbe.StatusCode -eq 200 -and
-        $configProbe.StatusCode -eq 200 -and
-        $statusProbe.StatusCode -eq 200 -and
-        $configured -and
-        $adminReady -and
-        $projectInitialized -and
-        -not $setupRequired -and
-        $migrationStatus -in @('ready', 'migrated') -and
-        $dataKeyReady -and
-        $collectorMatches -and
-        $collectorStateMatches -and
-        $dbPathMatches
-    )
+    $checks = [ordered]@{
+        ExecutableExists = (Test-Path -LiteralPath $Settings.Manager.Executable -PathType Leaf)
+        WorkingDirectoryExists = (Test-Path -LiteralPath $Settings.Manager.WorkingDirectory -PathType Container)
+        DataDirectoryExists = (Test-Path -LiteralPath $Settings.Manager.DataDirectory -PathType Container)
+        DatabaseExists = (Test-Path -LiteralPath $expectedDbPath -PathType Leaf)
+        DataKeyExists = (Test-Path -LiteralPath (Join-Path $Settings.Manager.DataDirectory 'data.key') -PathType Leaf)
+        SingleListener = ($listeners.Count -eq 1)
+        ListenerPathMatches = $pathMatches
+        ListenerAddressMatches = $addressMatches
+        ExecutableHashMatches = $hashMatches
+        ListenerStable = $postListenerTrusted
+        TrustStateReady = $TrustStateReady
+        HttpHealthy = ($healthProbe.StatusCode -eq 200 -and $infoProbe.StatusCode -eq 200 -and $configProbe.StatusCode -eq 200 -and $statusProbe.StatusCode -eq 200)
+        Configured = $configured
+        AdminReady = $adminReady
+        ProjectInitialized = $projectInitialized
+        SetupComplete = (-not $setupRequired)
+        MigrationReady = ($migrationStatus -in @('ready', 'migrated'))
+        DataKeyReady = $dataKeyReady
+        CollectorEnabledMatches = $collectorMatches
+        CollectorRunning = $collectorStateMatches
+        DatabasePathMatches = $dbPathMatches
+    }
+    $healthy = @($checks.Values | Where-Object { -not $_ }).Count -eq 0
 
     return [pscustomobject]@{
         Healthy = $healthy
         Port = $Settings.Manager.Port
+        Checks = $checks
+        HttpChecks = [ordered]@{
+            '/health' = $healthProbe | Select-Object Attempted, StatusCode, JsonValid, ErrorKind
+            '/usage-service/info' = $infoProbe | Select-Object Attempted, StatusCode, JsonValid, ErrorKind
+            '/usage-service/config' = $configProbe | Select-Object Attempted, StatusCode, JsonValid, ErrorKind
+            '/status' = $statusProbe | Select-Object Attempted, StatusCode, JsonValid, ErrorKind
+        }
         Expected = [pscustomobject]@{
             Executable = $Settings.Manager.Executable
             ExecutableExists = (Test-Path -LiteralPath $Settings.Manager.Executable -PathType Leaf)

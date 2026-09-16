@@ -216,6 +216,14 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli lan -Action Set 
 
 完整语法见 [docs/cli.md](docs/cli.md)。
 
+### 升级失败诊断
+
+升级事务的 `upgrade.diagnostics`（同时保存在受管目录的 `state/last-upgrade.json` 中）按时间顺序记录预检、切换后检查、恢复检查和异常位置。`failedChecks` 列出未通过的具体条件，`http` 仅包含组件、请求方法、允许的接口路径、HTTP 状态码或网络失败类型。首次失败和后续恢复观察分别保留；Manager 候选诊断也会附到升级结果中。
+
+诊断不包含密钥、请求头/正文、响应正文、完整配置、数据库内容、URL 查询参数或候选端口。定位时优先看第一条非空 `failedChecks` 或异常记录，再比较后续恢复检查。`recovered=true` 表示内部恢复已成功，不表示整个升级成功；`changed=true` 可与 `success=false` 同时出现，表示已有组件成功切换，仍需结合组件结果确认最终状态。
+
+仅修改或提交本仓库不会更新已安装的 Skill。要让下一次自动升级使用这些诊断，需要通过正式发布自更新，或用用户指定的可信本地发行目录执行安装器更新。
+
 ## 卸载
 
 ```powershell

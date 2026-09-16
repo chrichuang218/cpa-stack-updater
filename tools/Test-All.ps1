@@ -404,6 +404,7 @@ try {
         'tests\Maintenance.Tests.ps1',
         'tests\SelfUpdate.Tests.ps1',
         'tests\CliV2.Tests.ps1',
+        'tests\UpgradeDiagnostics.Tests.ps1',
         'tests\Static.Tests.ps1',
         'tests\Shortcut.Tests.ps1',
         'tests\PathSafety.Tests.ps1',

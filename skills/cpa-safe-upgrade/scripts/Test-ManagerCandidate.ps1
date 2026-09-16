@@ -40,6 +40,7 @@ $result = [ordered]@{
     hasHistoricalData = $false
     collectorEnabled = $null
     dataKeyPreserved = $false
+    diagnostics = @()
     error = $null
 }
 
@@ -93,7 +94,13 @@ function Test-ManagerCandidateHttp {
     if ($ExpectHistorical -and -not [bool]$info.hasHistoricalData) {
         throw "Manager candidate did not detect historical data."
     }
-    $page = Invoke-WebRequest -Uri "http://127.0.0.1:$TempPort/management.html" -UseBasicParsing -TimeoutSec 10
+    $pageUri = "http://127.0.0.1:$TempPort/management.html"
+    try {
+        $page = Invoke-WebRequest -Uri $pageUri -UseBasicParsing -TimeoutSec 10
+    } catch {
+        $_.Exception.Data['CpaStackHttpDiagnostic'] = New-CpaStackHttpFailureDiagnostic -Uri $pageUri -Failure $_
+        throw
+    }
     if ($page.StatusCode -ne 200 -or $page.Content -notmatch "CPA Manager Plus") {
         throw "Manager candidate embedded page validation failed."
     }
@@ -135,6 +142,9 @@ try {
         [void](Assert-CpaStackManagerSetupBaseline -ManagerPort $FormalPort -ManagerAdminKey $secrets.managerAdminKey -Expected $formalBaseline)
         Assert-FormalManagerListener
         $result.emptyDataSmoke = $true
+    } catch {
+        $result.diagnostics += New-CpaStackFailureDiagnostic -Stage 'manager-candidate-empty-data' -Failure $_
+        throw
     } finally {
         Stop-ManagerCandidateProcess
         if ($formalBaselineRestoreRequired) {
@@ -202,17 +212,22 @@ try {
         $result.hasHistoricalData = [bool]$snapshotState.info.hasHistoricalData
         $result.collectorEnabled = [bool]$snapshotState.config.config.collector.enabled
         $result.dataKeyPreserved = ((Get-CpaStackFileHash -Path (Join-Path $snapshotData "data.key")) -eq $sourceDataKeyHash)
+    } catch {
+        $result.diagnostics += New-CpaStackFailureDiagnostic -Stage 'manager-candidate-snapshot' -Failure $_
+        throw
     } finally {
         Stop-ManagerCandidateProcess
     }
 
     $result.success = ($result.emptyDataSmoke -and $result.snapshotCompatibility -and $result.dataKeyPreserved -and ($result.collectorEnabled -eq $false))
 } catch {
+    $result.diagnostics += New-CpaStackFailureDiagnostic -Stage 'manager-candidate' -Failure $_
     $result.error = $_.Exception.Message
 } finally {
     try {
         Stop-ManagerCandidateProcess
     } catch {
+        $result.diagnostics += New-CpaStackFailureDiagnostic -Stage 'manager-candidate-cleanup' -Failure $_
         $result.success = $false
         $result.error = (($result.error, "Candidate cleanup failed: $($_.Exception.Message)") | Where-Object { $_ }) -join ' '
     } finally {
@@ -228,6 +243,7 @@ try {
             Assert-FormalManagerListener
             $formalBaselineRestoreRequired = $false
         } catch {
+            $result.diagnostics += New-CpaStackFailureDiagnostic -Stage 'manager-candidate-restore' -Failure $_
             $result.error = $result.error + " Formal collector restore failed: " + $_.Exception.Message
         }
     }
@@ -238,7 +254,11 @@ try {
 }
 
 if (-not $result.success) {
-    if ($InProcess) { throw $result.error }
+    if ($InProcess) {
+        $failure = [System.Exception]::new($result.error)
+        $failure.Data['CpaStackDiagnostics'] = $result.diagnostics
+        throw $failure
+    }
     Write-Error $result.error
     exit 1
 }

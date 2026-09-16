@@ -249,6 +249,28 @@ try {
         -Message 'Upgrade string failure'
     Assert-Equal 'Legacy upgrade failure. ExitCode=23.' $upgradeDocument.error.message 'Upgrade retains the safe legacy string summary'
 
+    foreach ($case in @(
+        @{ Success = $true; Skipped = $false; RolledBack = $false; Changed = $true },
+        @{ Success = $false; Skipped = $false; RolledBack = $false; Changed = $false },
+        @{ Success = $true; Skipped = $true; RolledBack = $false; Changed = $false },
+        @{ Success = $false; Skipped = $false; RolledBack = $true; Changed = $false }
+    )) {
+        $partialAdapter = New-FakeHostAdapter -Runs ([ordered]@{
+            'Get-CpaStackState.ps1' = New-FakeRun -Json (New-HealthyState)
+            'Invoke-CpaStackUpgrade.ps1' = New-FakeRun -ExitCode 1 -Json ([pscustomobject]@{
+                success = $false; recoveredInterruptedState = $true
+                cpa = @{ success = $case.Success; skipped = $case.Skipped; rolledBack = $case.RolledBack }
+                manager = $null; error = 'Recovery health check failed.'
+                diagnostics = @(@{ stage = 'recovery-health'; failedChecks = @('Manager.Checks.CollectorRunning') }, @{ stage = 'recovery-health'; failedChecks = @() })
+            })
+        })
+        $partial = ConvertTo-ContractDocument (Invoke-CpaStackUpgradeTransaction -Root $root -HostAdapter $partialAdapter)
+        Assert-False $partial.success 'Recovery must not turn the failed upgrade into success'
+        Assert-Equal $case.Changed $partial.changed 'Only successful non-skipped non-rolled-back switches report changes'
+        Assert-True $partial.recovered 'Internal recovery success reaches the v2 result'
+        Assert-Equal 2 $partial.upgrade.diagnostics.Count 'Both failed and recovered observations survive envelope conversion'
+    }
+
     $startAdapter = New-FakeHostAdapter -Runs ([ordered]@{
         'Get-CpaStackState.ps1' = New-FakeRun -Json (New-HealthyState)
         'Start-CPA-Stack.ps1' = New-FakeRun -Json ([pscustomobject]@{

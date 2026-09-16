@@ -1890,6 +1890,110 @@ function Stop-CpaStackPort {
     throw "Process on port $Port did not stop within $WaitSeconds seconds."
 }
 
+function Get-CpaStackDiagnosticValue {
+    param($Object, [string]$Path)
+
+    foreach ($name in $Path.Split('.')) {
+        if ($null -eq $Object) { return $null }
+        if ($Object -is [System.Collections.IDictionary]) { $Object = $Object[$name] }
+        else {
+            $property = $Object.PSObject.Properties[$name]
+            if ($null -eq $property) { return $null }
+            $Object = $property.Value
+        }
+    }
+    return $Object
+}
+
+function New-CpaStackHttpFailureDiagnostic {
+    param([string]$Uri, [string]$Method = 'GET', [System.Management.Automation.ErrorRecord]$Failure)
+
+    # Never retain the authority/port, query, credentials, headers, body or exception message.
+    $parsed = $null
+    $endpoint = 'unrecognized'
+    if ([Uri]::TryCreate($Uri, [UriKind]::Absolute, [ref]$parsed) -and
+        $parsed.AbsolutePath -cin @('/health', '/v1/models', '/usage-service/info', '/usage-service/config', '/status', '/setup', '/management.html')) {
+        $endpoint = $parsed.AbsolutePath
+    }
+    $statusCode = $null
+    $failureKind = 'RequestFailed'
+    $exception = $Failure.Exception
+    while ($null -ne $exception) {
+        if ($exception -is [System.Net.WebException]) { $failureKind = [string]$exception.Status }
+        if ($exception -is [System.TimeoutException] -or $exception -is [System.OperationCanceledException]) { $failureKind = 'Timeout' }
+        $response = Get-CpaStackDiagnosticValue -Object $exception -Path 'Response'
+        $status = Get-CpaStackDiagnosticValue -Object $response -Path 'StatusCode'
+        if ($null -ne $status) { $statusCode = [int]$status; $failureKind = 'HttpError'; break }
+        $exception = $exception.InnerException
+    }
+    return [ordered]@{
+        method = if ($Method -cin @('GET', 'POST')) { $Method } else { 'unknown' }
+        endpoint = $endpoint
+        statusCode = $statusCode
+        failureKind = $failureKind
+    }
+}
+
+function New-CpaStackHealthDiagnostic {
+    param([string]$Stage, $State)
+
+    $checks = [ordered]@{}
+    $paths = @('CanonicalEstablished', 'Security.RootAcl.Protected',
+        'Security.ManagerDataTree.Protected', 'Security.Integrity.Ready', 'Configuration.Secrets.Ready',
+        'Cpa.Healthy', 'Manager.Healthy')
+    foreach ($component in @('Cpa', 'Manager')) {
+        foreach ($name in @('ExecutableExists', 'WorkingDirectoryExists', 'ConfigExists', 'ConfigPortMatches',
+            'DataDirectoryExists', 'DatabaseExists', 'DataKeyExists', 'SingleListener', 'ListenerPathMatches',
+            'ListenerAddressMatches', 'ExecutableHashMatches', 'ListenerStable', 'TrustStateReady',
+            'HttpHealthy', 'ModelsPresent', 'Configured', 'AdminReady', 'ProjectInitialized', 'SetupComplete',
+            'MigrationReady', 'DataKeyReady', 'CollectorEnabledMatches', 'CollectorRunning', 'DatabasePathMatches')) {
+            $paths += "$component.Checks.$name"
+        }
+    }
+    foreach ($path in $paths) {
+        $value = Get-CpaStackDiagnosticValue -Object $State -Path $path
+        if ($value -is [bool]) { $checks[$path] = $value }
+    }
+    $http = @()
+    foreach ($component in @('Cpa', 'Manager')) {
+        $probes = Get-CpaStackDiagnosticValue -Object $State -Path "$component.HttpChecks"
+        foreach ($endpoint in @('/v1/models', '/health', '/usage-service/info', '/usage-service/config', '/status')) {
+            $probe = Get-CpaStackDiagnosticValue -Object $probes -Path $endpoint
+            if ($null -eq $probe) { continue }
+            $code = Get-CpaStackDiagnosticValue -Object $probe -Path 'StatusCode'
+            $kind = Get-CpaStackDiagnosticValue -Object $probe -Path 'ErrorKind'
+            $http += [ordered]@{
+                component = $component; method = 'GET'; endpoint = $endpoint
+                statusCode = if ($code -is [int] -or $code -is [long]) { $code } else { $null }
+                failureKind = if ($kind -cin @('HttpError', 'Timeout', 'TimeoutException', 'WebException', 'ConnectFailure', 'ConnectionClosed', 'ReceiveFailure', 'SendFailure', 'RequestCanceled', 'RequestFailed', 'CredentialsUnavailable')) { $kind } elseif ($null -ne $kind) { 'RequestFailed' } else { $null }
+                attempted = [bool](Get-CpaStackDiagnosticValue -Object $probe -Path 'Attempted')
+                jsonValid = [bool](Get-CpaStackDiagnosticValue -Object $probe -Path 'JsonValid')
+            }
+        }
+    }
+    $overallHealthy = Get-CpaStackDiagnosticValue -Object $State -Path 'OverallHealthy'
+    return [ordered]@{
+        at = [DateTimeOffset]::UtcNow.ToString('o'); stage = $Stage; kind = 'health'
+        # OverallHealthy can be false solely because a valid switch is still pending.
+        overallHealthy = if ($overallHealthy -is [bool]) { $overallHealthy } else { $null }
+        checks = $checks
+        failedChecks = @($checks.Keys | Where-Object { -not $checks[$_] })
+        http = $http
+    }
+}
+
+function New-CpaStackFailureDiagnostic {
+    param([string]$Stage, [System.Management.Automation.ErrorRecord]$Failure)
+
+    return [ordered]@{
+        at = [DateTimeOffset]::UtcNow.ToString('o'); stage = $Stage; kind = 'exception'
+        script = [System.IO.Path]::GetFileName($Failure.InvocationInfo.ScriptName)
+        line = $Failure.InvocationInfo.ScriptLineNumber
+        exceptionType = $Failure.Exception.GetType().FullName
+        http = $Failure.Exception.Data['CpaStackHttpDiagnostic']
+    }
+}
+
 function Invoke-CpaStackHttpJson {
     param(
         [Parameter(Mandatory = $true)][string]$Uri,
@@ -1910,7 +2014,12 @@ function Invoke-CpaStackHttpJson {
         $parameters.ContentType = "application/json"
         $parameters.Body = $Body
     }
-    return Invoke-RestMethod @parameters
+    try {
+        return Invoke-RestMethod @parameters
+    } catch {
+        $_.Exception.Data['CpaStackHttpDiagnostic'] = New-CpaStackHttpFailureDiagnostic -Uri $Uri -Method $Method -Failure $_
+        throw
+    }
 }
 
 function Wait-CpaStackHttpJson {
@@ -1922,15 +2031,19 @@ function Wait-CpaStackHttpJson {
 
     $deadline = (Get-Date).AddSeconds($Seconds)
     $lastError = $null
+    $lastFailure = $null
     while ((Get-Date) -lt $deadline) {
         try {
             return Invoke-CpaStackHttpJson -Uri $Uri -Headers $Headers -TimeoutSec 3
         } catch {
             $lastError = $_.Exception.Message
+            $lastFailure = $_
         }
         Start-Sleep -Milliseconds 300
     }
-    throw "Timed out waiting for $Uri. Last error: $lastError"
+    $timeout = [System.TimeoutException]::new("Timed out waiting for $Uri. Last error: $lastError")
+    if ($null -ne $lastFailure) { $timeout.Data['CpaStackHttpDiagnostic'] = $lastFailure.Exception.Data['CpaStackHttpDiagnostic'] }
+    throw $timeout
 }
 
 function Get-CpaStackManagerSetupBaseline {

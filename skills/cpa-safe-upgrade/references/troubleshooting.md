@@ -48,6 +48,10 @@ CLI 返回 `TargetDriveNotFound` 时，选择真实存在的本地 NTFS/ReFS 盘
 
 正式服务应保持不变。只查看结构化错误和 managed root 中的小型 state 结果；GitHub Issue 中不要上传数据库、key、auth、完整配置或日志。
 
+新版升级结果中的 `upgrade.diagnostics` 保留按时间排序的脱敏诊断，同一数组也保存在 `state/last-upgrade.json` 的 `diagnostics` 中。先找第一条包含 `failedChecks` 的健康检查，或 `kind=exception` 的记录，再对比后续恢复检查；不要用最后一次成功检查覆盖首次失败证据。`http` 可区分具体接口的 HTTP 状态码与超时/连接失败，异常记录只保留脚本文件名、行号和类型，不包含调用参数或原始响应。
+
+`success=false` 可以同时伴随 `changed=true` 或 `recovered=true`：组件可能已切换、后续恢复也可能成功，但整个升级仍未完成。按错误停止后续运行时操作；需要诊断时使用公开只读 `status` 核对当前服务，不把这些字段当作绕过失败门禁的依据。
+
 候选即使未成功监听，也应由 updater 按已启动的固定 `Process` 清理。不要因候选端口已经消失就假定进程已退出，也不要使用递归结束进程的命令；让事务等待原进程和 executable 文件锁释放。
 
 如果网络必须经过代理，不要把账号口令写进 `HTTP_PROXY`/`HTTPS_PROXY` URL；安全进程环境会丢弃带 userinfo、query 或 fragment 的代理值。改用 Windows/企业无内嵌口令代理配置后重试。

@@ -35,6 +35,7 @@ $result = [ordered]@{
     launcherUpdated = $false
     journalCleanupWarning = $null
     cleanupWarning = $null
+    diagnostics = @()
     error = $null
 }
 $operationMutex = $null
@@ -42,6 +43,14 @@ $upgradeJournal = $null
 $instanceMarker = $null
 $candidatePortPlan = $null
 $suppressResultPersistence = $false
+$diagnosticStage = 'preflight'
+
+function Add-UpgradeDiagnostic {
+    param($Diagnostic)
+
+    # Append instead of replacing: a successful recovery must not erase the failed probe.
+    $result.diagnostics += $Diagnostic
+}
 
 function Invoke-ChildPowerShellJson {
     param([string]$Script, [string[]]$Arguments, [switch]$AllowNonZero)
@@ -83,6 +92,10 @@ function Invoke-InProcessPowerShellJson {
     try {
         $output = @(& $Script @parameters)
     } catch {
+        foreach ($diagnostic in @($_.Exception.Data['CpaStackDiagnostics'])) {
+            if ($null -ne $diagnostic) { Add-UpgradeDiagnostic $diagnostic }
+        }
+        Add-UpgradeDiagnostic (New-CpaStackFailureDiagnostic -Stage $diagnosticStage -Failure $_)
         throw "In-process bundled script failed: $Script. $($_.Exception.Message)"
     }
     $text = $output -join [Environment]::NewLine
@@ -266,6 +279,8 @@ function Prepare-CpaCandidateRuntime {
 
 function Set-UpgradeJournalPhase {
     param([string]$Phase)
+
+    $script:diagnosticStage = $Phase
     if ($null -eq $script:upgradeJournal) { return }
     $script:upgradeJournal.phase = $Phase
     $script:upgradeJournal.updatedAt = (Get-Date).ToString("o")
@@ -379,6 +394,7 @@ function Assert-SwitchedServicesHealthy {
         '-ControlRoot', $ControlRoot,
         '-PendingSwitchComponent', $PendingSwitchComponent
     ) -AllowNonZero
+    Add-UpgradeDiagnostic (New-CpaStackHealthDiagnostic -Stage "post-switch-$PendingSwitchComponent" -State $state)
     if (-not $state.Cpa.Healthy -or -not $state.Manager.Healthy) {
         throw 'A switched component did not preserve the health of both formal services.'
     }
@@ -1335,6 +1351,7 @@ function Restore-CanonicalInterruptedState {
     }
 
     $recoveredState = Invoke-ChildPowerShellJson -Script (Join-Path $PSScriptRoot "Get-CpaStackState.ps1") -Arguments @("-ControlRoot", $ControlRoot) -AllowNonZero
+    Add-UpgradeDiagnostic (New-CpaStackHealthDiagnostic -Stage 'recovery-health' -State $recoveredState)
     if (-not $recoveredState.Cpa.Healthy -or -not $recoveredState.Manager.Healthy -or -not $recoveredState.Security.Integrity.Ready) {
         throw "Canonical services restarted but did not pass recovery health checks."
     }
@@ -1427,6 +1444,7 @@ try {
         Repair-CpaStackRecordedExecutableAcl -CurrentState $identityState -Stack $stack -CpaRuntime $cpaRuntime -ManagerRuntime $managerRuntime
     }
     $preflight = Invoke-ChildPowerShellJson -Script (Join-Path $PSScriptRoot "Get-CpaStackState.ps1") -Arguments @("-ControlRoot", $ControlRoot) -AllowNonZero
+    Add-UpgradeDiagnostic (New-CpaStackHealthDiagnostic -Stage 'preflight' -State $preflight)
     $hasSwitchJournal = (Test-Path -LiteralPath (Join-Path $stateDir "switch-cpa.pending.json") -PathType Leaf) -or (Test-Path -LiteralPath (Join-Path $stateDir "switch-manager.pending.json") -PathType Leaf)
     $hasUpgradeJournal = Test-Path -LiteralPath $upgradeJournalPath -PathType Leaf
     if ($hasSwitchJournal) {
@@ -1666,16 +1684,20 @@ try {
     }
 } catch {
     $result.error = $_.Exception.Message
+    Add-UpgradeDiagnostic (New-CpaStackFailureDiagnostic -Stage $diagnosticStage -Failure $_)
+    $diagnosticStage = 'failure-recovery'
     $switchJournalPresent = (Test-Path -LiteralPath (Join-Path $stateDir "switch-cpa.pending.json") -PathType Leaf) -or (Test-Path -LiteralPath (Join-Path $stateDir "switch-manager.pending.json") -PathType Leaf)
     if ($switchJournalPresent) {
         try {
             $failedState = Invoke-ChildPowerShellJson -Script (Join-Path $PSScriptRoot 'Get-CpaStackState.ps1') -Arguments @('-ControlRoot', $ControlRoot) -AllowNonZero
+            Add-UpgradeDiagnostic (New-CpaStackHealthDiagnostic -Stage 'before-failure-recovery' -State $failedState)
             Restore-CanonicalInterruptedState -CpaRuntime $cpaRuntime -ManagerRuntime $managerRuntime -ManagerData $managerData -Preflight $failedState
             if (Test-Path -LiteralPath $upgradeJournalPath -PathType Leaf) {
                 [void](Recover-UpgradePreparationState -CpaRuntime $cpaRuntime -ManagerRuntime $managerRuntime)
             }
             $result.recoveredInterruptedState = $true
         } catch {
+            Add-UpgradeDiagnostic (New-CpaStackFailureDiagnostic -Stage $diagnosticStage -Failure $_)
             $result.error += " Immediate switch recovery failed: " + $_.Exception.Message
         }
     } else {
@@ -1686,6 +1708,7 @@ try {
                 Clear-SensitiveUpgradeWork
             }
         } catch {
+            Add-UpgradeDiagnostic (New-CpaStackFailureDiagnostic -Stage $diagnosticStage -Failure $_)
             $result.error += " Sensitive/recovery cleanup failed: " + $_.Exception.Message
         }
     }

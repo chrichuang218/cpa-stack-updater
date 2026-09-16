@@ -51,29 +51,35 @@ function Invoke-CpaStackUpgradeTransaction {
     $success = ($run.ExitCode -eq 0 -and [bool](Get-CpaStackValue -Object $run.Json -Name 'success' -Default $false))
     $cpa = Get-CpaStackValue -Object $run.Json -Name 'cpa'
     $manager = Get-CpaStackValue -Object $run.Json -Name 'manager'
-    $cpaChanged = $null -ne $cpa -and -not [bool](Get-CpaStackValue -Object $cpa -Name 'skipped' -Default $false)
-    $managerChanged = $null -ne $manager -and -not [bool](Get-CpaStackValue -Object $manager -Name 'skipped' -Default $false)
+    $cpaChanged = [bool](Get-CpaStackValue -Object $cpa -Name 'success' -Default $false) -and
+        -not [bool](Get-CpaStackValue -Object $cpa -Name 'skipped' -Default $false) -and
+        -not [bool](Get-CpaStackValue -Object $cpa -Name 'rolledBack' -Default $false)
+    $managerChanged = [bool](Get-CpaStackValue -Object $manager -Name 'success' -Default $false) -and
+        -not [bool](Get-CpaStackValue -Object $manager -Name 'skipped' -Default $false) -and
+        -not [bool](Get-CpaStackValue -Object $manager -Name 'rolledBack' -Default $false)
     $changed = [bool]($cpaChanged -or $managerChanged)
+    $recovered = [bool](Get-CpaStackValue -Object $run.Json -Name 'recoveredInterruptedState' -Default $false)
     $rolledBack = [bool](Get-CpaStackValue -Object $cpa -Name 'rolledBack' -Default $false) -or
         [bool](Get-CpaStackValue -Object $manager -Name 'rolledBack' -Default $false)
     $innerError = Get-CpaStackValue -Object $run.Json -Name 'error'
     if ($success) {
         $outcome = if ($changed) { 'Changed' } else { 'NoChange' }
         return New-CpaStackResult -Operation upgrade -Success $true -Outcome $outcome -Changed $changed -Root $Root `
+            -Recovered $recovered `
             -Extensions ([ordered]@{ upgrade = $run.Json })
     }
     if ($rolledBack) {
         $failureError = ConvertTo-CpaStackError -InputObject $innerError -Run $run -DefaultCode 'FormalSwitchFailedRolledBack' `
             -DefaultMessage 'Upgrade failed and the previous runtime was restored.' -DefaultPhase 'upgrade'
         Set-CpaStackValue -Object $run.Json -Name 'error' -Value $failureError
-        return New-CpaStackResult -Operation upgrade -Success $false -Outcome RolledBack -Changed $false -Root $Root -RolledBack $true `
+        return New-CpaStackResult -Operation upgrade -Success $false -Outcome RolledBack -Changed $changed -Root $Root -RolledBack $true -Recovered $recovered `
             -Error $failureError `
             -Extensions ([ordered]@{ upgrade = $run.Json })
     }
     $failureError = ConvertTo-CpaStackError -InputObject $innerError -Run $run -DefaultCode 'UpgradeFailed' `
         -DefaultMessage 'Upgrade failed.' -DefaultPhase 'upgrade'
     Set-CpaStackValue -Object $run.Json -Name 'error' -Value $failureError
-    return New-CpaStackResult -Operation upgrade -Success $false -Outcome Blocked -Changed $false -Root $Root `
+    return New-CpaStackResult -Operation upgrade -Success $false -Outcome Blocked -Changed $changed -Root $Root -Recovered $recovered `
         -Error $failureError `
         -Extensions ([ordered]@{ upgrade = $run.Json })
 }
