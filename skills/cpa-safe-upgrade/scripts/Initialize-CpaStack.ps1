@@ -19,6 +19,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "CpaStack.Common.ps1")
+Import-Module (Join-Path $PSScriptRoot '..\modules\CpaStack.BundledHost.psm1')
+$bundledHost = New-CpaStackBundledHost -ScriptsRoot $PSScriptRoot
 
 $ControlRoot = Resolve-CpaStackControlRoot -RequestedRoot $ControlRoot
 $ControlRoot = Assert-CpaStackSecureLocalRoot -Path $ControlRoot
@@ -74,47 +76,24 @@ $result = [ordered]@{
 }
 
 function Invoke-ChildPowerShell {
-    param([string]$Script, [string[]]$Arguments)
-    [void](Invoke-InProcessPowerShellJson -Script $Script -Arguments $Arguments)
+    param([string]$Script, [hashtable]$Parameters = @{})
+    [void](Invoke-InProcessPowerShellJson -Script $Script -Parameters $Parameters)
 }
 
 function Invoke-ChildPowerShellJson {
     param([string]$Script, [string[]]$Arguments)
 
-    $powershell = (Get-Command pwsh.exe -ErrorAction Stop).Source
-    $output = @(& $powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $Script @Arguments 2>&1)
-    $exitCode = $LASTEXITCODE
-    $text = $output -join [Environment]::NewLine
-    if ($exitCode -ne 0) {
-        throw "Child script failed: $Script. $text"
+    $run = Invoke-CpaStackBundled -HostAdapter $bundledHost -Name ([IO.Path]::GetFileName($Script)) -Arguments $Arguments
+    if ($null -eq $run.Json -or $run.ExitCode -ne 0) {
+        throw "Child script failed: $Script. $($run.Text)"
     }
-    return $text | ConvertFrom-Json
-}
-
-function ConvertTo-InProcessParameters {
-    param([string[]]$Arguments)
-
-    $parameters = @{}
-    for ($index = 0; $index -lt $Arguments.Count; $index++) {
-        $token = [string]$Arguments[$index]
-        if (-not $token.StartsWith('-') -or $token.Length -lt 2) { throw "Invalid bundled script argument token: $token" }
-        $name = $token.Substring(1)
-        $value = $true
-        if ($index + 1 -lt $Arguments.Count -and -not ([string]$Arguments[$index + 1]).StartsWith('-')) {
-            $index++
-            $value = $Arguments[$index]
-        }
-        $parameters[$name] = $value
-    }
-    return $parameters
+    return $run.Json
 }
 
 function Invoke-InProcessPowerShellJson {
-    param([string]$Script, [string[]]$Arguments, [hashtable]$AdditionalParameters = @{})
-
-    $parameters = ConvertTo-InProcessParameters -Arguments $Arguments
+    param([string]$Script, [hashtable]$Parameters = @{})
+    $parameters = $Parameters.Clone()
     $parameters['InProcess'] = $true
-    foreach ($name in $AdditionalParameters.Keys) { $parameters[$name] = $AdditionalParameters[$name] }
     try {
         $output = @(& $Script @parameters)
     } catch {
@@ -1473,7 +1452,7 @@ function Test-CommittedCanonicalInitialization {
         throw "An unexpected process owns Manager formal port $ManagerPort during committed initialization recovery."
     }
     if (-not $cpaListener -or -not $managerListener) {
-        $startResult = Invoke-InProcessPowerShellJson -Script (Join-Path $PSScriptRoot 'Start-CPA-Stack.ps1') -Arguments @("-NoBrowser", "-ConfigPath", $stackConfigPath) -AdditionalParameters @{ OperationLockHandle = $operationMutex; RecoveryMode = $true; StartedProcessRegistration = $registrationCallback }
+        $startResult = Invoke-InProcessPowerShellJson -Script (Join-Path $PSScriptRoot 'Start-CPA-Stack.ps1') -Parameters @{ NoBrowser = $true; ConfigPath = $stackConfigPath; OperationLockHandle = $operationMutex; RecoveryMode = $true; StartedProcessRegistration = $registrationCallback }
         if (-not $startResult.Success) { throw "Committed canonical stack could not be restarted: $($startResult.Error.Message)" }
         $cpaListener = Get-CpaStackListener -Port $CpaPort
         $managerListener = Get-CpaStackListener -Port $ManagerPort
@@ -1879,15 +1858,16 @@ try {
     $initializeJournal.stackConfigSha256 = Get-CpaStackFileHash -Path $stackConfigPath
     Set-InitializeJournalPhase -Phase "prepared"
 
-    $cpaCandidate = Invoke-InProcessPowerShellJson -Script (Join-Path $PSScriptRoot "Test-CpaCandidate.ps1") -Arguments @(
-        "-ControlRoot", $ControlRoot,
-        "-CandidateRuntime", $targetCpaRuntime,
-        "-ActiveConfig", (Join-Path $targetCpaRuntime "config.yaml"),
-        "-ActiveRuntime", $SourceCpaRuntime,
-        "-ExpectedCandidateHash", (Get-CpaStackFileHash -Path (Join-Path $targetCpaRuntime "cli-proxy-api.exe")),
-        "-ResultPath", (Join-Path $stateDir "cpa-candidate-migration-test.json"),
-        "-Port", ([string]$cpaCandidatePort)
-    ) -AdditionalParameters @{ FormalPort = @($CpaPort, $ManagerPort) }
+    $cpaCandidate = Invoke-InProcessPowerShellJson -Script (Join-Path $PSScriptRoot "Test-CpaCandidate.ps1") -Parameters @{
+        ControlRoot = $ControlRoot
+        CandidateRuntime = $targetCpaRuntime
+        ActiveConfig = (Join-Path $targetCpaRuntime "config.yaml")
+        ActiveRuntime = $SourceCpaRuntime
+        ExpectedCandidateHash = (Get-CpaStackFileHash -Path (Join-Path $targetCpaRuntime "cli-proxy-api.exe"))
+        ResultPath = (Join-Path $stateDir "cpa-candidate-migration-test.json")
+        Port = ([string]$cpaCandidatePort)
+        FormalPort = @($CpaPort, $ManagerPort)
+    }
     if ([string]$cpaCandidate.runtimeManifestSha256 -notmatch '^[0-9A-Fa-f]{64}$' -or
         [string]$cpaCandidate.activeConfigSha256 -notmatch '^[0-9A-Fa-f]{64}$' -or
         [string]::IsNullOrWhiteSpace([string]$cpaCandidate.activeConfigHost)) {
@@ -1901,17 +1881,17 @@ try {
     $initializeJournal.targetCpaConfigSha256 = [string]$cpaCandidate.activeConfigSha256
     $initializeJournal.targetCpaHost = $expectedTargetHost
     Set-InitializeJournalPhase -Phase "cpa-candidate-validated"
-    [void](Invoke-InProcessPowerShellJson -Script (Join-Path $PSScriptRoot "Test-ManagerCandidate.ps1") -Arguments @(
-        "-ControlRoot", $ControlRoot,
-        "-CandidateRuntime", $targetManagerRuntime,
-        "-FormalRuntime", $SourceManagerRuntime,
-        "-FormalData", $SourceManagerData,
-        "-ExpectedCandidateHash", (Get-CpaStackFileHash -Path (Join-Path $targetManagerRuntime "cpa-manager-plus.exe")),
-        "-ResultPath", (Join-Path $stateDir "manager-candidate-migration-test.json"),
-        "-CpaPort", ([string]$CpaPort),
-        "-FormalPort", ([string]$ManagerPort),
-        "-TempPort", ([string]$managerCandidatePort)
-    ))
+    [void](Invoke-InProcessPowerShellJson -Script (Join-Path $PSScriptRoot "Test-ManagerCandidate.ps1") -Parameters @{
+        ControlRoot = $ControlRoot
+        CandidateRuntime = $targetManagerRuntime
+        FormalRuntime = $SourceManagerRuntime
+        FormalData = $SourceManagerData
+        ExpectedCandidateHash = (Get-CpaStackFileHash -Path (Join-Path $targetManagerRuntime "cpa-manager-plus.exe"))
+        ResultPath = (Join-Path $stateDir "manager-candidate-migration-test.json")
+        CpaPort = ([string]$CpaPort)
+        FormalPort = ([string]$ManagerPort)
+        TempPort = ([string]$managerCandidatePort)
+    })
     foreach ($candidatePort in @($cpaCandidatePort, $managerCandidatePort)) {
         [void](Assert-CpaStackCandidatePort -Port $candidatePort -FormalPort @($CpaPort, $ManagerPort))
     }
@@ -1921,37 +1901,37 @@ try {
     $cpaSwitchResult = Join-Path $stateDir "cpa-migration-switch.json"
     Set-InitializeJournalPhase -Phase "switching"
     $switchPhaseStarted = $true
-    Invoke-ChildPowerShell -Script (Join-Path $PSScriptRoot "Switch-CpaRuntime.ps1") -Arguments @(
-        "-ControlRoot", $ControlRoot,
-        "-SourceRuntime", $SourceCpaRuntime,
-        "-TargetRuntime", $targetCpaRuntime,
-        "-CandidatePackageRoot", $targetCpaRuntime,
-        "-SourceConfig", $SourceCpaConfig,
-        "-ExpectedCandidateHash", ([string]$cpaCandidate.candidateHash),
-        "-ExpectedTargetRuntimeManifestSha256", ([string]$initializeJournal.targetCpaRuntimeManifestSha256),
-        "-ExpectedTargetConfigHash", ([string]$initializeJournal.targetCpaConfigSha256),
-        "-ExpectedTargetHost", ([string]$initializeJournal.targetCpaHost),
-        "-ResultPath", $cpaSwitchResult,
-        "-Port", ([string]$CpaPort),
-        "-ParentOperationId", ([string]$initializeJournal.operationId)
-    )
+    Invoke-ChildPowerShell -Script (Join-Path $PSScriptRoot "Switch-CpaRuntime.ps1") -Parameters @{
+        ControlRoot = $ControlRoot
+        SourceRuntime = $SourceCpaRuntime
+        TargetRuntime = $targetCpaRuntime
+        CandidatePackageRoot = $targetCpaRuntime
+        SourceConfig = $SourceCpaConfig
+        ExpectedCandidateHash = ([string]$cpaCandidate.candidateHash)
+        ExpectedTargetRuntimeManifestSha256 = ([string]$initializeJournal.targetCpaRuntimeManifestSha256)
+        ExpectedTargetConfigHash = ([string]$initializeJournal.targetCpaConfigSha256)
+        ExpectedTargetHost = ([string]$initializeJournal.targetCpaHost)
+        ResultPath = $cpaSwitchResult
+        Port = ([string]$CpaPort)
+        ParentOperationId = ([string]$initializeJournal.operationId)
+    }
     $result.cpa = Read-CpaStackJson -Path $cpaSwitchResult
 
     try {
         $managerSwitchResult = Join-Path $stateDir "manager-migration-switch.json"
-        Invoke-ChildPowerShell -Script (Join-Path $PSScriptRoot "Switch-ManagerRuntime.ps1") -Arguments @(
-            "-ControlRoot", $ControlRoot,
-            "-SourceRuntime", $SourceManagerRuntime,
-            "-SourceData", $SourceManagerData,
-            "-TargetRuntime", $targetManagerRuntime,
-            "-TargetData", $targetManagerData,
-            "-CandidatePackageRoot", $targetManagerRuntime,
-            "-ExpectedCandidateHash", (Get-CpaStackFileHash -Path (Join-Path $targetManagerRuntime "cpa-manager-plus.exe")),
-            "-ResultPath", $managerSwitchResult,
-            "-ManagerPort", ([string]$ManagerPort),
-            "-CpaPort", ([string]$CpaPort),
-            "-ParentOperationId", ([string]$initializeJournal.operationId)
-        )
+        Invoke-ChildPowerShell -Script (Join-Path $PSScriptRoot "Switch-ManagerRuntime.ps1") -Parameters @{
+            ControlRoot = $ControlRoot
+            SourceRuntime = $SourceManagerRuntime
+            SourceData = $SourceManagerData
+            TargetRuntime = $targetManagerRuntime
+            TargetData = $targetManagerData
+            CandidatePackageRoot = $targetManagerRuntime
+            ExpectedCandidateHash = (Get-CpaStackFileHash -Path (Join-Path $targetManagerRuntime "cpa-manager-plus.exe"))
+            ResultPath = $managerSwitchResult
+            ManagerPort = ([string]$ManagerPort)
+            CpaPort = ([string]$CpaPort)
+            ParentOperationId = ([string]$initializeJournal.operationId)
+        }
         $managerResult = Read-CpaStackJson -Path $managerSwitchResult
         $managerResultSourceRuntime = Split-Path -Parent ([string]$managerResult.sourcePath)
         if (-not [bool]$managerResult.success -or

@@ -912,6 +912,7 @@ function New-ManagedStackFixture {
     Write-CpaConfig -Path $cpaConfig -Port $cpaPort
     Write-StackConfig -Path $stackConfig -CpaPort $cpaPort -ManagerPort $managerPort
     Copy-Item -LiteralPath $isolatedStartStackScript -Destination (Join-Path $root 'ops\Start-CPA-Stack.ps1')
+    Copy-Item -LiteralPath (Join-Path (Split-Path -Parent $isolatedStartStackScript) 'CpaStack.Runtime.ps1') -Destination (Join-Path $root 'ops\CpaStack.Runtime.ps1')
     [void](Write-TestSecrets -ControlRoot $root -Protect)
     Write-CpaStackJson -Value ([ordered]@{
         schemaVersion = 1
@@ -1985,6 +1986,7 @@ function Invoke-TransitionHealthTest {
     Write-CpaConfig -Path (Join-Path $cpaRuntime 'config.yaml') -Port $cpaPort
     Write-StackConfig -Path (Join-Path $root 'config\stack.psd1') -CpaPort $cpaPort -ManagerPort $managerPort
     Copy-Item -LiteralPath $isolatedStartStackScript -Destination (Join-Path $root 'ops\Start-CPA-Stack.ps1')
+    Copy-Item -LiteralPath (Join-Path (Split-Path -Parent $isolatedStartStackScript) 'CpaStack.Runtime.ps1') -Destination (Join-Path $root 'ops\CpaStack.Runtime.ps1')
     [void](Write-TestSecrets -ControlRoot $root -Protect)
 
     $oldCpaHash = Get-CpaStackFileHash -Path $cpaExe
@@ -2572,6 +2574,7 @@ function Invoke-PendingJournalStartupGateTest {
     Write-CpaConfig -Path (Join-Path $cpaRuntime 'config.yaml') -Port $cpaPort
     Write-StackConfig -Path (Join-Path $root 'config\stack.psd1') -CpaPort $cpaPort -ManagerPort $managerPort
     Copy-Item -LiteralPath $isolatedStartStackScript -Destination (Join-Path $root 'ops\Start-CPA-Stack.ps1')
+    Copy-Item -LiteralPath (Join-Path (Split-Path -Parent $isolatedStartStackScript) 'CpaStack.Runtime.ps1') -Destination (Join-Path $root 'ops\CpaStack.Runtime.ps1')
     [void](Write-TestSecrets -ControlRoot $root -Protect)
     Write-CpaStackJson -Value ([ordered]@{
         schemaVersion = 1

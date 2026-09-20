@@ -289,10 +289,11 @@ $output = @(& $powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy By
 
     $standaloneSourcePath = Join-Path $repo 'skills\cpa-safe-upgrade\scripts\Start-CPA-Stack.ps1'
     $standaloneSource = [System.IO.File]::ReadAllText($standaloneSourcePath, [System.Text.UTF8Encoding]::new($false, $true))
-    $nativeStart = $standaloneSource.IndexOf('function Initialize-CpaStackNativeProcessType {', [System.StringComparison]::Ordinal)
-    $nativeEnd = $standaloneSource.IndexOf('function Get-ListenerProcess {', $nativeStart, [System.StringComparison]::Ordinal)
-    Assert-True ($nativeStart -ge 0 -and $nativeEnd -gt $nativeStart) 'The standalone launcher process helper can be isolated for its runtime test'
-    $standaloneFunctions = $standaloneSource.Substring($nativeStart, $nativeEnd - $nativeStart)
+    $sharedSource = [IO.File]::ReadAllText((Join-Path (Split-Path -Parent $standaloneSourcePath) 'CpaStack.Runtime.ps1'))
+    $helperStart = $standaloneSource.IndexOf('function Start-ManagedProcess {', [StringComparison]::Ordinal)
+    $helperEnd = $standaloneSource.IndexOf('function Get-ListenerProcess {', $helperStart, [StringComparison]::Ordinal)
+    Assert-True ($helperStart -ge 0 -and $helperEnd -gt $helperStart) 'The starter wrapper can be isolated for its runtime test'
+    $standaloneFunctions = $sharedSource + "`n" + $standaloneSource.Substring($helperStart, $helperEnd - $helperStart)
     $standaloneManagedScript = Join-Path $temp 'start-standalone-managed-child.ps1'
     $standalonePrefix = @'
 param(

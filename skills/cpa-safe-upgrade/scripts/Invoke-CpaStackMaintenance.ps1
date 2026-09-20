@@ -8,6 +8,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'CpaStack.Common.ps1')
+Import-Module (Join-Path $PSScriptRoot '..\modules\CpaStack.BundledHost.psm1')
+$bundledHost = New-CpaStackBundledHost -ScriptsRoot $PSScriptRoot
 
 $operationLock = $null
 $instanceId = $null
@@ -47,21 +49,11 @@ function Invoke-BundledJson {
         [switch]$AllowNonZero
     )
 
-    $powershell = (Get-Command pwsh.exe -ErrorAction Stop).Source
-    $previousPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        $output = @(& $powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $Script @Arguments 2>&1)
-        $exitCode = if ($null -eq $LASTEXITCODE) { if ($?) { 0 } else { 1 } } else { [int]$LASTEXITCODE }
-    } finally {
-        $ErrorActionPreference = $previousPreference
+    $run = Invoke-CpaStackBundled -HostAdapter $bundledHost -Name ([IO.Path]::GetFileName($Script)) -Arguments $Arguments
+    if ($null -eq $run.Json -or ($run.ExitCode -ne 0 -and -not $AllowNonZero)) {
+        throw "Bundled maintenance dependency returned an invalid result contract. ExitCode=$($run.ExitCode)."
     }
-    $text = @($output | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
-    try { $document = $text | ConvertFrom-Json -ErrorAction Stop } catch { $document = $null }
-    if ($null -eq $document -or $document -is [array] -or ($exitCode -ne 0 -and -not $AllowNonZero)) {
-        throw "Bundled maintenance dependency returned an invalid result contract. ExitCode=$exitCode."
-    }
-    return [pscustomobject]@{ ExitCode = $exitCode; Json = $document }
+    return $run
 }
 
 function Get-MaintenanceState {

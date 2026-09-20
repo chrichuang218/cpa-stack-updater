@@ -53,7 +53,7 @@ foreach ($case in @('success','cpa-only','unchanged','download-fails','switch-fa
     function Get-CpaStackListener { [pscustomobject]@{ExecutablePath='C:\fixture\runtime\manager\cpa-manager-plus.exe';ProcessId=123} }
     function Get-CpaStackManagerSetupBaseline { @{cpaBaseUrl='http://127.0.0.1:8317';collectorEnabled=$false;pollIntervalMs=500;usageStatisticsEnabled=$true} }
     function Set-UpgradeJournalPhase { param($Phase) $events.Add($Phase) }
-    function Invoke-SwitchScript { param($Script,$Arguments) $events.Add('switch'); $events.Add([IO.Path]::GetFileName($Script)); if($case -eq 'switch-fails'){$scenario.FailedSwitch=$true;throw 'fixture switch failure'} }
+    function Invoke-SwitchScript { param($Script,$Parameters) Assert-True ($Parameters -is [hashtable] -and $Parameters.DeferFinalCommit) 'Switch uses native parameter splatting'; $events.Add('switch'); $events.Add([IO.Path]::GetFileName($Script)); if($case -eq 'switch-fails'){$scenario.FailedSwitch=$true;throw 'fixture switch failure'} }
     function Set-CurrentComponentState { param($Component) $events.Add('record-'+$Component) }
     function Restore-CanonicalInterruptedState { param($CpaRuntime,$ManagerRuntime,$ManagerData,$Preflight,[switch]$CommitOnly) $events.Add($(if($CommitOnly){'archive'}else{'recover'})) }
     function Recover-UpgradePreparationState { $events.Add('preparation-recovery') }

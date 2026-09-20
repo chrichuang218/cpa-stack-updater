@@ -8,6 +8,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "CpaStack.Common.ps1")
+Import-Module (Join-Path $PSScriptRoot '..\modules\CpaStack.BundledHost.psm1')
+$bundledHost = New-CpaStackBundledHost -ScriptsRoot $PSScriptRoot
 
 $ControlRoot = Resolve-CpaStackControlRoot -RequestedRoot $ControlRoot
 $ControlRoot = Assert-CpaStackSecureLocalRoot -Path $ControlRoot
@@ -67,40 +69,17 @@ function Write-UpgradeCheckpoint {
 function Invoke-ChildPowerShellJson {
     param([string]$Script, [string[]]$Arguments, [switch]$AllowNonZero)
 
-    $powershell = (Get-Command pwsh.exe -ErrorAction Stop).Source
-    $output = @(& $powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $Script @Arguments 2>&1)
-    $exitCode = $LASTEXITCODE
-    $text = $output -join [Environment]::NewLine
-    if ($exitCode -ne 0 -and -not $AllowNonZero) {
-        throw "Child script failed: $Script. $text"
+    $run = Invoke-CpaStackBundled -HostAdapter $bundledHost -Name ([IO.Path]::GetFileName($Script)) -Arguments $Arguments
+    if ($null -eq $run.Json -or ($run.ExitCode -ne 0 -and -not $AllowNonZero)) {
+        throw "Child script failed: $Script. $($run.Text)"
     }
-    return $text | ConvertFrom-Json
-}
-
-function ConvertTo-InProcessParameters {
-    param([string[]]$Arguments)
-
-    $parameters = @{}
-    for ($index = 0; $index -lt $Arguments.Count; $index++) {
-        $token = [string]$Arguments[$index]
-        if (-not $token.StartsWith('-') -or $token.Length -lt 2) { throw "Invalid bundled script argument token: $token" }
-        $name = $token.Substring(1)
-        $value = $true
-        if ($index + 1 -lt $Arguments.Count -and -not ([string]$Arguments[$index + 1]).StartsWith('-')) {
-            $index++
-            $value = $Arguments[$index]
-        }
-        $parameters[$name] = $value
-    }
-    return $parameters
+    return $run.Json
 }
 
 function Invoke-InProcessPowerShellJson {
-    param([string]$Script, [string[]]$Arguments, [hashtable]$AdditionalParameters = @{})
-
-    $parameters = ConvertTo-InProcessParameters -Arguments $Arguments
+    param([string]$Script, [hashtable]$Parameters = @{})
+    $parameters = $Parameters.Clone()
     $parameters['InProcess'] = $true
-    foreach ($name in $AdditionalParameters.Keys) { $parameters[$name] = $AdditionalParameters[$name] }
     try {
         $output = @(& $Script @parameters)
     } catch {
@@ -116,8 +95,8 @@ function Invoke-InProcessPowerShellJson {
 }
 
 function Invoke-SwitchScript {
-    param([string]$Script, [string[]]$Arguments)
-    [void](Invoke-InProcessPowerShellJson -Script $Script -Arguments $Arguments)
+    param([string]$Script, [hashtable]$Parameters = @{})
+    [void](Invoke-InProcessPowerShellJson -Script $Script -Parameters $Parameters)
 }
 
 function Assert-TrustedCanonicalManagerListener {
@@ -420,7 +399,7 @@ function Ensure-CanonicalServicesForPreparationRecovery {
     if ($cpaListener -and $cpaListener.ExecutablePath -ine $expectedCpa) { throw "Unexpected process owns CPA formal port $cpaPort during candidate recovery." }
     if ($managerListener -and $managerListener.ExecutablePath -ine $expectedManager) { throw "Unexpected process owns Manager formal port $managerPort during candidate recovery." }
     if ($cpaListener -and $managerListener) { return }
-    $startResult = Invoke-InProcessPowerShellJson -Script (Join-Path $PSScriptRoot "Start-CPA-Stack.ps1") -Arguments @("-NoBrowser", "-ConfigPath", (Join-Path $ControlRoot 'config\stack.psd1')) -AdditionalParameters @{ OperationLockHandle = $operationMutex; RecoveryMode = $true }
+    $startResult = Invoke-InProcessPowerShellJson -Script (Join-Path $PSScriptRoot "Start-CPA-Stack.ps1") -Parameters @{ NoBrowser = $true; ConfigPath = (Join-Path $ControlRoot 'config\stack.psd1'); OperationLockHandle = $operationMutex; RecoveryMode = $true }
     if (-not $startResult.Success) { throw "Canonical stack could not be started for candidate recovery: $($startResult.Error.Message)" }
 }
 
@@ -1377,7 +1356,7 @@ function Restore-CanonicalInterruptedState {
         $startError = $null
         for ($attempt = 1; $attempt -le 3 -and -not $started; $attempt++) {
             try {
-                $startResult = Invoke-InProcessPowerShellJson -Script $startScript -Arguments @("-NoBrowser", "-ConfigPath", (Join-Path $ControlRoot 'config\stack.psd1')) -AdditionalParameters @{ OperationLockHandle = $operationMutex; RecoveryMode = $true }
+                $startResult = Invoke-InProcessPowerShellJson -Script $startScript -Parameters @{ NoBrowser = $true; ConfigPath = (Join-Path $ControlRoot 'config\stack.psd1'); OperationLockHandle = $operationMutex; RecoveryMode = $true }
                 if (-not $startResult.Success) { throw $startResult.Error.Message }
                 $started = $true
             } catch {
@@ -1624,17 +1603,17 @@ try {
     if ($cpaNeedsUpgrade) {
         $cpaSwitchPath = Join-Path $stateDir "cpa-upgrade-switch.json"
         Set-UpgradeJournalPhase -Phase "switching-cpa"
-        Invoke-SwitchScript -Script (Join-Path $PSScriptRoot "Switch-CpaRuntime.ps1") -Arguments @(
-            "-ControlRoot", $ControlRoot,
-            "-SourceRuntime", $cpaRuntime,
-            "-TargetRuntime", $cpaRuntime,
-            "-CandidatePackageRoot", $cpaPackage.packageRoot,
-            "-SourceConfig", $cpaConfig,
-            "-ExpectedCandidateHash", ([string]$cpaPackage.executableSha256),
-            "-ResultPath", $cpaSwitchPath,
-            "-Port", ([string]$cpaFormalPort),
-            "-DeferFinalCommit"
-        )
+        Invoke-SwitchScript -Script (Join-Path $PSScriptRoot "Switch-CpaRuntime.ps1") -Parameters @{
+            ControlRoot = $ControlRoot
+            SourceRuntime = $cpaRuntime
+            TargetRuntime = $cpaRuntime
+            CandidatePackageRoot = $cpaPackage.packageRoot
+            SourceConfig = $cpaConfig
+            ExpectedCandidateHash = ([string]$cpaPackage.executableSha256)
+            ResultPath = $cpaSwitchPath
+            Port = ([string]$cpaFormalPort)
+            DeferFinalCommit = $true
+        }
         $result.cpa = Read-CpaStackJson -Path $cpaSwitchPath
         if (-not $result.cpa.success) { throw 'CPA switch did not pass its health check.' }
     }
@@ -1645,22 +1624,22 @@ try {
 
     if ($managerNeedsUpgrade) {
         $managerSwitchPath = Join-Path $stateDir "manager-upgrade-switch.json"
-        $managerSwitchArguments = @(
-            "-ControlRoot", $ControlRoot,
-            "-SourceRuntime", $managerRuntime,
-            "-SourceData", $managerData,
-            "-TargetRuntime", $managerRuntime,
-            "-TargetData", $managerData,
-            "-CandidatePackageRoot", $managerPackage.packageRoot,
-            "-ExpectedCandidateHash", ([string]$managerPackage.executableSha256),
-            "-ResultPath", $managerSwitchPath,
-            "-ManagerPort", ([string]$managerFormalPort),
-            "-CpaPort", ([string]$cpaFormalPort),
-            "-DeferFinalCommit"
-        )
-        $managerSwitchArguments += "-RequireV111Schema"
+        $managerSwitchParameters = @{
+            ControlRoot = $ControlRoot
+            SourceRuntime = $managerRuntime
+            SourceData = $managerData
+            TargetRuntime = $managerRuntime
+            TargetData = $managerData
+            CandidatePackageRoot = $managerPackage.packageRoot
+            ExpectedCandidateHash = ([string]$managerPackage.executableSha256)
+            ResultPath = $managerSwitchPath
+            ManagerPort = ([string]$managerFormalPort)
+            CpaPort = ([string]$cpaFormalPort)
+            DeferFinalCommit = $true
+        }
+        $managerSwitchParameters.RequireV111Schema = $true
         Set-UpgradeJournalPhase -Phase "switching-manager"
-        Invoke-SwitchScript -Script (Join-Path $PSScriptRoot "Switch-ManagerRuntime.ps1") -Arguments $managerSwitchArguments
+        Invoke-SwitchScript -Script (Join-Path $PSScriptRoot "Switch-ManagerRuntime.ps1") -Parameters $managerSwitchParameters
         $result.manager = Read-CpaStackJson -Path $managerSwitchPath
         if (-not $result.manager.success) { throw 'Manager switch did not pass its health check.' }
     }

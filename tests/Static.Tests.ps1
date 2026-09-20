@@ -79,7 +79,7 @@ Assert-True ($start -match 'LocalAddresses\s*=\s*\$addresses') 'Canonical start 
 Assert-True ($start.IndexOf('Assert-TrustedListener -Listener $listener', [System.StringComparison]::Ordinal) -lt $start.IndexOf('$lastProbe = Get-CpaHealth', [System.StringComparison]::Ordinal)) 'Canonical start validates the CPA listener before sending its API key'
 Assert-True ($start -match 'function Start-ManagedProcess') 'Canonical services start with a controlled environment'
 Assert-False ($start -match 'Start-Process\s+-FilePath\s+\$Settings\.(?:Cpa|Manager)\.Executable') 'Canonical services do not inherit the full parent environment'
-Assert-True ($start -match 'PROC_THREAD_ATTRIBUTE_HANDLE_LIST|ProcThreadAttributeHandleList') 'Canonical services restrict inherited handles to isolated standard streams'
+Assert-True ($start -match 'CpaStack.Runtime.ps1') 'Canonical services load the shared native launcher'
 Assert-True ($start -match '\[CpaStack\.NativeProcessV1\]::Start') 'Canonical services use the native isolated process launcher'
 
 $cli = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\cpa-stack.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
@@ -108,12 +108,9 @@ Assert-True ($maintenance -match 'MaintenanceCommitIncomplete' -and $maintenance
 Assert-False ($start -match 'CPA_STACK_START_PROGRESS_PATH|Get-CpaStackStartProgressPath|AppendAllText\(\$startProgressPath') 'Canonical start contains no orphaned temp-file progress channel'
 
 $common = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\CpaStack.Common.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
-$commonNativeStart = $common.IndexOf('using System;', $common.IndexOf("Add-Type -TypeDefinition @'", [System.StringComparison]::Ordinal), [System.StringComparison]::Ordinal)
-$commonNativeEnd = $common.IndexOf("`n'@", $commonNativeStart, [System.StringComparison]::Ordinal)
-$startNativeStart = $start.IndexOf('using System;', $start.IndexOf("Add-Type -TypeDefinition @'", [System.StringComparison]::Ordinal), [System.StringComparison]::Ordinal)
-$startNativeEnd = $start.IndexOf("`n'@", $startNativeStart, [System.StringComparison]::Ordinal)
-Assert-True ($commonNativeStart -ge 0 -and $commonNativeEnd -gt $commonNativeStart -and $startNativeStart -ge 0 -and $startNativeEnd -gt $startNativeStart) 'Both managed-process native launcher sources are present'
-Assert-True ($common.Substring($commonNativeStart, $commonNativeEnd - $commonNativeStart) -ceq $start.Substring($startNativeStart, $startNativeEnd - $startNativeStart)) 'Common and standalone native process launchers remain byte-identical'
+$runtime = [IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\CpaStack.Runtime.ps1'))
+Assert-True ($common -match 'CpaStack.Runtime.ps1') 'Common uses the same runtime primitives as the starter'
+Assert-False ($common -match 'function Initialize-CpaStackNativeProcessType' -or $start -match 'function Initialize-CpaStackNativeProcessType') 'Native process implementation is not duplicated'
 Assert-True ($common -match '&\s+\$gh\.Source\s+api\s+--hostname\s+github\.com') 'GitHub CLI release queries are pinned to github.com'
 Assert-True ($common -match 'maximumReleaseJsonBytes\s*=\s*4194304') 'GitHub release JSON has a 4 MiB safety limit'
 Assert-True ($common.Contains('Invoke-CpaStackSecureDownload -Uri "https://api.github.com/repos/$Repository/releases/latest" -Destination $temp -MaximumBytes $maximumReleaseJsonBytes')) 'Direct GitHub release JSON downloads enforce the streaming limit'
@@ -136,7 +133,7 @@ Assert-True ($common -match '\$link\.WindowStyle\s*=\s*\[int\]\$contract\.Window
 Assert-True ($initialize -match 'Set-CpaStackCanonicalShortcut\s+-ShortcutPath\s+\$DesktopShortcut') 'Migration updates the authorized desktop shortcut through the hidden-window contract'
 Assert-True ($initialize -match 'Assert-CpaStackCanonicalShortcutContract\s+-Shortcut\s+\$shortcut') 'Committed migration recovery revalidates the hidden-window shortcut contract'
 Assert-True ($common -match '\[switch\]\$MinimalEnvironment') 'Candidate process launcher supports a minimal environment'
-Assert-True ($common -match 'PROC_THREAD_ATTRIBUTE_HANDLE_LIST|ProcThreadAttributeHandleList') 'Managed processes inherit only the explicit null-device handle list'
+Assert-True ($runtime -match 'PROC_THREAD_ATTRIBUTE_HANDLE_LIST|ProcThreadAttributeHandleList') 'Managed processes inherit only the explicit null-device handle list'
 Assert-True ($common -match 'function Test-CpaStackFileReadyForReplacement') 'Port shutdown verifies that the executable can be replaced'
 Assert-True ($common -match '\$ownedProcess\.HasExited') 'Port shutdown waits for the exact process after the listener disappears'
 Assert-True ($common -match '\$proxyUri\.UserInfo') 'Managed process proxy URLs reject embedded credentials'

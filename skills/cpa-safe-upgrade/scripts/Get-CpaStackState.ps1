@@ -27,90 +27,6 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'CpaStack.Common.ps1')
 $ControlRoot = Resolve-CpaStackControlRoot -RequestedRoot $ControlRoot
 
-function Get-RequiredMapValue {
-    param(
-        [System.Collections.IDictionary]$Map,
-        [string]$Name,
-        [string]$Context
-    )
-
-    if ($null -eq $Map -or -not $Map.Contains($Name)) {
-        throw "Missing required setting '$Context.$Name'."
-    }
-
-    $value = $Map[$Name]
-    if ($null -eq $value -or ($value -is [string] -and [string]::IsNullOrWhiteSpace($value))) {
-        throw "Setting '$Context.$Name' must not be empty."
-    }
-
-    return $value
-}
-
-function Get-OptionalMapValue {
-    param(
-        [System.Collections.IDictionary]$Map,
-        [string]$Name,
-        $DefaultValue
-    )
-
-    if ($null -eq $Map -or -not $Map.Contains($Name)) {
-        return $DefaultValue
-    }
-
-    return $Map[$Name]
-}
-
-function Get-JsonPropertyValue {
-    param(
-        $Object,
-        [string]$Name
-    )
-
-    if ($null -eq $Object) {
-        return $null
-    }
-
-    $property = $Object.PSObject.Properties[$Name]
-    if ($null -eq $property) {
-        return $null
-    }
-
-    return $property.Value
-}
-
-function Resolve-ConfiguredPath {
-    param(
-        [string]$StackRoot,
-        [string]$Value
-    )
-
-    if ([System.IO.Path]::IsPathRooted($Value)) {
-        return [System.IO.Path]::GetFullPath($Value)
-    }
-
-    return [System.IO.Path]::GetFullPath((Join-Path $StackRoot $Value))
-}
-
-function ConvertTo-Port {
-    param(
-        $Value,
-        [string]$Context
-    )
-
-    try {
-        $port = [int]$Value
-    }
-    catch {
-        throw "Setting '$Context' must be an integer port."
-    }
-
-    if ($port -lt 1 -or $port -gt 65535) {
-        throw "Setting '$Context' must be between 1 and 65535."
-    }
-
-    return $port
-}
-
 function Import-StackSettings {
     param([string]$Path)
 
@@ -269,23 +185,6 @@ function Get-SecretsState {
         }
         Values = $values
     }
-}
-
-function Test-PathEqual {
-    param(
-        [string]$Left,
-        [string]$Right
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Left) -or [string]::IsNullOrWhiteSpace($Right)) {
-        return $false
-    }
-
-    return [string]::Equals(
-        [System.IO.Path]::GetFullPath($Left).TrimEnd('\'),
-        [System.IO.Path]::GetFullPath($Right).TrimEnd('\'),
-        [System.StringComparison]::OrdinalIgnoreCase
-    )
 }
 
 function Get-ListenerProcesses {

@@ -72,7 +72,7 @@ Assert-False (($http502 | ConvertTo-Json).Contains($sentinel)) 'HTTP diagnostics
 }
 
 & {
-    $definitions = Import-TestFunctions -Path (Join-Path $scripts 'Invoke-CpaStackUpgrade.ps1') -Names @('Add-UpgradeDiagnostic', 'ConvertTo-InProcessParameters', 'Invoke-InProcessPowerShellJson')
+    $definitions = Import-TestFunctions -Path (Join-Path $scripts 'Invoke-CpaStackUpgrade.ps1') -Names @('Add-UpgradeDiagnostic', 'Invoke-InProcessPowerShellJson')
     . ([scriptblock]::Create($definitions -join "`n"))
     $result = [ordered]@{ diagnostics = @() }
     $diagnosticStage = 'testing-manager'
@@ -82,7 +82,7 @@ Assert-False (($http502 | ConvertTo-Json).Contains($sentinel)) 'HTTP diagnostics
         $failure.Data['CpaStackDiagnostics'] = @($failed)
         throw $failure
     }
-    Assert-ThrowsMatch { Invoke-InProcessPowerShellJson -Script 'Invoke-TestCandidate' -Arguments @() } 'Synthetic candidate failure' 'Candidate failure remains a failure'
+    Assert-ThrowsMatch { Invoke-InProcessPowerShellJson -Script 'Invoke-TestCandidate' -Parameters @{} } 'Synthetic candidate failure' 'Candidate failure remains a failure'
     Assert-Equal 2 $result.diagnostics.Count 'Candidate diagnostics survive the in-process exception wrapper'
     Assert-Equal 'recovery-health' $result.diagnostics[0].stage 'Original child diagnostic is retained'
     Assert-Equal 'testing-manager' $result.diagnostics[1].stage 'Parent context is appended separately'
@@ -90,7 +90,7 @@ Assert-False (($http502 | ConvertTo-Json).Contains($sentinel)) 'HTTP diagnostics
 
 & {
     # The status gate and its diagnostic booleans share the production check map.
-    $definitions = Import-TestFunctions -Path (Join-Path $scripts 'Get-CpaStackState.ps1') -Names @('Get-JsonPropertyValue', 'New-UnattemptedProbe', 'Get-ManagerStatus')
+    $definitions = Import-TestFunctions -Path (Join-Path $scripts 'Get-CpaStackState.ps1') -Names @('New-UnattemptedProbe', 'Get-ManagerStatus')
     . ([scriptblock]::Create($definitions -join "`n"))
     function Test-Path { return $true }
     function Get-ListenerProcesses { return [pscustomobject]@{ ProcessId = 42; ExecutablePath = 'fixture.exe'; Name = 'fixture'; LocalAddresses = @('127.0.0.1') } }
