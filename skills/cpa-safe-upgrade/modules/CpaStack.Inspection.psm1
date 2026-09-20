@@ -1,3 +1,4 @@
+#requires -Version 7.0
 Set-StrictMode -Version Latest
 
 Import-Module (Join-Path $PSScriptRoot 'CpaStack.Result.psm1') -Force
@@ -55,17 +56,9 @@ function Invoke-CpaStackInspection {
             $shortcutState = [pscustomobject]@{ operation = 'shortcut'; success = $true; status = 'Conflict'; changed = $false; reason = $_.Exception.Message }
         }
     }
-    $security = Get-CpaStackValue -Object $run.Json -Name 'Security'
-    $cpaLoopback = [bool](Get-CpaStackValue -Object $security -Name 'CpaLoopbackOnly' -Default $false)
-    $managerLoopback = [bool](Get-CpaStackValue -Object $security -Name 'ManagerLoopbackOnly' -Default $false)
-    $lanState = [pscustomobject]@{
-        mode = if ($cpaLoopback -and $managerLoopback) { 'Loopback' } elseif ($null -ne $security) { 'Lan' } else { 'Unknown' }
-        cpaLoopbackOnly = $cpaLoopback
-        managerLoopbackOnly = $managerLoopback
-    }
     return New-CpaStackResult -Operation $Operation -Success $true -Outcome $(if ($healthy) { 'Healthy' } else { 'Blocked' }) `
         -Changed $false -Root $Root -Warnings $Warnings `
-        -Extensions ([ordered]@{ requiredOperation = $requiredOperation; state = $run.Json; shortcut = $shortcutState; lan = $lanState })
+        -Extensions ([ordered]@{ requiredOperation = $requiredOperation; state = $run.Json; shortcut = $shortcutState })
 }
 
 Export-ModuleMember -Function Invoke-CpaStackInspection

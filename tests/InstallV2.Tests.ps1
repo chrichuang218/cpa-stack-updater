@@ -127,7 +127,7 @@ if (`$null -ne `$LASTEXITCODE) { exit [int]`$LASTEXITCODE }
 "@
     $encodedWrapper = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($wrapper))
     $process = Start-Process `
-        -FilePath (Get-Command powershell.exe -ErrorAction Stop).Source `
+        -FilePath (Get-Command pwsh.exe -ErrorAction Stop).Source `
         -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encodedWrapper) `
         -RedirectStandardOutput $OutputPath `
         -RedirectStandardError $ErrorPath `
@@ -313,7 +313,7 @@ try {
         [System.Text.Encoding]::Unicode.GetBytes('while ($true) { Start-Sleep -Seconds 60 }')
     )
     $registrationFailurePayloadText = @"
-`$grandchild = Start-Process -FilePath (Get-Command powershell.exe -ErrorAction Stop).Source -ArgumentList @('-NoProfile', '-EncodedCommand', '$grandchildCommand') -WindowStyle Hidden -PassThru
+`$grandchild = Start-Process -FilePath (Get-Command pwsh.exe -ErrorAction Stop).Source -ArgumentList @('-NoProfile', '-EncodedCommand', '$grandchildCommand') -WindowStyle Hidden -PassThru
 [System.IO.File]::WriteAllText('$($registrationFailureGrandchildPid.Replace("'", "''"))', [string]`$grandchild.Id, [System.Text.Encoding]::ASCII)
 while (`$true) { Start-Sleep -Seconds 60 }
 "@

@@ -35,7 +35,7 @@ $cpaCli = Join-Path $codexHome 'skills\cpa-safe-upgrade\scripts\cpa-stack.ps1'
 & $cpaCli recover [-Root <path>] [-Json]
 ```
 
-显式恢复一个可证明的中断事务，包括初始化/升级及其从属 switch artifact、旧 canonical 接管和 LAN 配置。无 pending 时返回 `NoChange`。journal 类型歧义、instanceId/path/hash 不一致或恢复后仍中断时返回 `ManualRecoveryRequired`。恢复只调用 recovery-only interface，不会自行开始迁移、升级或 LAN 变更；`upgrade` 可把它作为一次有界前置步骤，`start` 不会。
+显式恢复一个可证明的中断事务，包括初始化/升级及其从属 switch artifact、旧 canonical 接管。无 pending 时返回 `NoChange`。journal 类型歧义、instanceId/path/hash 不一致或恢复后仍中断时返回 `ManualRecoveryRequired`。恢复只调用 recovery-only interface，不会自行开始迁移或升级；`upgrade` 可把它作为一次有界前置步骤，`start` 不会。
 
 ### migrate
 
@@ -64,9 +64,13 @@ request 不得包含 secret 值。候选端口由执行器动态分配，不能�
 
 普通 `upgrade` 自动允许 latest stable 替换无法可靠识别版本或来源的旧 binary，不需要额外参数或确认。
 
-updater 查询、校验、安装或新版重执行失败时，返回 `automation.failedStep=updater`，不会继续使用旧 updater。除默认桌面快捷方式的自动 Ensure 外，其他快捷方式路径和 LAN 不会隐式修改。歧义 journal、未知端口 owner、不可信 ACL/reparse、checksum、候选健康、磁盘/路径预算、SQLite 水位或回滚失败仍立即返回失败。
+已有受管实例的日常升级不预跑候选服务、不复制凭据：校验官方包后，备份、替换重启并探活，失败回滚该组件。成功只提交状态并归档，不重复整栈检查。首次迁移仍保留候选验证。旧版候选事务记录继续支持恢复，新事务使用 runtime-only 格式。
 
-Windows 定时任务应使用 `powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <cpa-stack.ps1> upgrade -Root <root> -Json`。这同时授权自动更新 updater；退出码 `0` 表示 updater/runtime 成功或无需更新，非零表示真实失败。命令不读取 stdin、不打开浏览器、不产生确认提示。
+只更新 CPA 时不进入 Manager 数据库备份流程。Manager 确实更新时，停服前准备旧程序备份；停服后再一致性备份数据库及 `data.key`，保留最近一份成功归档的回滚备份。不拆表、不做增量备份、不清空历史。若旧备份清理失败，会明确给出 warning，而不是强制删除。
+
+updater 查询、校验、安装或新版重执行失败时，返回 `automation.failedStep=updater`，不会继续使用旧 updater。除默认桌面快捷方式的自动 Ensure 外，其他快捷方式路径不会隐式修改。歧义 journal、未知端口 owner、不可信 ACL/reparse、checksum、切换后健康、磁盘/路径预算、SQLite 水位或回滚失败仍立即返回失败。
+
+Windows 定时任务应使用 `pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <cpa-stack.ps1> upgrade -Root <root> -Json`。这同时授权自动更新 updater；退出码 `0` 表示 updater/runtime 成功或无需更新，非零表示真实失败。命令不读取 stdin、不打开浏览器、不产生确认提示。
 
 ### start
 
@@ -84,7 +88,7 @@ Windows 定时任务应使用 `powershell.exe -NoLogo -NoProfile -NonInteractive
 
 处理 Manager Plus 的“数据库升级维护尚未完成”、查询索引或旧派生数据提示。事务只使用 canonical 配置中的当前 Manager 二进制和正式 `usage.sqlite`，不接受外部路径；先建立一致性 SQLite 备份，再固定并停止已验证的 Manager 进程，执行 `cleanup-derived`，校验 `quick_check`、权威请求水位、关键表、exe 与 `data.key`，最后重启并验证服务。
 
-清理失败时恢复备份并重启，返回 `RolledBack`；自动恢复失败时保留受保护 journal 和备份并返回稳定错误。硬中断后重跑同一命令会先恢复旧事务，再重新执行维护。CPA 服务和 LAN 配置不变。
+清理失败时恢复备份并重启，返回 `RolledBack`；自动恢复失败时保留受保护 journal 和备份并返回稳定错误。硬中断后重跑同一命令会先恢复旧事务，再重新执行维护。CPA 服务不变。
 
 ### shortcut
 
@@ -95,18 +99,7 @@ Windows 定时任务应使用 `powershell.exe -NoLogo -NoProfile -NonInteractive
 
 `Check` 严格零写入，状态包括 `Absent`、`Matching`、`Drifted`、`Adoptable`、`Conflict`。`Ensure` 使用 staging、复读和原子提交，自动备份并接管可识别的旧 CPA 快捷方式；未知冲突不会覆盖。`upgrade` 成功后自动对默认路径执行一次 Ensure，失败只追加 warning，不回滚已成功的运行时升级。
 
-未传 `-ShortcutPath` 时使用当前用户桌面的 `CPA 本地启动.lnk`。快捷方式优先使用 PowerShell 7 (`pwsh.exe`)，未安装时回退 Windows PowerShell 5.1，只保留一个可见窗口。canonical bootstrap 直接调用 bundled starter 的 Fast 模式，不执行 CLI `start` 的 ACL、hash、state、端口健康或 Manager readiness 预检；进程存在时立即复用，缺失时直接启动。旧的 `CPA 本地启动（新版）.lnk` 在新名称成功建立后自动清理。
-
-### lan
-
-```powershell
-& $cpaCli lan -Action Set -Mode Loopback [-Root <path>] [-Json]
-& $cpaCli lan -Action Set -Mode Lan      [-Root <path>] [-Json]
-```
-
-独立配置 CPA 与 Manager 的正式绑定并进行真实健康验证；失败时恢复旧配置和健康服务。LAN journal 在配置写入前记录受保护备份与 hash，硬中断由公开 `recover` 收敛；`NoChange` 同样验证实际 listener，不只比较文件。LAN 需要单独风险说明和授权。候选验证始终只允许 loopback。
-
-每个命令有参数 allowlist。无关参数返回 `UnsupportedCommandParameter`，不会被静默忽略。
+未传 `-ShortcutPath` 时使用当前用户桌面的 `CPA 本地启动.lnk`。快捷方式仅使用 PowerShell 7 (`pwsh.exe`)，未安装时明确报错，只保留一个可见窗口。canonical bootstrap 直接调用 bundled starter 的 Fast 模式，不执行 CLI `start` 的 ACL、hash、state、端口健康或 Manager readiness 预检；进程存在时立即复用，缺失时直接启动。旧的 `CPA 本地启动（新版）.lnk` 在新名称成功建立后自动清理。
 
 ## installer
 
@@ -117,7 +110,7 @@ Windows 定时任务应使用 `powershell.exe -NoLogo -NoProfile -NonInteractive
 & '<local release>\install.ps1' -Action Update [-CodexHome <path>] [-StackRoot <path>] -Json
 ```
 
-`Check` 严格只读；`Update` 原子更新 Skill、稳定 bootstrap 与 root registration，支持并发幂等和 hard-kill journal 恢复。显式指定新的空 `StackRoot` 时会先创建受保护 instance marker，使后续一键 `upgrade` 的自动迁移不会因 installer bootstrap 令目录非空而失败。installer 不升级或启动 CPA/Manager、不启用 LAN、不创建桌面快捷方式，也不从网络更新自身。
+`Check` 严格只读；`Update` 原子更新 Skill、稳定 bootstrap 与 root registration，支持并发幂等和 hard-kill journal 恢复。显式指定新的空 `StackRoot` 时会先创建受保护 instance marker，使后续一键 `upgrade` 的自动迁移不会因 installer bootstrap 令目录非空而失败。installer 不升级或启动 CPA/Manager、不创建桌面快捷方式，也不从网络更新自身。
 
 ## schema v2
 

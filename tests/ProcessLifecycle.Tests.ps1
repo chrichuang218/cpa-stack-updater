@@ -200,7 +200,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 . $CommonPath
-$powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
+$powershell = (Get-Command pwsh.exe -ErrorAction Stop).Source
 $process = Start-CpaStackProcess `
     -FilePath $powershell `
     -Arguments '-NoProfile -NonInteractive -Command "Start-Sleep -Seconds 30"' `
@@ -226,12 +226,12 @@ while (-not (Test-Path -LiteralPath $GoPath -PathType Leaf)) {
     if ((Get-Date) -ge $deadline) { throw 'Timed out waiting for Job Object registration.' }
     Start-Sleep -Milliseconds 25
 }
-$powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
+$powershell = (Get-Command pwsh.exe -ErrorAction Stop).Source
 $output = @(& $powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $ManagedScript -CommonPath $CommonPath -PidPath $PidPath 2>&1)
 [System.IO.File]::WriteAllLines($OutputPath, @($output | ForEach-Object { [string]$_ }), [System.Text.UTF8Encoding]::new($false))
 '@
 
-    $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
+    $powershell = (Get-Command pwsh.exe -ErrorAction Stop).Source
     $registrationFailure = $null
     try {
         [void](Start-CpaStackProcess `
@@ -302,7 +302,7 @@ param(
 $ErrorActionPreference = 'Stop'
 '@
     $standaloneSuffix = @'
-$powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
+$powershell = (Get-Command pwsh.exe -ErrorAction Stop).Source
 $process = Start-ManagedProcess `
     -FilePath $powershell `
     -Arguments '-NoProfile -NonInteractive -Command "Start-Sleep -Seconds 30"' `

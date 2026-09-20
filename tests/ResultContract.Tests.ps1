@@ -12,7 +12,6 @@ Import-Module (Join-Path $moduleRoot 'CpaStack.UpgradeTransaction.psm1') -Force
 Import-Module (Join-Path $moduleRoot 'CpaStack.MigrationTransaction.psm1') -Force
 Import-Module (Join-Path $moduleRoot 'CpaStack.Recovery.psm1') -Force
 Import-Module (Join-Path $moduleRoot 'CpaStack.Launcher.psm1') -Force
-Import-Module (Join-Path $moduleRoot 'CpaStack.LanConfiguration.psm1') -Force
 Import-Module (Join-Path $moduleRoot 'CpaStack.StateInspection.psm1') -Force
 Import-Module (Join-Path $moduleRoot 'CpaStack.Result.psm1') -Force
 
@@ -383,31 +382,6 @@ try {
     [void](Assert-FailedResultError -Result $recovery -Code 'RecoveryFailed' -Phase 'recovery' -ExitCode 12 `
         -Message 'Recovery string failure')
 
-    $lanProtocolAdapter = New-FakeHostAdapter -Runs ([ordered]@{
-        'Set-CpaStackLan.ps1' = New-FakeRun -Json $null -ExitCode 41 `
-            -Output @("Bearer $secretSentinel", 'two JSON documents') `
-            -Text "Bearer $secretSentinel`r`ntwo JSON documents" `
-            -ProtocolError ([pscustomobject]@{
-                code = 'BundledProtocolViolation'
-                message = 'Bundled script did not return exactly one JSON object.'
-            })
-    })
-    $lanProtocol = Invoke-CpaStackLanOperation -Root $root -HostAdapter $lanProtocolAdapter -Action Set -Mode Lan
-    $lanProtocolDocument = Assert-FailedResultError -Result $lanProtocol -Code 'BundledProtocolViolation' -Phase 'lan' -ExitCode 41 `
-        -Message 'LAN bundled protocol failure'
-    Assert-True ([string]$lanProtocolDocument.error.message -match '^Bundled script did not return exactly one JSON object\.') 'ProtocolError message takes precedence over captured output'
-
-    $lanSensitiveErrorAdapter = New-FakeHostAdapter -Runs ([ordered]@{
-        'Set-CpaStackLan.ps1' = New-FakeRun -Json ([pscustomobject]@{
-            success = $false
-            changed = $false
-            rolledBack = $false
-            error = "apiKey=$secretSentinel"
-        }) -ExitCode 43
-    })
-    $lanSensitiveError = Invoke-CpaStackLanOperation -Root $root -HostAdapter $lanSensitiveErrorAdapter -Action Set -Mode Lan
-    $lanSensitiveJson = $lanSensitiveError | ConvertTo-Json -Depth 16 -Compress
-    Assert-False ($lanSensitiveJson -match [regex]::Escape($secretSentinel)) 'Normalized failure evidence does not retain the raw secret-bearing error'
 } finally {
     if (Test-Path -LiteralPath $temp) {
         Remove-TestPathWithRetry -Path $temp

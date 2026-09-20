@@ -52,7 +52,7 @@ Start-Sleep -Seconds 30
 "@
     $encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($command))
     $process = Start-Process `
-        -FilePath (Get-Command powershell.exe -ErrorAction Stop).Source `
+        -FilePath (Get-Command pwsh.exe -ErrorAction Stop).Source `
         -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedCommand) `
         -WindowStyle Hidden `
         -PassThru

@@ -1,15 +1,12 @@
+#requires -Version 7.0
 Set-StrictMode -Version Latest
 
 $script:ShortcutContractVersion = 3
 
 function Get-CpaStackPreferredPowerShellPath {
-    foreach ($name in @('pwsh.exe', 'powershell.exe')) {
-        $command = Get-Command $name -ErrorAction SilentlyContinue
-        if ($null -ne $command -and -not [string]::IsNullOrWhiteSpace([string]$command.Source)) {
-            return [System.IO.Path]::GetFullPath([string]$command.Source)
-        }
-    }
-    throw 'PowerShell 7 or Windows PowerShell 5.1 is required for the desktop shortcut.'
+    $command = Get-Command pwsh.exe -ErrorAction SilentlyContinue
+    if (-not $command) { throw 'PowerShell 7 is required. Install pwsh before creating the shortcut.' }
+    return [System.IO.Path]::GetFullPath($command.Source)
 }
 
 function Get-CpaStackManagedFileHash {
@@ -259,6 +256,7 @@ function Test-CpaStackShortcutReferencesLauncher {
         return $true
     }
     $allowedPowerShellPaths = @(
+        # Recognize old shortcuts for migration only; new shortcuts always use pwsh.
         foreach ($name in @('pwsh.exe', 'powershell.exe')) {
             $command = Get-Command $name -ErrorAction SilentlyContinue
             if ($null -ne $command -and -not [string]::IsNullOrWhiteSpace([string]$command.Source)) {

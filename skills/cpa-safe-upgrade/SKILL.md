@@ -1,11 +1,13 @@
 ---
 name: cpa-safe-upgrade
-description: 在 Windows 上安全检查、迁移、恢复、启动、升级或离线维护 CLIProxyAPI/CPA 与 CPA Manager Plus，包括数据库提示 cleanup-derived、查询索引或旧派生数据维护；在 upgrade 前从固定官方 Release 自动验证并更新本 Skill，也支持可信本地发行目录的原子手工更新、CPA 桌面快捷方式管理和显式 LAN 切换。仅当用户明确要求上述操作、看到数据库维护未完成提示，或显式调用 cpa-safe-upgrade 时使用；普通端口查询和未伴随上述目标的监控页面问题不要触发。
+description: 在 Windows 上安全检查、迁移、恢复、启动、升级或离线维护 CLIProxyAPI/CPA 与 CPA Manager Plus，包括数据库提示 cleanup-derived、查询索引或旧派生数据维护；在 upgrade 前从固定官方 Release 自动验证并更新本 Skill，也支持可信本地发行目录的原子手工更新、CPA 桌面快捷方式管理。仅当用户明确要求上述操作、看到数据库维护未完成提示，或显式调用 cpa-safe-upgrade 时使用；普通端口查询和未伴随上述目标的监控页面问题不要触发。
 ---
 
 # CPA Safe Upgrade
 
 ## 执行边界
+
+仅支持 Windows 上的 PowerShell 7 (`pwsh.exe`)；未安装时明确报告缺少 PS7，不回退到 Windows PowerShell。LAN 管理已移除，不提供 `lan` 命令，不替用户修改现有网络绑定。
 
 只使用 bundled `scripts/cpa-stack.ps1` 处理 CPA/Manager runtime。不要直接调用内部 `Test-*`、`Switch-*`、初始化或启动脚本，也不要临时重写停止、复制、迁移、切换或恢复逻辑。唯一例外是 installer 管理的 canonical desktop bootstrap；它按固定契约内部调用 starter 的 Fast 模式，Codex 不手工复刻或直接调用该入口。
 
@@ -42,6 +44,8 @@ managed root 优先使用用户明确给出的 `-Root`，否则让 CLI 按 `CPA_
 
 单实例固定端口原地升级需要一次短暂重启，不承诺零断连。下载、备份与完整凭证树检查应在停服前完成；成功提交仅校验并归档，不得再次停止健康服务。只有运行文件确需恢复时才停止 CPA，保留的 auth/plugins 不在停机窗口内全量重写权限。
 
+日常原地升级直接使用校验后的官方包：备份旧程序和必要数据库，替换重启、探活，失败则回滚该组件。不复制正式凭据到候选目录、不分配候选端口、不预跑候选服务；正式 config/auth 原地保留。首次迁移仍保留候选验证。新版启动问题会在正式切换后发现，由回滚处理，不承诺提前发现所有不兼容问题。
+
 只依据最终结构化结果（`schemaVersion=2`）报告：
 
 1. `success=true`：报告结果，不追加无关检查或操作。
@@ -57,12 +61,12 @@ managed root 优先使用用户明确给出的 `-Root`，否则让 CLI 按 `CPA_
 
 临时 request 只保存路径；使用后删除本次创建的 request。不要删除用户提供的 secrets 文件。
 
-真正的安全失败仍立即停止：updater Release 查询/校验/安装/重执行失败、歧义 journal、未知端口 owner、不可信 ACL/reparse、checksum、候选健康、磁盘/路径预算、SQLite 水位或自动回滚失败。不要吞错、伪成功或自动放宽这些门禁。
+真正的安全失败仍立即停止：updater Release 查询/校验/安装/重执行失败、歧义 journal、未知端口 owner、不可信 ACL/reparse、checksum、切换后健康（首次迁移另含候选验证）、磁盘/路径预算、SQLite 水位或自动回滚失败。不要吞错、伪成功或自动放宽这些门禁。
 
 用于 Windows 定时任务时，通过 PowerShell 宿主以 `-NonInteractive` 调用同一个 `upgrade` 命令；`-NonInteractive` 是宿主参数，必须放在 `-File` 之前，不能传给 `cpa-stack.ps1`：
 
 ```powershell
-& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $cpaCli upgrade -Json
+& pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $cpaCli upgrade -Json
 ```
 
 调用本身同时授权按固定信任链更新 updater，无需逐次确认。退出码 `0` 表示 updater/runtime 升级成功或已经最新；非零表示真实失败。命令不读取 stdin、不打开浏览器；下一次调度会自动处理单一可恢复 pending。
@@ -91,21 +95,12 @@ managed root 优先使用用户明确给出的 `-Root`，否则让 CLI 按 `CPA_
 & $cpaCli shortcut -Action Ensure -Root '<managed root>' -Json
 ```
 
-默认路径是当前用户桌面的 `CPA 本地启动.lnk`。Ensure 自动创建、修复 drift，或备份并接管可识别的旧 CPA 启动方式；旧的 `CPA 本地启动（新版）.lnk` 在新名称成功建立后自动清理，完全无关的未知冲突仍明确失败且不覆盖。生成的快捷方式优先使用 PowerShell 7 (`pwsh.exe`)，未安装时回退 Windows PowerShell 5.1，只保留一个可见窗口。canonical bootstrap 直接调用 bundled starter 的 Fast 模式，不执行 `cpa-stack status/start`、ACL、hash、端口健康或 Manager readiness 预检；进程存在时立即复用，缺失时直接启动并打开页面。完整检查只在 CLI `start` 和更新事务中执行。
+默认路径是当前用户桌面的 `CPA 本地启动.lnk`。Ensure 自动创建、修复 drift，或备份并接管可识别的旧 CPA 启动方式；旧的 `CPA 本地启动（新版）.lnk` 在新名称成功建立后自动清理，完全无关的未知冲突仍明确失败且不覆盖。生成的快捷方式仅使用 PowerShell 7 (`pwsh.exe`)，未安装时明确报错，只保留一个可见窗口。canonical bootstrap 直接调用 bundled starter 的 Fast 模式，不执行 `cpa-stack status/start`、ACL、hash、端口健康或 Manager readiness 预检；进程存在时立即复用，缺失时直接启动并打开页面。完整检查只在 CLI `start` 和更新事务中执行。
 
 只有用户明确要求只读审计快捷方式时才执行：
 
 ```powershell
 & $cpaCli shortcut -Action Check -Root '<managed root>' -ShortcutPath '<desktop .lnk>' -Json
-```
-
-LAN 永远不并入 migrate、upgrade 或快捷方式操作。
-
-只有解释局域网暴露风险并得到明确授权后才切到 LAN；恢复 Loopback 也使用同一独立操作：
-
-```powershell
-& $cpaCli lan -Action Set -Mode Lan -Root '<managed root>' -Json
-& $cpaCli lan -Action Set -Mode Loopback -Root '<managed root>' -Json
 ```
 
 ## 手工更新 updater/Skill
@@ -122,13 +117,13 @@ LAN 永远不并入 migrate、upgrade 或快捷方式操作。
 & '<local release>\install.ps1' -Action Update -CodexHome '<codex home>' -StackRoot '<managed root>' -Json
 ```
 
-这是自动 `upgrade` 之外的离线/手工入口。installer 只更新 Skill、稳定 launcher 与 root registration；它不升级正式 CPA/Manager、不改变 LAN，也不生成桌面快捷方式。若存在 installer recovery pending，让同一个本地 installer 的 `Update` 收敛事务，不要手工混合复制目录。
+这是自动 `upgrade` 之外的离线/手工入口。installer 只更新 Skill、稳定 launcher 与 root registration；它不升级正式 CPA/Manager、不改变网络配置，也不生成桌面快捷方式。若存在 installer recovery pending，让同一个本地 installer 的 `Update` 收敛事务，不要手工混合复制目录。
 
 ## 安全与诊断
 
 发布审查、ACL/进程/数据安全判断或恢复诊断时读取 [safety-model.md](references/safety-model.md)。只有遇到具体失败时读取 [troubleshooting.md](references/troubleshooting.md)。
 
-候选端口为执行器内部动态高位 loopback 资源，不作为用户接口、报告字段或固定端口假设。正式端口来自 managed stack 配置。
+首次迁移的候选端口为执行器内部动态高位 loopback 资源，不作为用户接口、报告字段或固定端口假设。正式端口来自 managed stack 配置。
 
 ## 最终报告
 
@@ -137,7 +132,7 @@ LAN 永远不并入 migrate、upgrade 或快捷方式操作。
 - `operation`、`outcome`、`root`、`changed`、`rolledBack`、`recovered`；
 - updater 是否检查/更新及其 before、after、available 版本；
 - 可用的 `before` / `after`、版本与 hash；
-- shortcut 是否自动创建/更新、LAN 是否发生用户授权的变化；
+- shortcut 是否自动创建/更新、网络配置是否保持不变；
 - `warnings`、`error.code` 和未完成事项。
 
 不要报告动态候选端口、内部 journal 路径、secret 或长日志。

@@ -1,10 +1,14 @@
-#requires -Version 5.1
+#requires -Version 7.0
 
 [CmdletBinding()]
-param()
+param([switch]$Extended)
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
+if (-not $Extended) {
+    & (Join-Path $PSScriptRoot 'Test-Quick.ps1')
+    exit $(if ($?) { 0 } else { 1 })
+}
 . (Join-Path $repo 'skills\cpa-safe-upgrade\scripts\CpaStack.Common.ps1')
 Import-Module (Join-Path $PSScriptRoot 'CpaStack.ProductionGuard.psm1') -Force
 
@@ -160,11 +164,7 @@ function Invoke-CpaStackIsolatedPowerShellTest {
     $stdoutPath = Join-Path $CaseRoot 'runner.stdout.log'
     $stderrPath = Join-Path $CaseRoot 'runner.stderr.log'
     $protectedPorts = @($ProtectedPort + $isolatedRootPorts | Sort-Object -Unique) -join ','
-    $requestedHost = if ($PSVersionTable.PSEdition -eq 'Core') {
-        Join-Path $PSHOME 'pwsh.exe'
-    } else {
-        Join-Path $PSHOME 'powershell.exe'
-    }
+    $requestedHost = Join-Path $PSHOME 'pwsh.exe'
     if (-not (Test-Path -LiteralPath $requestedHost -PathType Leaf)) {
         throw "The requested PowerShell test host is unavailable: $requestedHost"
     }
@@ -233,7 +233,7 @@ exit `$childExitCode
     $process = $null
     try {
         $process = Start-Process `
-            -FilePath (Get-Command powershell.exe -ErrorAction Stop).Source `
+            -FilePath (Get-Command pwsh.exe -ErrorAction Stop).Source `
             -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encodedWrapper) `
             -WindowStyle Hidden `
             -RedirectStandardOutput $stdoutPath `
@@ -383,7 +383,7 @@ $productionArtifactsBefore = Get-CpaStackProductionArtifactSnapshot `
     -ProductionStateHome $productionStateHome `
     -ListenerSnapshot $listenerSnapshot `
     -ProductionPort $productionPorts
-# Keep the isolated root short enough for Windows PowerShell 5.1 Archive internals.
+# Keep isolated archive paths within the Windows runtime path budget.
 $suiteRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('cst-' + [guid]::NewGuid().ToString('N').Substring(0, 12))
 New-Item -ItemType Directory -Force -Path $suiteRoot | Out-Null
 [void](Assert-CpaStackTestIsolation `
@@ -400,13 +400,15 @@ try {
         'tests\InitializeRecoverySafety.Tests.ps1',
         'tests\DynamicPorts.Tests.ps1',
         'tests\ManagedShortcutV2.Tests.ps1',
-        'tests\LanConfiguration.Tests.ps1',
         'tests\Maintenance.Tests.ps1',
         'tests\SelfUpdate.Tests.ps1',
         'tests\CliV2.Tests.ps1',
         'tests\UpgradeDiagnostics.Tests.ps1',
         'tests\ManagerSetupRetry.Tests.ps1',
         'tests\RecoveryPhase.Tests.ps1',
+        'tests\UpgradeFlow.Tests.ps1',
+        'tests\ManagerBackupPlacement.Tests.ps1',
+        'tests\AuthLogBoundary.Tests.ps1',
         'tests\Static.Tests.ps1',
         'tests\Shortcut.Tests.ps1',
         'tests\PathSafety.Tests.ps1',
@@ -430,7 +432,7 @@ try {
         )) {
             # These tests own their ProductionGuard lifecycle and isolated temp
             # roots. Avoid a second Job hierarchy and, for InstallV2, the extra
-            # path depth that exceeds the Windows PowerShell 5.1 leaf budget.
+            # path depth that exceeds the Windows runtime leaf budget.
             Assert-CpaStackProductionBaseline `
                 -Guard $productionGuard `
                 -ArtifactBaseline $productionArtifactsBefore `
@@ -458,7 +460,7 @@ try {
             -ProductionStateHome $productionStateHome `
             -ProductionPort $productionPorts `
             -TimeoutSeconds $(if ($test -cin @('tests\TransactionIntegration.Core.Tests.ps1', 'tests\MaintenanceTransaction.Tests.ps1')) {
-                if ($PSVersionTable.PSEdition -eq 'Core') { 5400 } else { 2700 }
+                5400
             } else { 1200 })
     }
 

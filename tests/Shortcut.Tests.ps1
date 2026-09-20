@@ -11,7 +11,7 @@ $contract = Get-CpaStackCanonicalShortcutContract -StartScript $startScript -Wor
 Assert-True ([string]$contract.Arguments -match '(?i)(?:^|\s)-WindowStyle\s+Hidden(?:\s|$)') 'Canonical shortcut arguments hide the PowerShell window'
 Assert-True ([string]$contract.Arguments -match '(?i)(?:^|\s)-NonInteractive(?:\s|$)') 'Canonical shortcut launch is non-interactive'
 Assert-True ([string]$contract.Arguments -match ('-File\s+"' + [regex]::Escape([System.IO.Path]::GetFullPath($startScript)) + '"$')) 'Canonical shortcut quotes a start script path containing spaces'
-Assert-Equal ([System.IO.Path]::GetFullPath((Get-Command powershell.exe -ErrorAction Stop).Source)) ([System.IO.Path]::GetFullPath([string]$contract.TargetPath)) 'Canonical shortcut targets Windows PowerShell'
+Assert-Equal ([System.IO.Path]::GetFullPath((Get-Command pwsh.exe -ErrorAction Stop).Source)) ([System.IO.Path]::GetFullPath([string]$contract.TargetPath)) 'Canonical shortcut targets Windows PowerShell'
 Assert-Equal ([System.IO.Path]::GetFullPath($ops).TrimEnd('\')) ([string]$contract.WorkingDirectory) 'Canonical shortcut uses the canonical working directory'
 Assert-Equal 7 ([int]$contract.WindowStyle) 'Canonical shortcut minimizes the shell bootstrap before PowerShell hides itself'
 

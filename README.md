@@ -6,7 +6,7 @@
 
 [English](README.en.md)
 
-面向 Windows 本地部署的 CLIProxyAPI（CPA）与 CPA Manager Plus 安全迁移、恢复和升级工具。推荐直接告诉 Codex 你的目标，不需要记 PowerShell 命令；发现、ACL、SQLite 快照、候选验证、切换和回滚由工具自动完成。
+面向 Windows 本地部署的 CLIProxyAPI（CPA）与 CPA Manager Plus 安全迁移、恢复和升级工具。推荐直接告诉 Codex 你的目标，不需要记 PowerShell 命令；发现、ACL、SQLite 快照、首次迁移验证、切换和回滚由工具自动完成。
 
 > 本项目是社区工具，与两个上游项目不存在官方隶属或背书关系。
 
@@ -26,7 +26,7 @@ https://github.com/chrichuang218/cpa-stack-updater
 使用 $cpa-safe-upgrade 升级 CPA。
 ```
 
-以后只需说“升级 CPA”“检查 CPA”“处理数据库维护提示”或“创建 CPA 桌面启动方式”。根目录只在首次安装、切换实例或隔离测试时指定。升级会先验证并更新 Skill，再自动处理恢复、首次迁移、稳定版替换和快捷方式维护，不重复询问；LAN 仍需单独授权。
+以后只需说“升级 CPA”“检查 CPA”“处理数据库维护提示”或“创建 CPA 桌面启动方式”。根目录只在首次安装、切换实例或隔离测试时指定。升级会先验证并更新 Skill，再自动处理恢复、首次迁移、稳定版替换和快捷方式维护，不重复询问。
 
 ## 使用截图
 
@@ -50,14 +50,16 @@ upgrade
   ├─ 已就绪 ────────────────────> upgrade
   └─ 成功后 ────────────────────> shortcut Ensure
 
-lan / start / 手工 Skill installer 均为独立操作
+start / 手工 Skill installer 均为独立操作
 ```
 
-用户执行一次 `upgrade` 即授权自动更新 updater，以及必要的恢复、迁移、稳定版替换和默认桌面快捷方式维护。updater 更新失败时不会继续运行旧版本；LAN 仍是独立操作。
+用户执行一次 `upgrade` 即授权自动更新 updater，以及必要的恢复、迁移、稳定版替换和默认桌面快捷方式维护。updater 更新失败时不会继续运行旧版本。
 
 ## 安全保证
 
-- 候选进程使用动态分配、未占用的高位 loopback 端口；候选端口不是固定用户接口。
+日常升级：校验官方包 → 备份 → 替换重启 → 探活 → 失败回滚。正式配置和凭据保留原位，不再预跑候选实例；首次迁移仍保留候选验证。
+
+- 首次迁移的候选进程使用动态分配、未占用的高位 loopback 端口；候选端口不是固定用户接口。
 - 正式端口来自 managed stack 配置，不假设盘符或端口。
 - 只从两个硬编码官方上游读取 Release，并校验 HTTPS、checksum 与 SHA256。
 - Skill 自更新只接受本仓库更高的稳定 Release，并验证版本化 ZIP、`checksums.txt`、GitHub 双 digest 与包内 VERSION。
@@ -67,16 +69,16 @@ lan / start / 手工 Skill installer 均为独立操作
 - 停服前固定已验证 listener 的 `Process`；路径/PID 不匹配时绝不终止未知进程。
 - 长驻服务无控制台运行，只继承显式指向 `NUL` 的标准句柄。
 - managed root、runtime、auth/plugins、Manager data 和关键父目录执行 owner、DACL 与 reparse 检查。
-- Windows PowerShell 5.1 路径预算在正式停服前完成。
+- Windows 路径预算在正式停服前完成。
 - 正式切换失败时自动恢复上一健康 runtime；未经授权不删除 legacy 安装或历史目录。
-- updater installer 只更新 Skill、稳定 launcher 与 root registration，不升级正式 CPA/Manager，也不改变 LAN。
+- updater installer 只更新 Skill、稳定 launcher 与 root registration，不升级正式 CPA/Manager，也不改变网络配置。
 
 完整模型见 [docs/safety-model.md](docs/safety-model.md)。
 
 ## 要求
 
 - Windows 10/11 x64
-- Windows PowerShell 5.1 或 PowerShell 7
+- PowerShell 7
 - Python 3.10+
 - 本地 NTFS 或 ReFS
 - 迁移场景下已有 CLIProxyAPI 与 CPA Manager Plus
@@ -90,7 +92,7 @@ lan / start / 手工 Skill installer 均为独立操作
 从 [Releases](https://github.com/chrichuang218/cpa-stack-updater/releases/latest) 下载并解压可信发行包。先做严格只读检查：
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 `
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 `
   -Action Check `
   -StackRoot 'E:\CPA-Stack' `
   -Json
@@ -99,7 +101,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 `
 确认后原子安装或更新：
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 `
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 `
   -Action Update `
   -StackRoot 'E:\CPA-Stack' `
   -Json
@@ -124,7 +126,7 @@ $root = 'E:\CPA-Stack'
 ### 1. 一键升级
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli upgrade -Root $root -Json
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli upgrade -Root $root -Json
 ```
 
 命令自动执行 `updater → recover → migrate → runtime upgrade → shortcut Ensure`，不询问二次授权。发现 updater 新版时先安全更新并用新版 CLI 重执行；失败则停止。未知或不可验证的旧 binary 自动替换为已验证的 latest stable；运行时升级成功后自动维护默认桌面快速启动方式。
@@ -132,16 +134,16 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli upgrade -Root $r
 自动发现不唯一时，可在同一条升级命令中提供 request：
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli upgrade -Root $root -RequestPath '<request.json>' -Json
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli upgrade -Root $root -RequestPath '<request.json>' -Json
 ```
 
 request 只保存来源路径、secrets 文件路径和可选正式端口，不保存 secret 值。格式见 [migration-request.md](skills/cpa-safe-upgrade/references/migration-request.md)。
 
-真正的安全失败仍会立即停止，包括 journal 歧义、未知端口 owner、不可信 ACL/reparse、checksum、候选健康、磁盘/路径预算、SQLite 水位或自动回滚失败。
+真正的安全失败仍会立即停止，包括 journal 歧义、未知端口 owner、不可信 ACL/reparse、checksum、切换后健康、磁盘/路径预算、SQLite 水位或自动回滚失败。
 
 #### Windows 定时任务
 
-程序使用 `powershell.exe`，参数使用：
+程序使用 `pwsh.exe`，参数使用：
 
 ```text
 -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "<CodexHome>\skills\cpa-safe-upgrade\scripts\cpa-stack.ps1" upgrade -Root "<managed root>" -Json
@@ -152,7 +154,7 @@ request 只保存来源路径、secrets 文件路径和可选正式端口，不�
 ### 2. 启动
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli start -Root $root -NoBrowser
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli start -Root $root -NoBrowser
 ```
 
 `start` 不会隐式恢复 pending transaction。
@@ -162,7 +164,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli start -Root $roo
 管理页面提示查询索引或旧派生数据维护未完成时，执行受控离线事务：
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli maintenance `
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli maintenance `
   -Action CleanupDerived -Root $root -Json
 ```
 
@@ -173,22 +175,11 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli maintenance `
 `upgrade` 成功后会自动创建或更新当前用户桌面的 `CPA 本地启动.lnk`。你也可以独立执行同一个幂等操作：
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli shortcut `
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli shortcut `
   -Action Ensure -Root $root -Json
 ```
 
-快捷方式使用内置图标，只保留一个可见的 PowerShell 窗口，优先使用 PowerShell 7 (`pwsh.exe`)，未安装时回退 Windows PowerShell 5.1。桌面入口直接运行 Fast starter：不执行 ACL、hash、状态、端口健康或 Manager readiness 预检；已配置进程存在时立即复用，缺失时直接拉起并打开管理页面。完整检查只保留在 CLI `start` 与更新事务中。可识别的旧 CPA 快捷方式会先备份再自动接管；未知无关冲突不会被覆盖。
-
-## LAN 暴露
-
-LAN 是独立高风险操作。解释风险并得到明确授权后才切换：
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli lan -Action Set -Mode Lan -Root $root -Json
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli lan -Action Set -Mode Loopback -Root $root -Json
-```
-
-候选验证始终只允许 loopback。
+快捷方式使用内置图标，只保留一个可见的 PowerShell 窗口，仅使用 PowerShell 7 (`pwsh.exe`)，未安装时明确报错。桌面入口直接运行 Fast starter：不执行 ACL、hash、状态、端口健康或 Manager readiness 预检；已配置进程存在时立即复用，缺失时直接拉起并打开管理页面。完整检查只保留在 CLI `start` 与更新事务中。可识别的旧 CPA 快捷方式会先备份再自动接管；未知无关冲突不会被覆盖。
 
 ## 结构化返回格式（开发者）
 
@@ -218,7 +209,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli lan -Action Set 
 
 ### 升级失败诊断
 
-升级事务的 `upgrade.diagnostics`（同时保存在受管目录的 `state/last-upgrade.json` 中）按时间顺序记录预检、切换后检查、恢复检查和异常位置。`failedChecks` 列出未通过的具体条件，`http` 仅包含组件、请求方法、允许的接口路径、HTTP 状态码或网络失败类型。首次失败和后续恢复观察分别保留；Manager 候选诊断也会附到升级结果中。
+升级事务的 `upgrade.diagnostics`（同时保存在受管目录的 `state/last-upgrade.json` 中）按时间顺序记录预检、事务阶段、失败恢复检查和异常位置。`failedChecks` 列出未通过的具体条件，`http` 仅包含组件、请求方法、允许的接口路径、HTTP 状态码或网络失败类型。首次失败和后续恢复观察分别保留。
 
 诊断不包含密钥、请求头/正文、响应正文、完整配置、数据库内容、URL 查询参数或候选端口。定位时优先看第一条非空 `failedChecks` 或异常记录，再比较后续恢复检查。`recovered=true` 表示内部恢复已成功，不表示整个升级成功；`changed=true` 可与 `success=false` 同时出现，表示已有组件成功切换，仍需结合组件结果确认最终状态。
 
@@ -228,7 +219,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli lan -Action Set 
 
 ```powershell
 $uninstaller = Join-Path $codexHome 'skills\cpa-safe-upgrade\scripts\Uninstall-CpaSafeUpgrade.ps1'
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $uninstaller -Yes
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File $uninstaller -Yes
 ```
 
 卸载只移除带有效 ownership marker 的 Skill 与回滚槽，不触碰 CPA runtime、Manager 数据或 legacy 安装。
@@ -246,7 +237,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File $uninstaller -Yes
 
 ## 测试与发布
 
-测试使用隔离 root/state/lock、动态高位 loopback 端口和 `KILL_ON_JOB_CLOSE` Job Object；正式端口、正式 PID、正式 root 与控制文件是发布阻断保护项。CI 在 Windows PowerShell 5.1 和 PowerShell 7 运行完整套件。
+测试使用隔离 root/state/lock、动态高位 loopback 端口和 `KILL_ON_JOB_CLOSE` Job Object；正式端口、正式 PID、正式 root 与控制文件是发布阻断保护项。CI 仅在 PowerShell 7 运行短检查；长集成测试需显式使用 `pwsh -File tools/Test-All.ps1 -Extended`。
 
 ## 安全反馈
 

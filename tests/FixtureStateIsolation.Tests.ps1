@@ -1,4 +1,4 @@
-#requires -Version 5.1
+#requires -Version 7.0
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'TestHelpers.ps1')

@@ -1,3 +1,4 @@
+#requires -Version 7.0
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$ControlRoot,
@@ -26,7 +27,7 @@ $result = [ordered]@{
 $operationLock = $null
 
 function Get-LegacyCanonicalState {
-    $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
+    $powershell = (Get-Command pwsh.exe -ErrorAction Stop).Source
     $output = @(& $powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'Get-CpaStackState.ps1') -ControlRoot $ControlRoot 2>&1)
     $json = (@($output | ForEach-Object { [string]$_ }) -join [Environment]::NewLine).Trim()
     if ([string]::IsNullOrWhiteSpace($json)) { throw 'Legacy canonical status returned no structured result.' }

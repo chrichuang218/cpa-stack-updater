@@ -12,13 +12,13 @@ CLI 返回 `TargetDriveNotFound` 时，选择真实存在的本地 NTFS/ReFS 盘
 
 使用专用目录，例如 `E:\CPA-Stack`。不要使用盘符根、UNC、Git worktree、Windows/Program Files 子树或用户主目录本身。LocalAppData 下的专用子目录允许使用。
 
-若错误指出 Windows PowerShell 5.1 路径预算，缩短 managed root 或来源树中的深层名称：目录必须不超过 247 字符，文件必须不超过 259 字符，且事务临时后缀也计入预算。该检查发生在正式停服或禁用 collector 前；不要通过手工停服绕过。
+若错误指出 Windows 路径预算，缩短 managed root 或来源树中的深层名称：目录必须不超过 247 字符，文件必须不超过 259 字符，且事务临时后缀也计入预算。该检查发生在正式停服或禁用 collector 前；不要通过手工停服绕过。
 
 ## 找不到旧安装
 
 先让旧 CPA 与 Manager Plus 正常运行，再执行 `status`。若仍不能唯一获得 runtime、config、data 与 key，按 [migration-request.md](migration-request.md) 创建显式 request；不要假设正式端口或把 secret 值写进 request。
 
-## 候选端口被占用
+## 首次迁移的候选端口被占用
 
 候选端口由执行器动态分配为未占用的高位 loopback 端口，不存在固定候选端口。不要终止未知进程；保留结构化错误并重试。重复失败时检查系统端口耗尽或安全软件拦截，不要绕过 loopback 门禁。
 
@@ -48,9 +48,9 @@ CPA 回滚可能在旧程序写回后、事务清理前中断。对于 `target-s
 
 ## 无法证明版本单调
 
-公开 `upgrade` 会自动允许用已验证的 latest stable 替换无法可靠识别版本或来源的旧 binary，不需要额外参数或确认。release checksum、候选健康、SQLite 水位和失败回滚仍按原安全门禁执行。
+公开 `upgrade` 会自动允许用已验证的 latest stable 替换无法可靠识别版本或来源的旧 binary，不需要额外参数或确认。release checksum、切换后健康、SQLite 水位和失败回滚仍按原安全门禁执行。
 
-## 候选验证失败
+## 首次迁移的候选验证失败
 
 正式服务应保持不变。只查看结构化错误和 managed root 中的小型 state 结果；GitHub Issue 中不要上传数据库、key、auth、完整配置或日志。
 
@@ -68,7 +68,7 @@ Manager 的 `/health` 可能早于启动索引维护完成。共享配置函数�
 
 用 `status` 确认 stack config 中的正式端口、健康状态和 last-known-good。自动回滚成功属于受控升级失败，不等于数据丢失。只报告版本、exe hash、检查项和脱敏错误。
 
-Windows 安全软件或文件系统过滤器可能在回滚快照刚完成时短暂拒绝目录改名；Windows PowerShell 5.1 还会把 sharing violation 折叠为通用 I/O 错误。updater 只在源目录仍存在且目标仍不存在时做固定上限重试；路径状态发生歧义、持续拒绝或非 I/O 错误仍立即失败，不能手工移动 staging/pending 目录绕过事务。
+Windows 安全软件或文件系统过滤器可能在回滚快照刚完成时短暂拒绝目录改名；底层 sharing violation 也可能被包装为通用 I/O 错误。updater 只在源目录仍存在且目标仍不存在时做固定上限重试；路径状态发生歧义、持续拒绝或非 I/O 错误仍立即失败，不能手工移动 staging/pending 目录绕过事务。
 
 ## 升级已经完成但命令长时间不返回
 

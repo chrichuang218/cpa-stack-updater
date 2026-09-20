@@ -1,4 +1,4 @@
-#requires -Version 5.1
+#requires -Version 7.0
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -123,7 +123,7 @@ while (-not (Test-Path -LiteralPath `$GatePath -PathType Leaf)) {
 `$code = if (`$null -eq `$global:LASTEXITCODE) { 0 } else { [int]`$global:LASTEXITCODE }
 exit `$code
 "@
-        $launchExecutable = (Get-Command powershell.exe -ErrorAction Stop).Source
+        $launchExecutable = (Get-Command pwsh.exe -ErrorAction Stop).Source
         $launchArguments = @(
             '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
             '-File', $trampoline,
@@ -415,7 +415,7 @@ try {
         -ListenerSnapshot $listenerSnapshot
     [void](Assert-CpaStackTestIsolation -Guard $productionGuard -TestRoot $temp -TestStateHome (Join-Path $temp 'local-app-data'))
 
-    $powershells = @((Get-Command powershell.exe -ErrorAction Stop).Source)
+    $powershells = @((Get-Command pwsh.exe -ErrorAction Stop).Source)
     $pwsh = Get-Command pwsh.exe -ErrorAction SilentlyContinue
     if ($null -ne $pwsh) { $powershells += $pwsh.Source }
 
@@ -555,7 +555,7 @@ exit 1
         $unownedTargetRoot = Join-Path $hostRoot 'unowned-target-root'
         $unownedTargetFixture = New-FullJournalRoot -CaseRoot (Join-Path $hostRoot 'unowned-target-source') -Root $unownedTargetRoot
         $unownedTargetExe = Join-Path $unownedTargetFixture.TargetCpa 'cli-proxy-api.exe'
-        Copy-Item -LiteralPath (Get-Command powershell.exe -ErrorAction Stop).Source -Destination $unownedTargetExe -Force
+        Copy-Item -LiteralPath (Get-Command pwsh.exe -ErrorAction Stop).Source -Destination $unownedTargetExe -Force
         $unownedTargetFixture.Journal.targetCpaSha256 = Get-CpaStackFileHash -Path $unownedTargetExe
         $unownedTargetFixture.Journal.targetCpaRuntimeManifestSha256 = [string](Get-CpaStackTreeManifest -Root $unownedTargetFixture.TargetCpa).sha256
         Write-TestJson -Path (Join-Path $unownedTargetRoot 'state\initialize.pending.json') -Value $unownedTargetFixture.Journal
@@ -594,7 +594,7 @@ exit 1
         $extraTargetRoot = Join-Path $hostRoot 'extra-target-process-root'
         $extraTargetFixture = New-FullJournalRoot -CaseRoot (Join-Path $hostRoot 'extra-target-process-source') -Root $extraTargetRoot
         $extraTargetExe = Join-Path $extraTargetFixture.TargetCpa 'cli-proxy-api.exe'
-        Copy-Item -LiteralPath (Get-Command powershell.exe -ErrorAction Stop).Source -Destination $extraTargetExe -Force
+        Copy-Item -LiteralPath (Get-Command pwsh.exe -ErrorAction Stop).Source -Destination $extraTargetExe -Force
         $extraTargetFixture.Journal.targetCpaSha256 = Get-CpaStackFileHash -Path $extraTargetExe
         $extraTargetFixture.Journal.targetCpaRuntimeManifestSha256 = [string](Get-CpaStackTreeManifest -Root $extraTargetFixture.TargetCpa).sha256
         Write-TestJson -Path (Join-Path $extraTargetRoot 'state\initialize.pending.json') -Value $extraTargetFixture.Journal

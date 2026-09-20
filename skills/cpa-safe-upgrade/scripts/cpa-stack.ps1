@@ -1,19 +1,17 @@
-#requires -Version 5.1
+#requires -Version 7.0
 
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('status', 'migrate', 'recover', 'upgrade', 'start', 'maintenance', 'shortcut', 'lan')]
+    [ValidateSet('status', 'migrate', 'recover', 'upgrade', 'start', 'maintenance', 'shortcut')]
     [string]$Command = 'status',
 
     [Alias('ControlRoot')]
     [string]$Root,
 
     [string]$RequestPath,
-    [ValidateSet('Check', 'Ensure', 'Set', 'CleanupDerived')]
+    [ValidateSet('Check', 'Ensure', 'CleanupDerived')]
     [string]$Action,
-    [ValidateSet('Loopback', 'Lan')]
-    [string]$Mode,
     [string]$ShortcutPath,
     [switch]$NoBrowser,
     [switch]$Json
@@ -27,7 +25,6 @@ Import-Module (Join-Path $moduleRoot 'CpaStack.UpgradeTransaction.psm1') -Force
 Import-Module (Join-Path $moduleRoot 'CpaStack.MigrationTransaction.psm1') -Force
 Import-Module (Join-Path $moduleRoot 'CpaStack.Recovery.psm1') -Force
 Import-Module (Join-Path $moduleRoot 'CpaStack.Launcher.psm1') -Force
-Import-Module (Join-Path $moduleRoot 'CpaStack.LanConfiguration.psm1') -Force
 Import-Module (Join-Path $moduleRoot 'CpaStack.Maintenance.psm1') -Force
 Import-Module (Join-Path $moduleRoot 'CpaStack.ManagedShortcut.psm1') -Force -Global
 Import-Module (Join-Path $moduleRoot 'CpaStack.Result.psm1') -Force -Global
@@ -210,7 +207,7 @@ function Invoke-CpaStackUpgradeReexec {
 
     $engine = [string](Get-Process -Id $PID -ErrorAction Stop).Path
     if (-not (Test-Path -LiteralPath $engine -PathType Leaf) -or
-        [System.IO.Path]::GetFileName($engine) -notin @('powershell.exe', 'pwsh.exe')) {
+        [System.IO.Path]::GetFileName($engine) -ne 'pwsh.exe') {
         throw 'Current PowerShell host cannot be used for updater re-execution.'
     }
     $cli = Join-Path $PSScriptRoot 'cpa-stack.ps1'
@@ -375,7 +372,6 @@ $commandParameterNames = switch ($Command) {
     'start' { @('NoBrowser'); break }
     'maintenance' { @('Action'); break }
     'shortcut' { @('Action', 'ShortcutPath'); break }
-    'lan' { @('Action', 'Mode'); break }
 }
 $allowedParameterNames = @($commonParameterNames) + @($commandParameterNames)
 $unsupportedParameterNames = @($PSBoundParameters.Keys | Where-Object { [string]$_ -notin $allowedParameterNames })
@@ -488,18 +484,6 @@ try {
         $maintenanceResult = Invoke-CpaStackMaintenanceOperation -Root $resolvedRoot -HostAdapter $hostAdapter -Action $Action
         Write-CommandResult -Value $maintenanceResult
         if (-not $maintenanceResult.success) { exit 1 }
-        exit 0
-    }
-    if ($Command -eq 'lan') {
-        if ($Action -ne 'Set' -or [string]::IsNullOrWhiteSpace($Mode)) {
-            $invalidLan = New-CpaStackResult -Operation lan -Success $false -Outcome Blocked -Changed $false -Root $resolvedRoot `
-                -Error (New-CpaStackError -Code 'InvalidLanRequest' -Message "LAN requires '-Action Set -Mode Loopback|Lan'.")
-            Write-CommandResult -Value $invalidLan
-            exit 1
-        }
-        $lanResult = Invoke-CpaStackLanOperation -Root $resolvedRoot -HostAdapter $hostAdapter -Action $Action -Mode $Mode
-        Write-CommandResult -Value $lanResult
-        if (-not $lanResult.success) { exit 1 }
         exit 0
     }
     if ($Command -eq 'shortcut') {

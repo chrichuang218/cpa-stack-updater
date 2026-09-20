@@ -1,4 +1,4 @@
-#requires -Version 5.1
+#requires -Version 7.0
 
 [CmdletBinding()]
 param(
@@ -47,7 +47,7 @@ function Invoke-BundledJson {
         [switch]$AllowNonZero
     )
 
-    $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
+    $powershell = (Get-Command pwsh.exe -ErrorAction Stop).Source
     $previousPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'

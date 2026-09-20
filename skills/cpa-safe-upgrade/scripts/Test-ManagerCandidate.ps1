@@ -1,3 +1,4 @@
+#requires -Version 7.0
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$ControlRoot,
@@ -184,7 +185,7 @@ try {
         $expectHistorical = ([Int64]$baseline.snapshot.usage_events.count -gt 0)
         $snapshotState = Test-ManagerCandidateHttp -ExpectHistorical $expectHistorical -ExpectedProcessId $candidateProcess.Id
         if ($RequireV111Schema) {
-            $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
+            $powershell = (Get-Command pwsh.exe -ErrorAction Stop).Source
             & $powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "Test-ManagerData.ps1") -DatabasePath (Join-Path $snapshotData "usage.sqlite") -BaselineJsonPath $baselinePath | Out-Null
             if ($LASTEXITCODE -ne 0) {
                 throw "Manager candidate v1.11 schema/history assertions failed."

@@ -1,4 +1,4 @@
-#requires -Version 5.1
+#requires -Version 7.0
 
 <#
 .SYNOPSIS
@@ -358,7 +358,7 @@ function Assert-CanonicalInstanceState {
             throw "$($entry.Name) executable does not match current state."
         }
     }
-    Assert-PrivateCpaTree -Root (Join-Path $Settings.Cpa.WorkingDirectory 'auth') -Description 'Canonical CPA auth' -AllowInheritedDescendants
+    Assert-PrivateCpaTree -Root (Join-Path $Settings.Cpa.WorkingDirectory 'auth') -Description 'Canonical CPA auth' -AllowInheritedDescendants -ShallowDirectoryNames @('logs')
     $pluginsRoot = Join-Path $Settings.Cpa.WorkingDirectory 'plugins'
     if (Test-Path -LiteralPath $pluginsRoot) {
         Assert-PrivateCpaTree -Root $pluginsRoot -Description 'Canonical CPA plugins'
@@ -370,7 +370,8 @@ function Assert-PrivateCpaTree {
     param(
         [string]$Root,
         [string]$Description,
-        [switch]$AllowInheritedDescendants
+        [switch]$AllowInheritedDescendants,
+        [string[]]$ShallowDirectoryNames = @()
     )
 
     if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
@@ -412,6 +413,7 @@ function Assert-PrivateCpaTree {
             }
         }
         if ($item.PSIsContainer) {
+            if ((Split-Path -Parent $item.FullName).TrimEnd('\') -ieq $rootFull -and $ShallowDirectoryNames -contains $item.Name) { continue }
             foreach ($child in Get-ChildItem -Force -LiteralPath $item.FullName) {
                 $queue.Enqueue($child.FullName)
             }

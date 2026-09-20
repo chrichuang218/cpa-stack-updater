@@ -4,10 +4,10 @@
 
 1. 保持 `skills/cpa-safe-upgrade/scripts/cpa-stack.ps1` 的公开接口小而稳定。
 2. 禁止提交真实 binary、key、配置、数据库、日志或个人路径。
-3. 同时运行 `powershell -File .\tools\Test-All.ps1` 与 `pwsh -File .\tools\Test-All.ps1`。
+3. 仅支持 PowerShell 7。日常运行 `pwsh -File .\tools\Test-All.ps1`：默认只做语法、平台约束、日志边界、恢复状态和 SQLite 备份短检查。长时间安装/迁移/故障注入测试仅显式使用 `-Extended`，不作为每次修改或 CI 的默认门槛。
 4. 每个恢复 bug 都要增加 fixture、状态真值表或 failure-injection 回归。
-5. 保持“候选失败不改变正式服务”的不变量。
+5. 下载校验失败不得改变正式服务。日常升级不预跑候选；首次迁移仍保留候选验证。
 6. 保持“正式切换失败时，返回前恢复旧健康服务”的不变量。
-7. PowerShell 源码保持 ASCII，以兼容 Windows PowerShell 5.1；中文放在 UTF-8 Markdown/YAML 中。
+7. 源码与文档使用 UTF-8；不再维护 PS5 宿主或兼容分支。
 
 扩展端口、启动方式、CPU 架构、文件系统或 release 来源时，必须同步说明新的信任边界。

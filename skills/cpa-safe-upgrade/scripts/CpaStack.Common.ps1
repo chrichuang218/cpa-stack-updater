@@ -1,22 +1,5 @@
+#requires -Version 7.0
 Set-StrictMode -Version 2.0
-
-function Get-CpaStackWindowsPowerShellModulePath {
-    $paths = @()
-    $documents = [Environment]::GetFolderPath('MyDocuments')
-    if (-not [string]::IsNullOrWhiteSpace($documents)) {
-        $paths += Join-Path $documents 'WindowsPowerShell\Modules'
-    }
-    $programFiles = [Environment]::GetFolderPath('ProgramFiles')
-    if (-not [string]::IsNullOrWhiteSpace($programFiles)) {
-        $paths += Join-Path $programFiles 'WindowsPowerShell\Modules'
-    }
-    $windows = [Environment]::GetFolderPath('Windows')
-    if (-not [string]::IsNullOrWhiteSpace($windows)) {
-        $paths += Join-Path $windows 'System32\WindowsPowerShell\v1.0\Modules'
-    }
-    if ($paths.Count -eq 0) { throw 'Windows PowerShell module paths are unavailable.' }
-    return (@($paths | Select-Object -Unique) -join [System.IO.Path]::PathSeparator)
-}
 
 function Get-CpaStackUpdaterVersion {
     param([switch]$Optional)
@@ -31,10 +14,6 @@ function Get-CpaStackUpdaterVersion {
         throw 'CPA Stack Updater version is invalid.'
     }
     return $version
-}
-
-if ($PSVersionTable.PSEdition -eq 'Desktop') {
-    $env:PSModulePath = Get-CpaStackWindowsPowerShellModulePath
 }
 
 function Get-CpaStackDefaultRoot {
@@ -594,7 +573,7 @@ function Get-CpaStackCanonicalShortcutContract {
     }
     $startScriptFull = [System.IO.Path]::GetFullPath($StartScript)
     $workingDirectoryFull = [System.IO.Path]::GetFullPath($WorkingDirectory).TrimEnd('\')
-    $powershell = [System.IO.Path]::GetFullPath((Get-Command powershell.exe -ErrorAction Stop).Source)
+    $powershell = [System.IO.Path]::GetFullPath((Get-Command pwsh.exe -ErrorAction Stop).Source)
     return [pscustomobject]@{
         TargetPath = $powershell
         Arguments = '-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $startScriptFull
@@ -802,33 +781,24 @@ function Set-CpaStackFileSystemAcl {
     )
 
     $item = Get-Item -Force -LiteralPath $Path -ErrorAction Stop
-    $extensions = 'System.IO.FileSystemAclExtensions' -as [type]
     if ($item.PSIsContainer) {
         if ($Acl -isnot [System.Security.AccessControl.DirectorySecurity]) {
             throw "A directory ACL is required for $Path"
         }
-        if ($null -ne $extensions) {
-            [System.IO.FileSystemAclExtensions]::SetAccessControl(
+        [System.IO.FileSystemAclExtensions]::SetAccessControl(
                 [System.IO.DirectoryInfo]$item,
                 [System.Security.AccessControl.DirectorySecurity]$Acl
-            )
-        } else {
-            ([System.IO.DirectoryInfo]$item).SetAccessControl([System.Security.AccessControl.DirectorySecurity]$Acl)
-        }
+        )
         return
     }
 
     if ($Acl -isnot [System.Security.AccessControl.FileSecurity]) {
         throw "A file ACL is required for $Path"
     }
-    if ($null -ne $extensions) {
-        [System.IO.FileSystemAclExtensions]::SetAccessControl(
+    [System.IO.FileSystemAclExtensions]::SetAccessControl(
             [System.IO.FileInfo]$item,
             [System.Security.AccessControl.FileSecurity]$Acl
-        )
-    } else {
-        ([System.IO.FileInfo]$item).SetAccessControl([System.Security.AccessControl.FileSecurity]$Acl)
-    }
+    )
 }
 
 function Test-CpaStackPrivateAcl {
@@ -925,7 +895,8 @@ function Get-CpaStackTreeItemsNoReparse {
     param(
         [Parameter(Mandatory = $true)][string]$Root,
         [string[]]$ExcludeDirectoryNames = @(),
-        [string[]]$ExcludeFileNames = @()
+        [string[]]$ExcludeFileNames = @(),
+        [string[]]$ShallowDirectoryNames = @()
     )
 
     Assert-CpaStackPath -Path $Root
@@ -941,6 +912,8 @@ function Get-CpaStackTreeItemsNoReparse {
         }
         [void]$items.Add($item)
         if ($item.PSIsContainer) {
+            # Keep the directory boundary in the audit, not its disposable contents.
+            if ((Split-Path -Parent $item.FullName).TrimEnd('\') -ieq $rootFull -and $ShallowDirectoryNames -contains $item.Name) { continue }
             foreach ($child in Get-ChildItem -Force -LiteralPath $item.FullName) {
                 # Manifest exclusions must prune traversal, not just filter its output.
                 if ($item.FullName.TrimEnd('\') -ieq $rootFull -and $child.PSIsContainer -and $ExcludeDirectoryNames -contains $child.Name) { continue }
@@ -1217,13 +1190,14 @@ function Assert-CpaStackPrivateTree {
         [Parameter(Mandatory = $true)][string]$Root,
         [string]$Description = 'Protected CPA stack tree',
         [switch]$AllowInheritedDescendants,
-        [switch]$RootOnly
+        [switch]$RootOnly,
+        [string[]]$ShallowDirectoryNames = @()
     )
 
     $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\')
     $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     $allowedSids = @($currentSid, 'S-1-5-18', 'S-1-5-32-544')
-    $items = if ($RootOnly) { @(Get-Item -LiteralPath $Root -Force -ErrorAction Stop) } else { @(Get-CpaStackTreeItemsNoReparse -Root $Root) }
+    $items = if ($RootOnly) { @(Get-Item -LiteralPath $Root -Force -ErrorAction Stop) } else { @(Get-CpaStackTreeItemsNoReparse -Root $Root -ShallowDirectoryNames $ShallowDirectoryNames) }
     if ($RootOnly -and -not $items[0].PSIsContainer) { throw "$Description root is not a directory." }
     foreach ($item in $items) {
         if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw "$Description contains a reparse point." }
@@ -2601,7 +2575,7 @@ function Copy-CpaStackAuthTree {
         [Parameter(Mandatory = $true)][string]$Destination
     )
 
-    [void](Get-CpaStackTreeItemsNoReparse -Root $Source)
+    [void](Get-CpaStackTreeItemsNoReparse -Root $Source -ShallowDirectoryNames @('logs'))
     Copy-CpaStackTree -Source $Source -Destination $Destination -ExcludeDirectoryNames @("logs")
     Protect-CpaStackPrivateTree -Root $Destination
 }
@@ -2649,7 +2623,7 @@ function Assert-CpaStackChildPath {
         '^logs\\[^\\]+(?:\\.*)?$',
         '^ops\\[^\\]+(?:\\.*)?$',
         '^releases\\current(?:\\.*)?$',
-        '^rollback\\(?:last-known-good|legacy-migration|lan\\[0-9a-fA-F]{32}|(?:staging|pending)-(?:cpa|manager|maintenance)-[0-9a-fA-F]{32})(?:\\.*)?$',
+        '^rollback\\(?:last-known-good|legacy-migration|(?:staging|pending)-(?:cpa|manager|maintenance)-[0-9a-fA-F]{32})(?:\\.*)?$',
         '^runtime\\(?:cli-proxy-api|manager-plus)(?:\\.*)?$',
         '^state\\[^\\]+(?:\\.*)?$',
         '^work\\(?:current|cpa-(?:candidate|\d{1,5})-[0-9a-fA-F]{32}|manager-(?:candidate|\d{1,5})-[0-9a-fA-F]{32}|manager-formal-verification-[0-9a-fA-F]{32}|mv-[0-9a-fA-F]{32})(?:\\.*)?$'
@@ -2688,7 +2662,7 @@ function Assert-CpaStackPathBudget {
         if ([string]::IsNullOrWhiteSpace($path)) { throw 'Path budget validation received an empty path.' }
         $fullPath = [System.IO.Path]::GetFullPath($path)
         if ($fullPath.Length -gt $maximumLength) {
-            throw "Path exceeds the Windows PowerShell 5.1 $PathType budget of $maximumLength characters: $fullPath"
+            throw "Path exceeds the Windows $PathType budget of $maximumLength characters: $fullPath"
         }
     }
 }

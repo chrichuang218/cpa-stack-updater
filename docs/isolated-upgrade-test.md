@@ -3,10 +3,11 @@
 Run only with explicit permission to copy local credentials and history:
 
 ```powershell
-powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File tools\Test-RealUpgrade.ps1 -SourceRoot 'E:\CPA-Stack' -TestRoot 'E:\CPA-stack-test' -CpaPort 28317 -ManagerPort 28318
+pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File tools\Test-RealUpgrade.ps1 -SourceRoot 'E:\CPA-Stack' -TestRoot 'E:\CPA-stack-test' -CpaPort 28317 -ManagerPort 28318
 ```
 
-The destination must not exist. The runner copies runtime/auth, takes an online
+The destination must not exist. The runner copies runtime/auth without historical
+logs (including auth/logs), takes an online
 SQLite snapshot, creates a new instance identity, and omits production journals,
 rollback state and runtime overrides. Only the offline test snapshot is rebound
 to the test CPA. Its collector and account automation are disabled; history and

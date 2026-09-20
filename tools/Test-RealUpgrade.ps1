@@ -1,4 +1,4 @@
-#requires -Version 5.1
+#requires -Version 7.0
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$SourceRoot,
@@ -36,7 +36,7 @@ $report = [ordered]@{ success = $false; phase = $phase; productionUnchanged = $f
 
 function Invoke-TestCli {
     param([string[]]$Arguments)
-    $output = @(& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $script:cli @Arguments)
+    $output = @(& pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $script:cli @Arguments)
     $code = $LASTEXITCODE
     $document = ($output -join [Environment]::NewLine) | ConvertFrom-Json
     if ($null -eq $document -or $document.schemaVersion -ne 2) { throw 'Missing final schema v2 result.' }
@@ -64,10 +64,11 @@ try {
     Write-Host 'Copying runtime and auth into protected test directories.'
     foreach ($relative in @('runtime\cli-proxy-api', 'runtime\manager-plus')) {
         $sourcePath = Join-Path $SourceRoot $relative
-        [void](Get-CpaStackTreeItemsNoReparse -Root $sourcePath)
+        [void](Get-CpaStackTreeItemsNoReparse -Root $sourcePath -ExcludeDirectoryNames @('auth', 'logs'))
         Copy-CpaStackTree -Source $sourcePath -Destination (Join-Path $TestRoot $relative) `
-            -ExcludeDirectoryNames @('logs') -ExcludeFileNames @('server.log', 'config.json')
+            -ExcludeDirectoryNames @('auth', 'logs') -ExcludeFileNames @('server.log', 'config.json')
     }
+    Copy-CpaStackAuthTree -Source (Join-Path $SourceRoot 'runtime\cli-proxy-api\auth') -Destination (Join-Path $TestRoot 'runtime\cli-proxy-api\auth')
     foreach ($relative in @('config', 'state', 'ops', 'data\manager-plus', 'lab')) {
         New-Item -ItemType Directory -Force -Path (Join-Path $TestRoot $relative) | Out-Null
     }
@@ -136,7 +137,7 @@ try {
     Protect-CpaStackPrivateTree -Root $TestRoot
     $testCodex = Join-Path $TestRoot 'lab\codex'
     foreach ($action in @('Check','Update')) {
-        $installText = @(& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $fixture.Repository 'install.ps1') -Action $action -CodexHome $testCodex -StackRoot $TestRoot -Json)
+        $installText = @(& pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $fixture.Repository 'install.ps1') -Action $action -CodexHome $testCodex -StackRoot $TestRoot -Json)
         $installExit = $LASTEXITCODE
         $installed = ($installText -join [Environment]::NewLine) | ConvertFrom-Json
         if ($installExit -ne 0 -or -not $installed.success) { throw 'Isolated installer failed.' }

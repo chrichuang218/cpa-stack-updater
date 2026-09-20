@@ -1,4 +1,4 @@
-#requires -Version 5.1
+#requires -Version 7.0
 
 <#
 .SYNOPSIS
@@ -399,7 +399,7 @@ function Get-RootSecurityState {
     $authRoot = Join-Path $StackRoot 'runtime\cli-proxy-api\auth'
     if (Test-Path -LiteralPath $authRoot -PathType Container) {
         try {
-            Assert-CpaStackPrivateTree -Root $authRoot -Description 'Protected CPA auth' -AllowInheritedDescendants
+            Assert-CpaStackPrivateTree -Root $authRoot -Description 'Protected CPA auth' -AllowInheritedDescendants -ShallowDirectoryNames @('logs')
         } catch {
             $issues += $_.Exception.Message
         }
@@ -1016,7 +1016,7 @@ function Get-LegacyState {
             WorkingDirectory = $link.WorkingDirectory
             IconLocation = $link.IconLocation
             PowerShellWindowHidden = (
-                [System.IO.Path]::GetFileName([string]$link.TargetPath) -ieq 'powershell.exe' -and
+                [System.IO.Path]::GetFileName([string]$link.TargetPath) -ieq 'pwsh.exe' -and
                 [string]$link.Arguments -match '(?i)(?:^|\s)-WindowStyle\s+Hidden(?:\s|$)'
             )
         }

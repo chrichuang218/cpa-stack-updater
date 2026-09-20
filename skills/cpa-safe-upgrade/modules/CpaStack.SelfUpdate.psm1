@@ -1,3 +1,4 @@
+#requires -Version 7.0
 Set-StrictMode -Version Latest
 
 . (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\CpaStack.Common.ps1')
@@ -197,7 +198,7 @@ function Invoke-CpaStackInstallerJson {
         [Parameter(Mandatory = $true)][string]$StackRoot
     )
 
-    $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
+    $powershell = (Get-Command pwsh.exe -ErrorAction Stop).Source
     $previousPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'

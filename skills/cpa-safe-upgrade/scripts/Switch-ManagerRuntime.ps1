@@ -1,3 +1,4 @@
+#requires -Version 7.0
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$ControlRoot,
@@ -264,6 +265,21 @@ try {
         sourceSnapshot = $null
         targetProcessId = $null
     }
+    if ($sameRuntime -and $sameData) {
+        # Program files are static while Manager runs; keep their copy out of downtime.
+        # The database and data.key are still captured together after the process exits.
+        Assert-CpaStackChildPath -Root $ControlRoot -Path $rollbackRoot
+        Assert-CpaStackChildPath -Root $ControlRoot -Path $snapshotStaging
+        Assert-CpaStackChildPath -Root $ControlRoot -Path $pending
+        New-Item -ItemType Directory -Force -Path $snapshotStaging | Out-Null
+        Protect-CpaStackPrivateDirectory -Path $snapshotStaging
+        New-Item -ItemType Directory -Force -Path (Join-Path $snapshotStaging "runtime") | Out-Null
+        Copy-CpaStackTree -Source $SourceRuntime -Destination (Join-Path $snapshotStaging "runtime") -ExcludeDirectoryNames @("data") -ExcludeFileNames @("server.log")
+        $snapshotExe = Join-Path $snapshotStaging "runtime\cpa-manager-plus.exe"
+        if ((Get-CpaStackFileHash -Path $snapshotExe) -ne $result.oldHash) {
+            throw "Manager rollback executable snapshot hash validation failed."
+        }
+    }
     Write-CpaStackJson -Value $journal -Path $journalPath
     $collectorDisabled = $true
     [void](Set-CpaStackManagerCollector -ManagerPort $ManagerPort -CpaPort $CpaPort -ManagerAdminKey $secrets.managerAdminKey -CpaManagementKey $secrets.cpaManagementKey -Enabled $false -Baseline $formalBaseline)
@@ -276,15 +292,6 @@ try {
 
     try {
         if ($sameRuntime -and $sameData) {
-            Assert-CpaStackChildPath -Root $ControlRoot -Path $rollbackRoot
-            Assert-CpaStackChildPath -Root $ControlRoot -Path $snapshotStaging
-            Assert-CpaStackChildPath -Root $ControlRoot -Path $pending
-            New-Item -ItemType Directory -Force -Path (Join-Path $snapshotStaging "runtime") | Out-Null
-            Copy-CpaStackTree -Source $SourceRuntime -Destination (Join-Path $snapshotStaging "runtime") -ExcludeDirectoryNames @("data") -ExcludeFileNames @("server.log")
-            $snapshotExe = Join-Path $snapshotStaging "runtime\cpa-manager-plus.exe"
-            if ((Get-CpaStackFileHash -Path $snapshotExe) -ne $result.oldHash) {
-                throw "Manager rollback executable snapshot hash validation failed."
-            }
             $stagingBaselinePath = Join-Path $snapshotStaging "sqlite-backup.json"
             $baseline = Copy-ManagerDataSnapshot -FromData $SourceData -ToData (Join-Path $snapshotStaging "data") -MetadataPath $stagingBaselinePath
             $result.sourceSnapshot = $baseline.snapshot
@@ -338,7 +345,7 @@ try {
         Assert-HistoryPreserved -Before $baseline -After $after
 
         if ($RequireV111Schema) {
-            $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
+            $powershell = (Get-Command pwsh.exe -ErrorAction Stop).Source
             & $powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "Test-ManagerData.ps1") -DatabasePath $targetDb -BaselineJsonPath $baselinePath | Out-Null
             if ($LASTEXITCODE -ne 0) {
                 throw "Manager v1.11 data compatibility assertions failed."

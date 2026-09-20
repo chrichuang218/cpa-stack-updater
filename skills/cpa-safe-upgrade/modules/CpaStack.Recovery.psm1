@@ -1,3 +1,4 @@
+#requires -Version 7.0
 Set-StrictMode -Version Latest
 
 Import-Module (Join-Path $PSScriptRoot 'CpaStack.Result.psm1') -Force
@@ -24,7 +25,6 @@ function Get-CpaStackRecoveryPlan {
     $hasRollbackArtifact = $false
     $hasInitializePrevious = $false
     $hasUpgradePrevious = $false
-    $hasLanPrevious = $false
     $hasSwitchPrevious = $false
     foreach ($path in $artifacts) {
         $name = [System.IO.Path]::GetFileName($path)
@@ -48,14 +48,6 @@ function Get-CpaStackRecoveryPlan {
             }
             '^upgrade\.pending\.json\.previous$' {
                 if ($parent -ine $stateRoot) { $unknown.Add($path) } else { $hasUpgradePrevious = $true }
-                continue
-            }
-            '^lan\.pending\.json$' {
-                if ($parent -ine $stateRoot) { $unknown.Add($path) } else { $journalKinds.Add('lan') }
-                continue
-            }
-            '^lan\.pending\.json\.previous$' {
-                if ($parent -ine $stateRoot) { $unknown.Add($path) } else { $hasLanPrevious = $true }
                 continue
             }
             '^switch-(cpa|manager)\.pending\.json$' {
@@ -87,7 +79,6 @@ function Get-CpaStackRecoveryPlan {
             return [pscustomobject]@{ Kind = 'ambiguous'; Artifacts = $artifacts; Unknown = @() }
         }
         if ($hasUpgradePrevious -and $kind -ne 'upgrade' -or
-            $hasLanPrevious -and $kind -ne 'lan' -or
             $hasSwitchPrevious -and $kind -ne 'upgrade') {
             return [pscustomobject]@{ Kind = 'ambiguous'; Artifacts = $artifacts; Unknown = @() }
         }
@@ -102,11 +93,8 @@ function Get-CpaStackRecoveryPlan {
         }
         return [pscustomobject]@{ Kind = $kind; Artifacts = $artifacts; Unknown = @() }
     }
-    if (($hasUpgradePrevious -or $hasSwitchArtifact -or $hasSwitchPrevious -or $hasRollbackArtifact) -and -not $hasLanPrevious -and -not $hasInitializePrevious) {
+    if (($hasUpgradePrevious -or $hasSwitchArtifact -or $hasSwitchPrevious -or $hasRollbackArtifact) -and -not $hasInitializePrevious) {
         return [pscustomobject]@{ Kind = 'upgrade'; Artifacts = $artifacts; Unknown = @() }
-    }
-    if ($hasLanPrevious -and -not $hasUpgradePrevious -and -not $hasSwitchPrevious -and -not $hasInitializePrevious) {
-        return [pscustomobject]@{ Kind = 'lan'; Artifacts = $artifacts; Unknown = @() }
     }
     if ($hasInitializePrevious) {
         return [pscustomobject]@{ Kind = 'ambiguous'; Artifacts = $artifacts; Unknown = @() }
@@ -179,7 +167,6 @@ function Invoke-CpaStackRecovery {
         'adopt' { $script = 'Adopt-CpaStackLegacyCanonical.ps1'; $arguments += '-RecoverOnly' }
         'initialize' { $script = 'Initialize-CpaStack.ps1'; $arguments += '-RecoverOnly' }
         'upgrade' { $script = 'Invoke-CpaStackUpgrade.ps1'; $arguments += '-RecoverOnly' }
-        'lan' { $script = 'Set-CpaStackLan.ps1'; $arguments += '-RecoverOnly' }
         default { throw "Unexpected recovery kind: $($plan.Kind)" }
     }
     $run = Invoke-CpaStackBundled -HostAdapter $HostAdapter -Name $script -Arguments $arguments

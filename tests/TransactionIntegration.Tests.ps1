@@ -1,8 +1,8 @@
-#requires -Version 5.1
+#requires -Version 7.0
 
 [CmdletBinding()]
 param(
-    [ValidateSet('All', 'Core', 'CpaSuccess', 'CpaRollback', 'CpaHangCleanup', 'ManagerRollback', 'ManagerMigrationRollback', 'ManagerMigrationTamper', 'ManagerRecoveryGate', 'TransitionHealth', 'PendingGate', 'RecoveryJournalGuard', 'InterruptedCpaRollback', 'CpaAvailability', 'LanSuccess', 'LanRollback', 'LanRecovery', 'UpgradeCandidateRecovery', 'Maintenance', 'MaintenanceIdentity', 'MaintenanceResultWarning', 'MaintenanceLifecycle', 'MaintenanceRecovery', 'MaintenanceRollbackFailure', 'MaintenancePendingGuard', 'MaintenanceCommitRecovery')]
+    [ValidateSet('All', 'Core', 'CpaSuccess', 'CpaRollback', 'CpaHangCleanup', 'ManagerRollback', 'ManagerMigrationRollback', 'ManagerMigrationTamper', 'ManagerRecoveryGate', 'TransitionHealth', 'PendingGate', 'RecoveryJournalGuard', 'InterruptedCpaRollback', 'CpaAvailability', 'Maintenance', 'MaintenanceIdentity', 'MaintenanceResultWarning', 'MaintenanceLifecycle', 'MaintenanceRecovery', 'MaintenanceRollbackFailure', 'MaintenancePendingGuard', 'MaintenanceCommitRecovery')]
     [string]$Case = 'All'
 )
 
@@ -20,7 +20,7 @@ $switchManagerScript = Join-Path $scriptRoot 'Switch-ManagerRuntime.ps1'
 $stateScript = Join-Path $scriptRoot 'Get-CpaStackState.ps1'
 $productionGuardModule = Join-Path $repo 'tools\CpaStack.ProductionGuard.psm1'
 $isolatedStartStackScript = $null
-$isolatedLanEntry = $null
+$isolatedStackEntry = $null
 $isolatedLocalAppData = $null
 $productionGuard = $null
 $startedProcessRegistration = $null
@@ -93,11 +93,6 @@ public static class Program
             if (behavior.IndexOf("hang-before-listen", StringComparison.OrdinalIgnoreCase) >= 0)
             {
                 System.Threading.Thread.Sleep(System.Threading.Timeout.Infinite);
-            }
-            if (behavior.IndexOf("fail-on-lan", StringComparison.OrdinalIgnoreCase) >= 0 &&
-                (IPAddress.Any.Equals(listenAddress) || IPAddress.IPv6Any.Equals(listenAddress)))
-            {
-                throw new InvalidOperationException("Synthetic LAN bind failure.");
             }
             TcpListener listener = new TcpListener(listenAddress, port);
             listener.Start();
@@ -623,19 +618,15 @@ c.close()
     }
 }
 
-function Invoke-IsolatedLanCommand {
+function Invoke-IsolatedRecoveryCommand {
     param(
         [Parameter(Mandatory = $true)][string]$ControlRoot,
-        [ValidateSet('Loopback', 'Lan')][string]$Mode,
-        [ValidateSet('lan', 'recover')][string]$Command = 'lan'
+        [ValidateSet('recover')][string]$Command = 'recover'
     )
 
-    if ($Command -eq 'lan' -and [string]::IsNullOrWhiteSpace($Mode)) {
-        throw 'LAN test command requires a mode.'
-    }
 
     $runId = [guid]::NewGuid().ToString('N')
-    $wrapperPath = Join-Path $testRunRoot 'invoke-lan-command.ps1'
+    $wrapperPath = Join-Path $testRunRoot 'invoke-recovery-command.ps1'
     $readyPath = Join-Path $testRunRoot ($runId + '.ready')
     $goPath = Join-Path $testRunRoot ($runId + '.go')
     $stdoutPath = Join-Path $testRunRoot ($runId + '.stdout')
@@ -645,7 +636,6 @@ function Invoke-IsolatedLanCommand {
 param(
     [string]$Entry,
     [string]$ControlRoot,
-    [string]$Mode,
     [string]$Command,
     [string]$ReadyPath,
     [string]$GoPath
@@ -657,11 +647,7 @@ while (-not (Test-Path -LiteralPath $GoPath -PathType Leaf)) {
     if ((Get-Date) -ge $deadline) { throw 'Timed out waiting for test Job Object registration.' }
     Start-Sleep -Milliseconds 25
 }
-if ($Command -eq 'recover') {
-    & $Entry recover -Root $ControlRoot -Json
-} else {
-    & $Entry lan -Root $ControlRoot -Action Set -Mode $Mode -Json
-}
+& $Entry recover -Root $ControlRoot -Json
 $commandSucceeded = $?
 $commandExitCode = $LASTEXITCODE
 if ($null -eq $commandExitCode) { $commandExitCode = if ($commandSucceeded) { 0 } else { 1 } }
@@ -669,11 +655,10 @@ exit ([int]$commandExitCode)
 '@
     }
 
-    $modeArgument = if ([string]::IsNullOrWhiteSpace($Mode)) { '' } else { $Mode }
-    $arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Entry "{1}" -ControlRoot "{2}" -Mode "{3}" -Command {4} -ReadyPath "{5}" -GoPath "{6}"' -f `
-        $wrapperPath, $isolatedLanEntry, $ControlRoot, $modeArgument, $Command, $readyPath, $goPath
+    $arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Entry "{1}" -ControlRoot "{2}" -Command {3} -ReadyPath "{4}" -GoPath "{5}"' -f `
+        $wrapperPath, $isolatedStackEntry, $ControlRoot, $Command, $readyPath, $goPath
     $process = Start-Process `
-        -FilePath (Get-Command powershell.exe -ErrorAction Stop).Source `
+        -FilePath (Get-Command pwsh.exe -ErrorAction Stop).Source `
         -ArgumentList $arguments `
         -WindowStyle Hidden `
         -RedirectStandardOutput $stdoutPath `
@@ -687,13 +672,13 @@ exit ([int]$commandExitCode)
         }
         if (-not (Test-Path -LiteralPath $readyPath -PathType Leaf)) {
             $errorText = if (Test-Path -LiteralPath $stderrPath -PathType Leaf) { [System.IO.File]::ReadAllText($stderrPath) } else { '' }
-            throw "LAN command wrapper did not reach the registration gate. Error=[$errorText]"
+            throw "Recovery command wrapper did not reach the registration gate. Error=[$errorText]"
         }
         [void](Register-CpaStackTestProcess -Guard $productionGuard -Process $process)
         $registered = $true
         Write-Utf8Text -Path $goPath -Value 'go'
         if (-not $process.WaitForExit(120000)) {
-            throw 'LAN command exceeded the integration-test timeout.'
+            throw 'Recovery command exceeded the integration-test timeout.'
         }
 
         $stdout = if (Test-Path -LiteralPath $stdoutPath -PathType Leaf) { [System.IO.File]::ReadAllText($stdoutPath) } else { '' }
@@ -705,7 +690,7 @@ exit ([int]$commandExitCode)
             try { $json = $candidate | ConvertFrom-Json } catch {}
         }
         if ($null -eq $json) {
-            throw "LAN command returned no JSON result. ExitCode=$($process.ExitCode) Output=[$stdout] Error=[$stderr]"
+            throw "Recovery command returned no JSON result. ExitCode=$($process.ExitCode) Output=[$stdout] Error=[$stderr]"
         }
         return [pscustomobject]@{
             ExitCode = [int]$process.ExitCode
@@ -770,7 +755,7 @@ exit ([int]$commandExitCode)
     $arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -TargetScript "{1}" -InvocationPath "{2}" -ReadyPath "{3}" -GoPath "{4}"' -f `
         $wrapperPath, $TargetScript, $invocationPath, $readyPath, $goPath
     $process = Start-Process `
-        -FilePath (Get-Command powershell.exe -ErrorAction Stop).Source `
+        -FilePath (Get-Command pwsh.exe -ErrorAction Stop).Source `
         -ArgumentList $arguments `
         -WindowStyle Hidden `
         -RedirectStandardOutput $stdoutPath `
@@ -871,7 +856,7 @@ function Complete-IsolatedInvocation {
 function Start-IsolatedMaintenanceCommand {
     param([Parameter(Mandatory = $true)][string]$ControlRoot)
 
-    return Start-IsolatedInterruptedScript -TargetScript $isolatedLanEntry -Parameters ([ordered]@{
+    return Start-IsolatedInterruptedScript -TargetScript $isolatedStackEntry -Parameters ([ordered]@{
         Command = 'maintenance'
         Root = $ControlRoot
         Action = 'CleanupDerived'
@@ -886,7 +871,7 @@ function Invoke-IsolatedMaintenanceCommand {
     return Complete-IsolatedInvocation -Invocation $invocation
 }
 
-function New-LanTransactionFixture {
+function New-ManagedStackFixture {
     param(
         [Parameter(Mandatory = $true)][string]$Binary,
         [Parameter(Mandatory = $true)][string]$Name,
@@ -933,12 +918,12 @@ function New-LanTransactionFixture {
         instanceId = [string]$fixture.Marker.instanceId
         canonicalRoot = $root
         cpa = [ordered]@{
-            version = 'fixture-lan'
+            version = 'fixture-stack'
             executable = $cpaExe
             sha256 = Get-CpaStackFileHash -Path $cpaExe
         }
         manager = [ordered]@{
-            version = 'fixture-lan'
+            version = 'fixture-stack'
             executable = $managerExe
             sha256 = Get-CpaStackFileHash -Path $managerExe
         }
@@ -979,56 +964,15 @@ function New-LanTransactionFixture {
     }
 }
 
-function Assert-LanFixtureState {
-    param(
-        [Parameter(Mandatory = $true)]$Fixture,
-        [Parameter(Mandatory = $true)][ValidateSet('127.0.0.1', '0.0.0.0')][string]$Address
-    )
 
-    Assert-Equal $Address (Get-CpaStackConfigHost -ConfigPath $Fixture.CpaConfig) 'CPA config contains the requested bind address'
-    $stack = Import-PowerShellDataFile -LiteralPath $Fixture.StackConfig
-    Assert-Equal $Address ([string]$stack.Manager.BindAddress) 'Manager config contains the requested bind address'
-    foreach ($port in @($Fixture.CpaPort, $Fixture.ManagerPort)) {
-        $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue)
-        Assert-True ($listeners.Count -gt 0) "LAN fixture owns a listener on test port $port"
-        foreach ($listener in $listeners) {
-            Assert-Equal $Address ([string]$listener.LocalAddress) "Test listener $port uses only the requested address"
-        }
-    }
-    Assert-False (Test-Path -LiteralPath (Join-Path $Fixture.Root 'state\lan.pending.json')) 'LAN transaction leaves no pending journal'
-    Assert-False (Test-Path -LiteralPath (Join-Path $Fixture.Root 'state\lan.pending.json.previous')) 'LAN transaction leaves no previous journal artifact'
-}
 
-function Invoke-LanConfigurationSuccessTest {
-    param([Parameter(Mandatory = $true)][string]$Binary)
 
-    $fixture = New-LanTransactionFixture -Binary $Binary -Name 'lan-success'
-    try {
-        $lan = Invoke-IsolatedLanCommand -ControlRoot $fixture.Root -Mode Lan
-        Assert-Equal 0 $lan.ExitCode "LAN command succeeds. Output=[$($lan.Output)] Error=[$($lan.ErrorOutput)]"
-        Assert-True ([bool]$lan.Result.success) 'LAN command reports success'
-        Assert-Equal 'lan' $lan.Result.operation 'LAN command returns the v2 operation envelope'
-        Assert-Equal 'Changed' $lan.Result.outcome 'LAN command reports a committed change'
-        Assert-True ([bool]$lan.Result.changed) 'LAN command reports changed=true'
-        Assert-False ([bool]$lan.Result.rolledBack) 'Successful LAN command does not report rollback'
-        Assert-LanFixtureState -Fixture $fixture -Address '0.0.0.0'
-
-        $loopback = Invoke-IsolatedLanCommand -ControlRoot $fixture.Root -Mode Loopback
-        Assert-Equal 0 $loopback.ExitCode "Loopback command succeeds. Output=[$($loopback.Output)] Error=[$($loopback.ErrorOutput)]"
-        Assert-True ([bool]$loopback.Result.success) 'Loopback command reports success'
-        Assert-Equal 'Changed' $loopback.Result.outcome 'Loopback command reports a committed change'
-        Assert-LanFixtureState -Fixture $fixture -Address '127.0.0.1'
-    } finally {
-        Stop-OwnedFixturePort -Port $fixture.CpaPort -ManagedRoot $fixture.Root
-        Stop-OwnedFixturePort -Port $fixture.ManagerPort -ManagedRoot $fixture.Root
-    }
-}
 
 function Invoke-MaintenanceIdentityGateTest {
     param([Parameter(Mandatory = $true)][string]$Binary)
 
-    $fixture = New-LanTransactionFixture -Binary $Binary -Name 'maintenance-identity' -MaintenanceSchema
-    $maintenanceScript = Join-Path (Split-Path -Parent $isolatedLanEntry) 'Invoke-CpaStackMaintenance.ps1'
+    $fixture = New-ManagedStackFixture -Binary $Binary -Name 'maintenance-identity' -MaintenanceSchema
+    $maintenanceScript = Join-Path (Split-Path -Parent $isolatedStackEntry) 'Invoke-CpaStackMaintenance.ps1'
     $originalScript = [System.IO.File]::ReadAllText($maintenanceScript, [System.Text.UTF8Encoding]::new($false, $true))
     $needle = '        $result.managerStopped = Stop-MaintenanceManager -Context $context'
     Assert-Equal 1 ([regex]::Matches($originalScript, [regex]::Escape($needle)).Count) 'Maintenance identity fixture has one pre-stop seam'
@@ -1094,7 +1038,7 @@ function Invoke-MaintenanceIdentityGateTest {
 function Invoke-MaintenanceResultPersistenceWarningTest {
     param([Parameter(Mandatory = $true)][string]$Binary)
 
-    $fixture = New-LanTransactionFixture -Binary $Binary -Name 'maintenance-result-warning' -MaintenanceSchema
+    $fixture = New-ManagedStackFixture -Binary $Binary -Name 'maintenance-result-warning' -MaintenanceSchema
     $resultPath = Join-Path $fixture.Root 'state\maintenance-result.json'
     Write-Utf8Text -Path $resultPath -Value '{}'
     Protect-CpaStackSecretFile -Path $resultPath
@@ -1122,9 +1066,9 @@ function Invoke-MaintenanceResultPersistenceWarningTest {
 function Assert-MaintenanceFixtureDatabase {
     param([Parameter(Mandatory = $true)][string]$Root)
 
-    $validator = Join-Path (Split-Path -Parent $isolatedLanEntry) 'Test-ManagerData.ps1'
+    $validator = Join-Path (Split-Path -Parent $isolatedStackEntry) 'Test-ManagerData.ps1'
     $database = Join-Path $Root 'data\manager-plus\usage.sqlite'
-    $output = @(& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+    $output = @(& pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
         -File $validator -DatabasePath $database 2>&1)
     $exitCode = $LASTEXITCODE
     $document = (@($output | ForEach-Object { [string]$_ }) -join [Environment]::NewLine) | ConvertFrom-Json
@@ -1147,7 +1091,7 @@ function Assert-MaintenanceFixtureHealthy {
 function Invoke-MaintenanceLifecycleTest {
     param([Parameter(Mandatory = $true)][string]$Binary)
 
-    $successFixture = New-LanTransactionFixture -Binary $Binary -Name 'maintenance-success' -MaintenanceSchema
+    $successFixture = New-ManagedStackFixture -Binary $Binary -Name 'maintenance-success' -MaintenanceSchema
     try {
         $beforeCpa = Get-CpaStackListener -Port $successFixture.CpaPort
         $beforeManager = Get-CpaStackListener -Port $successFixture.ManagerPort
@@ -1166,7 +1110,7 @@ function Invoke-MaintenanceLifecycleTest {
         Stop-OwnedFixturePort -Port $successFixture.ManagerPort -ManagedRoot $successFixture.Root
     }
 
-    $cleanupFailureFixture = New-LanTransactionFixture -Binary $Binary -Name 'maintenance-cleanup-rollback' -MaintenanceSchema
+    $cleanupFailureFixture = New-ManagedStackFixture -Binary $Binary -Name 'maintenance-cleanup-rollback' -MaintenanceSchema
     try {
         Write-Utf8Text -Path (Join-Path $cleanupFailureFixture.Root 'runtime\manager-plus\behavior.txt') -Value 'cleanup-fail'
         $failure = Invoke-IsolatedMaintenanceCommand -ControlRoot $cleanupFailureFixture.Root
@@ -1183,7 +1127,7 @@ function Invoke-MaintenanceLifecycleTest {
         Stop-OwnedFixturePort -Port $cleanupFailureFixture.ManagerPort -ManagedRoot $cleanupFailureFixture.Root
     }
 
-    $restartFailureFixture = New-LanTransactionFixture -Binary $Binary -Name 'maintenance-restart-rollback' -MaintenanceSchema
+    $restartFailureFixture = New-ManagedStackFixture -Binary $Binary -Name 'maintenance-restart-rollback' -MaintenanceSchema
     try {
         Write-Utf8Text -Path (Join-Path $restartFailureFixture.Root 'runtime\manager-plus\behavior.txt') -Value 'cleanup-restart-once'
         $failure = Invoke-IsolatedMaintenanceCommand -ControlRoot $restartFailureFixture.Root
@@ -1207,8 +1151,8 @@ function New-MaintenanceHardInterruptedFixture {
         [Parameter(Mandatory = $true)][string]$Name
     )
 
-    $fixture = New-LanTransactionFixture -Binary $Binary -Name $Name -MaintenanceSchema
-    $maintenanceScript = Join-Path (Split-Path -Parent $isolatedLanEntry) 'Invoke-CpaStackMaintenance.ps1'
+    $fixture = New-ManagedStackFixture -Binary $Binary -Name $Name -MaintenanceSchema
+    $maintenanceScript = Join-Path (Split-Path -Parent $isolatedStackEntry) 'Invoke-CpaStackMaintenance.ps1'
     $originalScript = [System.IO.File]::ReadAllText($maintenanceScript, [System.Text.UTF8Encoding]::new($false, $true))
     $needle = if ($Phase -eq 'cleaned') {
         '        Write-MaintenanceJournal -Journal $journal -Phase cleaned'
@@ -1289,8 +1233,8 @@ function Invoke-MaintenanceRecoveryTest {
 function Invoke-MaintenanceRollbackFailureTest {
     param([Parameter(Mandatory = $true)][string]$Binary)
 
-    $fixture = New-LanTransactionFixture -Binary $Binary -Name 'maintenance-rollback-failure' -MaintenanceSchema
-    $maintenanceScript = Join-Path (Split-Path -Parent $isolatedLanEntry) 'Invoke-CpaStackMaintenance.ps1'
+    $fixture = New-ManagedStackFixture -Binary $Binary -Name 'maintenance-rollback-failure' -MaintenanceSchema
+    $maintenanceScript = Join-Path (Split-Path -Parent $isolatedStackEntry) 'Invoke-CpaStackMaintenance.ps1'
     $originalScript = [System.IO.File]::ReadAllText($maintenanceScript, [System.Text.UTF8Encoding]::new($false, $true))
     $needle = '        $result.managerStopped = Stop-MaintenanceManager -Context $context -ExpectedProcessId $context.ProcessId'
     Assert-Equal 1 ([regex]::Matches($originalScript, [regex]::Escape($needle)).Count) 'Maintenance rollback-failure fixture has one pre-stop seam'
@@ -1426,8 +1370,8 @@ function Invoke-MaintenancePendingRecoveryGuardTest {
 function Invoke-MaintenanceCommitRecoveryTest {
     param([Parameter(Mandatory = $true)][string]$Binary)
 
-    $fixture = New-LanTransactionFixture -Binary $Binary -Name 'maintenance-commit-recovery' -MaintenanceSchema
-    $maintenanceScript = Join-Path (Split-Path -Parent $isolatedLanEntry) 'Invoke-CpaStackMaintenance.ps1'
+    $fixture = New-ManagedStackFixture -Binary $Binary -Name 'maintenance-commit-recovery' -MaintenanceSchema
+    $maintenanceScript = Join-Path (Split-Path -Parent $isolatedStackEntry) 'Invoke-CpaStackMaintenance.ps1'
     $originalScript = [System.IO.File]::ReadAllText($maintenanceScript, [System.Text.UTF8Encoding]::new($false, $true))
     $needle = '    $Journal.backupPath = Retain-MaintenanceBackup -Backup $Backup -OperationId $OperationId'
     Assert-Equal 1 ([regex]::Matches($originalScript, [regex]::Escape($needle)).Count) 'Maintenance commit fixture has one post-retain seam'
@@ -1493,8 +1437,8 @@ function Invoke-MaintenanceCommitRecoveryTest {
 function Invoke-MaintenanceCommittedJournalCleanupTest {
     param([Parameter(Mandatory = $true)][string]$Binary)
 
-    $fixture = New-LanTransactionFixture -Binary $Binary -Name 'maintenance-committed-cleanup' -MaintenanceSchema
-    $maintenanceScript = Join-Path (Split-Path -Parent $isolatedLanEntry) 'Invoke-CpaStackMaintenance.ps1'
+    $fixture = New-ManagedStackFixture -Binary $Binary -Name 'maintenance-committed-cleanup' -MaintenanceSchema
+    $maintenanceScript = Join-Path (Split-Path -Parent $isolatedStackEntry) 'Invoke-CpaStackMaintenance.ps1'
     $originalScript = [System.IO.File]::ReadAllText($maintenanceScript, [System.Text.UTF8Encoding]::new($false, $true))
     $needle = '    Write-MaintenanceJournal -Journal $Journal -Phase committed'
     Assert-Equal 1 ([regex]::Matches($originalScript, [regex]::Escape($needle)).Count) 'Committed cleanup fixture has one persisted committed seam'
@@ -1560,432 +1504,11 @@ function Invoke-MaintenanceCommittedJournalCleanupTest {
     }
 }
 
-function Invoke-LanConfigurationRollbackTest {
-    param([Parameter(Mandatory = $true)][string]$Binary)
 
-    $fixture = New-LanTransactionFixture -Binary $Binary -Name 'lan-rollback' -CpaBehavior 'fail-on-lan'
-    try {
-        $lan = Invoke-IsolatedLanCommand -ControlRoot $fixture.Root -Mode Lan
-        Assert-Equal 1 $lan.ExitCode "Synthetic LAN bind failure returns a failing command. Output=[$($lan.Output)] Error=[$($lan.ErrorOutput)]"
-        Assert-False ([bool]$lan.Result.success) 'Failed LAN command reports success=false'
-        Assert-Equal 'RolledBack' $lan.Result.outcome 'Failed LAN command reports automatic rollback'
-        Assert-False ([bool]$lan.Result.changed) 'Rolled-back LAN command reports changed=false'
-        Assert-True ([bool]$lan.Result.rolledBack) 'Failed LAN command reports rolledBack=true'
-        Assert-Equal 'LanApplyFailedRolledBack' $lan.Result.error.code 'Rollback result preserves the specific failure code'
-        Assert-LanFixtureState -Fixture $fixture -Address '127.0.0.1'
 
-        $noChange = Invoke-IsolatedLanCommand -ControlRoot $fixture.Root -Mode Loopback
-        Assert-Equal 0 $noChange.ExitCode 'Rollback leaves the stack usable by the next public command'
-        Assert-Equal 'NoChange' $noChange.Result.outcome 'Post-rollback loopback command is idempotent'
-    } finally {
-        Stop-OwnedFixturePort -Port $fixture.CpaPort -ManagedRoot $fixture.Root
-        Stop-OwnedFixturePort -Port $fixture.ManagerPort -ManagedRoot $fixture.Root
-    }
-}
 
-function Invoke-LanHardInterruptionRecoveryTest {
-    param([Parameter(Mandatory = $true)][string]$Binary)
 
-    $fixture = New-LanTransactionFixture -Binary $Binary -Name 'lan-hard-recovery'
-    $setLanScript = Join-Path (Split-Path -Parent $isolatedLanEntry) 'Set-CpaStackLan.ps1'
-    $originalScript = [System.IO.File]::ReadAllText($setLanScript, [System.Text.UTF8Encoding]::new($false, $true))
-    $holdNeedle = "            Set-LanJournalPhase -Journal `$pendingTransaction -Phase 'configs-written'"
-    Assert-Equal 1 ([regex]::Matches($originalScript, [regex]::Escape($holdNeedle)).Count) 'LAN hard-kill fixture has one persisted config-write seam'
-    $holdProbe = @'
-            [System.IO.File]::WriteAllText(
-                $env:CPA_STACK_TEST_LAN_HOLD_READY_PATH,
-                'ready',
-                [System.Text.UTF8Encoding]::new($false)
-            )
-            while ($true) { Start-Sleep -Milliseconds 100 }
-'@
-    $patchedScript = $originalScript.Replace($holdNeedle, $holdNeedle + [Environment]::NewLine + $holdProbe.TrimEnd())
-    Write-Utf8Text -Path $setLanScript -Value $patchedScript
 
-    $runId = [guid]::NewGuid().ToString('N')
-    $wrapperPath = Join-Path $testRunRoot 'invoke-lan-hard-kill.ps1'
-    $wrapperReady = Join-Path $testRunRoot ($runId + '.wrapper-ready')
-    $wrapperGo = Join-Path $testRunRoot ($runId + '.wrapper-go')
-    $holdReady = Join-Path $testRunRoot ($runId + '.transaction-ready')
-    $stdoutPath = Join-Path $testRunRoot ($runId + '.stdout')
-    $stderrPath = Join-Path $testRunRoot ($runId + '.stderr')
-    Write-Utf8Text -Path $wrapperPath -Value @'
-param(
-    [string]$Entry,
-    [string]$ControlRoot,
-    [string]$ReadyPath,
-    [string]$GoPath
-)
-$ErrorActionPreference = 'Stop'
-[System.IO.File]::WriteAllText($ReadyPath, 'ready', [System.Text.UTF8Encoding]::new($false))
-$deadline = (Get-Date).AddSeconds(20)
-while (-not (Test-Path -LiteralPath $GoPath -PathType Leaf)) {
-    if ((Get-Date) -ge $deadline) { throw 'Timed out waiting for the hard-kill Job Object.' }
-    Start-Sleep -Milliseconds 25
-}
-& $Entry lan -Root $ControlRoot -Action Set -Mode Lan -Json
-exit ([int]$LASTEXITCODE)
-'@
-
-    $commandJob = $null
-    $process = $null
-    $hardPhaseCompleted = $false
-    $previousHoldReady = $env:CPA_STACK_TEST_LAN_HOLD_READY_PATH
-    try {
-        $env:CPA_STACK_TEST_LAN_HOLD_READY_PATH = $holdReady
-        $arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Entry "{1}" -ControlRoot "{2}" -ReadyPath "{3}" -GoPath "{4}"' -f `
-            $wrapperPath, $isolatedLanEntry, $fixture.Root, $wrapperReady, $wrapperGo
-        $process = Start-Process `
-            -FilePath (Get-Command powershell.exe -ErrorAction Stop).Source `
-            -ArgumentList $arguments `
-            -WindowStyle Hidden `
-            -RedirectStandardOutput $stdoutPath `
-            -RedirectStandardError $stderrPath `
-            -PassThru
-        $commandJob = [CpaStackUpdater.ProductionGuard.KillOnCloseJob]::new()
-        $commandJob.Assign($process)
-        $readyDeadline = (Get-Date).AddSeconds(20)
-        while (-not (Test-Path -LiteralPath $wrapperReady -PathType Leaf) -and -not $process.HasExited -and (Get-Date) -lt $readyDeadline) {
-            Start-Sleep -Milliseconds 25
-        }
-        Assert-True (Test-Path -LiteralPath $wrapperReady -PathType Leaf) 'Hard-kill wrapper reaches the Job Object gate'
-        Write-Utf8Text -Path $wrapperGo -Value 'go'
-
-        $holdDeadline = (Get-Date).AddSeconds(60)
-        while (-not (Test-Path -LiteralPath $holdReady -PathType Leaf) -and -not $process.HasExited -and (Get-Date) -lt $holdDeadline) {
-            Start-Sleep -Milliseconds 50
-        }
-        Assert-True (Test-Path -LiteralPath $holdReady -PathType Leaf) 'LAN transaction reaches the persisted configs-written phase before hard termination'
-        Assert-False $process.HasExited 'LAN transaction is still active at the hard-interruption point'
-        $commandJob.Dispose()
-        $commandJob = $null
-        Assert-True ($process.WaitForExit(10000)) 'Closing the dedicated Job Object kills the LAN command tree'
-        $hardPhaseCompleted = $true
-    } finally {
-        $env:CPA_STACK_TEST_LAN_HOLD_READY_PATH = $previousHoldReady
-        Write-Utf8Text -Path $setLanScript -Value $originalScript
-        if ($null -ne $commandJob) { $commandJob.Dispose() }
-        if ($null -ne $process) {
-            if (-not $process.HasExited) {
-                $process.Kill()
-                [void]$process.WaitForExit(10000)
-            }
-            $process.Dispose()
-        }
-        if (-not $hardPhaseCompleted) {
-            Stop-OwnedFixturePort -Port $fixture.CpaPort -ManagedRoot $fixture.Root
-            Stop-OwnedFixturePort -Port $fixture.ManagerPort -ManagedRoot $fixture.Root
-        }
-    }
-
-    try {
-        $journalPath = Join-Path $fixture.Root 'state\lan.pending.json'
-        Assert-True (Test-Path -LiteralPath $journalPath -PathType Leaf) 'Hard interruption leaves the persistent LAN journal'
-        Assert-Equal '0.0.0.0' (Get-CpaStackConfigHost -ConfigPath $fixture.CpaConfig) 'Hard interruption occurs after the CPA config write'
-        Assert-Equal '0.0.0.0' ([string](Import-PowerShellDataFile -LiteralPath $fixture.StackConfig).Manager.BindAddress) 'Hard interruption occurs after the Manager config write'
-
-        $previousJournalPath = $journalPath + '.previous'
-        Assert-True (Test-Path -LiteralPath $previousJournalPath -PathType Leaf) 'Hard interruption retains the adjacent LAN journal predecessor'
-        $validCurrentBytes = [System.IO.File]::ReadAllBytes($journalPath)
-        $validPreviousBytes = [System.IO.File]::ReadAllBytes($previousJournalPath)
-        $validJournal = Read-CpaStackJson -Path $journalPath
-        $validPreviousJournal = Read-CpaStackJson -Path $previousJournalPath
-        Assert-Equal 'configs-written' ([string]$validJournal.phase) 'Hard interruption current journal records configs-written'
-        Assert-Equal 'prepared' ([string]$validPreviousJournal.phase) 'Hard interruption previous journal records the adjacent prepared phase'
-        $validCurrentHash = Get-CpaStackFileHash -Path $journalPath
-        $validPreviousHash = Get-CpaStackFileHash -Path $previousJournalPath
-
-        $invalidPreviousJournal = $validPreviousJournal | ConvertTo-Json -Depth 12 | ConvertFrom-Json
-        $invalidPreviousJournal.instanceId = [guid]::NewGuid().ToString('N')
-        Write-Utf8Text -Path $previousJournalPath -Value ($invalidPreviousJournal | ConvertTo-Json -Depth 12)
-        $currentHashBeforeInvalidPrevious = Get-CpaStackFileHash -Path $journalPath
-        $invalidPreviousHash = Get-CpaStackFileHash -Path $previousJournalPath
-        $cpaConfigHash = Get-CpaStackFileHash -Path $fixture.CpaConfig
-        $stackConfigHash = Get-CpaStackFileHash -Path $fixture.StackConfig
-        $aclSections = [System.Security.AccessControl.AccessControlSections]::Owner -bor
-            [System.Security.AccessControl.AccessControlSections]::Group -bor
-            [System.Security.AccessControl.AccessControlSections]::Access
-        $journalSddl = (Get-CpaStackFileSystemAcl -Path $journalPath).GetSecurityDescriptorSddlForm($aclSections)
-        $previousJournalSddl = (Get-CpaStackFileSystemAcl -Path $previousJournalPath).GetSecurityDescriptorSddlForm($aclSections)
-        $cpaConfigSddl = (Get-CpaStackFileSystemAcl -Path $fixture.CpaConfig).GetSecurityDescriptorSddlForm($aclSections)
-        $stackConfigSddl = (Get-CpaStackFileSystemAcl -Path $fixture.StackConfig).GetSecurityDescriptorSddlForm($aclSections)
-        $cpaListenerBeforeInvalidPrevious = Get-CpaStackListener -Port $fixture.CpaPort
-        $managerListenerBeforeInvalidPrevious = Get-CpaStackListener -Port $fixture.ManagerPort
-
-        $invalidPreviousRecovery = Invoke-IsolatedLanCommand -ControlRoot $fixture.Root -Command recover
-        Assert-True ($invalidPreviousRecovery.ExitCode -ne 0) 'Invalid LAN previous-journal recovery returns a nonzero exit code'
-        Assert-False ([bool]$invalidPreviousRecovery.Result.success) 'Invalid LAN previous-journal recovery reports failure'
-        Assert-Equal 'ManualRecoveryRequired' ([string]$invalidPreviousRecovery.Result.outcome) "Invalid LAN previous journal requires manual recovery. Output=[$($invalidPreviousRecovery.Output)] Error=[$($invalidPreviousRecovery.ErrorOutput)]"
-        Assert-Equal $currentHashBeforeInvalidPrevious (Get-CpaStackFileHash -Path $journalPath) 'Invalid previous recovery does not rewrite the current journal'
-        Assert-Equal $invalidPreviousHash (Get-CpaStackFileHash -Path $previousJournalPath) 'Invalid previous recovery preserves the invalid previous evidence'
-        Assert-Equal $cpaConfigHash (Get-CpaStackFileHash -Path $fixture.CpaConfig) 'Invalid previous recovery preserves CPA config bytes'
-        Assert-Equal $stackConfigHash (Get-CpaStackFileHash -Path $fixture.StackConfig) 'Invalid previous recovery preserves stack config bytes'
-        Assert-Equal $journalSddl ((Get-CpaStackFileSystemAcl -Path $journalPath).GetSecurityDescriptorSddlForm($aclSections)) 'Invalid previous recovery preserves current journal ACL'
-        Assert-Equal $previousJournalSddl ((Get-CpaStackFileSystemAcl -Path $previousJournalPath).GetSecurityDescriptorSddlForm($aclSections)) 'Invalid previous recovery preserves previous journal ACL'
-        Assert-Equal $cpaConfigSddl ((Get-CpaStackFileSystemAcl -Path $fixture.CpaConfig).GetSecurityDescriptorSddlForm($aclSections)) 'Invalid previous recovery preserves CPA config ACL'
-        Assert-Equal $stackConfigSddl ((Get-CpaStackFileSystemAcl -Path $fixture.StackConfig).GetSecurityDescriptorSddlForm($aclSections)) 'Invalid previous recovery preserves stack config ACL'
-        $cpaListenerAfterInvalidPrevious = Get-CpaStackListener -Port $fixture.CpaPort
-        $managerListenerAfterInvalidPrevious = Get-CpaStackListener -Port $fixture.ManagerPort
-        Assert-Equal ([int]$cpaListenerBeforeInvalidPrevious.ProcessId) ([int]$cpaListenerAfterInvalidPrevious.ProcessId) 'Invalid previous recovery does not restart CPA'
-        Assert-Equal ([int]$managerListenerBeforeInvalidPrevious.ProcessId) ([int]$managerListenerAfterInvalidPrevious.ProcessId) 'Invalid previous recovery does not restart Manager'
-
-        [System.IO.File]::WriteAllBytes($journalPath, $validCurrentBytes)
-        [System.IO.File]::WriteAllBytes($previousJournalPath, $validPreviousBytes)
-        Assert-Equal $validCurrentHash (Get-CpaStackFileHash -Path $journalPath) 'Raw fixture restore reinstates the valid current journal bytes'
-        Assert-Equal $validPreviousHash (Get-CpaStackFileHash -Path $previousJournalPath) 'Raw fixture restore reinstates the valid previous journal bytes'
-
-        $foreignJournal = $validJournal | ConvertTo-Json -Depth 12 | ConvertFrom-Json
-        $foreignJournal.instanceId = [guid]::NewGuid().ToString('N')
-        Write-Utf8Text -Path $journalPath -Value ($foreignJournal | ConvertTo-Json -Depth 12)
-        $foreignJournalHash = Get-CpaStackFileHash -Path $journalPath
-        $previousJournalHash = Get-CpaStackFileHash -Path $previousJournalPath
-        $journalSddl = (Get-CpaStackFileSystemAcl -Path $journalPath).GetSecurityDescriptorSddlForm($aclSections)
-        $previousJournalSddl = (Get-CpaStackFileSystemAcl -Path $previousJournalPath).GetSecurityDescriptorSddlForm($aclSections)
-        $cpaConfigSddl = (Get-CpaStackFileSystemAcl -Path $fixture.CpaConfig).GetSecurityDescriptorSddlForm($aclSections)
-        $stackConfigSddl = (Get-CpaStackFileSystemAcl -Path $fixture.StackConfig).GetSecurityDescriptorSddlForm($aclSections)
-        $cpaListenerBeforeForeign = Get-CpaStackListener -Port $fixture.CpaPort
-        $managerListenerBeforeForeign = Get-CpaStackListener -Port $fixture.ManagerPort
-
-        $foreignRecovery = Invoke-IsolatedLanCommand -ControlRoot $fixture.Root -Command recover
-        Assert-True ($foreignRecovery.ExitCode -ne 0) 'Foreign LAN journal recovery returns a nonzero exit code'
-        Assert-False ([bool]$foreignRecovery.Result.success) 'Foreign LAN journal recovery reports failure'
-        Assert-Equal 'ManualRecoveryRequired' ([string]$foreignRecovery.Result.outcome) "Foreign LAN journal requires manual recovery. Output=[$($foreignRecovery.Output)] Error=[$($foreignRecovery.ErrorOutput)]"
-        Assert-Equal $foreignJournalHash (Get-CpaStackFileHash -Path $journalPath) 'Foreign LAN journal is not rewritten'
-        Assert-Equal $previousJournalHash (Get-CpaStackFileHash -Path $previousJournalPath) 'Foreign LAN recovery preserves the previous journal evidence'
-        Assert-Equal $cpaConfigHash (Get-CpaStackFileHash -Path $fixture.CpaConfig) 'Foreign LAN recovery preserves CPA config bytes'
-        Assert-Equal $stackConfigHash (Get-CpaStackFileHash -Path $fixture.StackConfig) 'Foreign LAN recovery preserves stack config bytes'
-        Assert-Equal $journalSddl ((Get-CpaStackFileSystemAcl -Path $journalPath).GetSecurityDescriptorSddlForm($aclSections)) 'Foreign LAN recovery preserves journal ACL'
-        Assert-Equal $previousJournalSddl ((Get-CpaStackFileSystemAcl -Path $previousJournalPath).GetSecurityDescriptorSddlForm($aclSections)) 'Foreign LAN recovery preserves previous journal ACL'
-        Assert-Equal $cpaConfigSddl ((Get-CpaStackFileSystemAcl -Path $fixture.CpaConfig).GetSecurityDescriptorSddlForm($aclSections)) 'Foreign LAN recovery preserves CPA config ACL'
-        Assert-Equal $stackConfigSddl ((Get-CpaStackFileSystemAcl -Path $fixture.StackConfig).GetSecurityDescriptorSddlForm($aclSections)) 'Foreign LAN recovery preserves stack config ACL'
-        $cpaListenerAfterForeign = Get-CpaStackListener -Port $fixture.CpaPort
-        $managerListenerAfterForeign = Get-CpaStackListener -Port $fixture.ManagerPort
-        Assert-Equal ([int]$cpaListenerBeforeForeign.ProcessId) ([int]$cpaListenerAfterForeign.ProcessId) 'Foreign LAN recovery does not restart CPA'
-        Assert-Equal ([int]$managerListenerBeforeForeign.ProcessId) ([int]$managerListenerAfterForeign.ProcessId) 'Foreign LAN recovery does not restart Manager'
-
-        [System.IO.File]::WriteAllBytes($journalPath, $validCurrentBytes)
-        [System.IO.File]::WriteAllBytes($previousJournalPath, $validPreviousBytes)
-        Assert-Equal $validCurrentHash (Get-CpaStackFileHash -Path $journalPath) 'Foreign rejection is followed by a raw valid-current restore'
-        Assert-Equal $validPreviousHash (Get-CpaStackFileHash -Path $previousJournalPath) 'Foreign rejection is followed by a raw valid-previous restore'
-        Assert-Equal 'configs-written' ([string](Read-CpaStackJson -Path $journalPath).phase) 'Restored current journal retains configs-written'
-        Assert-Equal 'prepared' ([string](Read-CpaStackJson -Path $previousJournalPath).phase) 'Restored previous journal retains prepared'
-
-        $recovery = Invoke-IsolatedLanCommand -ControlRoot $fixture.Root -Command recover
-        Assert-Equal 0 $recovery.ExitCode "Public recover succeeds after LAN hard interruption. Output=[$($recovery.Output)] Error=[$($recovery.ErrorOutput)]"
-        Assert-True ([bool]$recovery.Result.success) 'LAN recovery reports success'
-        Assert-Equal 'Changed' $recovery.Result.outcome 'LAN recovery reports a recovered change'
-        Assert-True ([bool]$recovery.Result.recovered) 'LAN recovery sets recovered=true'
-        Assert-True ([bool]$recovery.Result.rolledBack) 'LAN recovery reports that it restored the pre-transaction state'
-        Assert-Equal 'lan' $recovery.Result.recoveryKind 'Recovery routes the LAN journal to its dedicated transaction recovery'
-        Assert-LanFixtureState -Fixture $fixture -Address '127.0.0.1'
-
-        $secondRecovery = Invoke-IsolatedLanCommand -ControlRoot $fixture.Root -Command recover
-        Assert-Equal 0 $secondRecovery.ExitCode 'A second recover is idempotent'
-        Assert-Equal 'NoChange' $secondRecovery.Result.outcome 'A second recover reports NoChange'
-        Assert-False ([bool]$secondRecovery.Result.recovered) 'A second recover does not invent recovery work'
-    } finally {
-        Stop-OwnedFixturePort -Port $fixture.CpaPort -ManagedRoot $fixture.Root
-        Stop-OwnedFixturePort -Port $fixture.ManagerPort -ManagedRoot $fixture.Root
-        foreach ($path in @($wrapperReady, $wrapperGo, $holdReady, $stdoutPath, $stderrPath)) {
-            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
-        }
-    }
-}
-
-function Invoke-UpgradeCandidateHardInterruptionRecoveryTest {
-    param(
-        [Parameter(Mandatory = $true)][string]$OldBinary,
-        [Parameter(Mandatory = $true)][string]$NewBinary
-    )
-
-    $fixture = New-LanTransactionFixture -Binary $OldBinary -Name 'upgrade-candidate-hard-recovery'
-    $scriptsRoot = Split-Path -Parent $isolatedLanEntry
-    $upgradeScript = Join-Path $scriptsRoot 'Invoke-CpaStackUpgrade.ps1'
-    $originalScript = [System.IO.File]::ReadAllText($upgradeScript, [System.Text.UTF8Encoding]::new($false, $true))
-    $overrideNeedle = '. (Join-Path $PSScriptRoot "CpaStack.Common.ps1")'
-    Assert-Equal 1 ([regex]::Matches($originalScript, [regex]::Escape($overrideNeedle)).Count) 'Upgrade hard-kill fixture has one release override seam'
-    $releaseOverride = @'
-function Get-CpaStackLatestRelease {
-    param([string]$Repository, [string]$AssetPattern)
-    return [pscustomobject]@{ Repository = $Repository; AssetPattern = $AssetPattern }
-}
-
-function Save-CpaStackRelease {
-    param($Release, [string]$Destination)
-    $isCpa = [string]$Release.Repository -eq 'router-for-me/CLIProxyAPI'
-    $packageRoot = if ($isCpa) {
-        $env:CPA_STACK_TEST_UPGRADE_CPA_PACKAGE
-    } else {
-        $env:CPA_STACK_TEST_UPGRADE_MANAGER_PACKAGE
-    }
-    $executable = Join-Path $packageRoot $(if ($isCpa) { 'cli-proxy-api.exe' } else { 'cpa-manager-plus.exe' })
-    return [pscustomobject]@{
-        tag = if ($isCpa) { 'v9.9.9' } else { 'v1.11.1' }
-        packageRoot = $packageRoot
-        executableSha256 = Get-CpaStackFileHash -Path $executable
-        archiveSha256 = ('A' * 64)
-    }
-}
-'@
-    $patchedScript = $originalScript.Replace(
-        $overrideNeedle,
-        $overrideNeedle + [Environment]::NewLine + $releaseOverride.TrimEnd()
-    )
-
-    $packageRoot = Join-Path $testRunRoot ('upgrade-packages-' + [guid]::NewGuid().ToString('N'))
-    $cpaPackage = Join-Path $packageRoot 'cpa'
-    $managerPackage = Join-Path $packageRoot 'manager'
-    $candidateRecordPath = Join-Path $testRunRoot ([guid]::NewGuid().ToString('N') + '.candidate-started')
-    New-Item -ItemType Directory -Force -Path $cpaPackage, $managerPackage | Out-Null
-    Copy-Item -LiteralPath $NewBinary -Destination (Join-Path $cpaPackage 'cli-proxy-api.exe')
-    Copy-Item -LiteralPath $OldBinary -Destination (Join-Path $managerPackage 'cpa-manager-plus.exe')
-    Write-Utf8Text -Path (Join-Path $cpaPackage 'behavior.txt') -Value 'hang-before-listen'
-    Write-Utf8Text -Path (Join-Path $cpaPackage 'start-record-path.txt') -Value $candidateRecordPath
-
-    $previousCpaPackage = $env:CPA_STACK_TEST_UPGRADE_CPA_PACKAGE
-    $previousManagerPackage = $env:CPA_STACK_TEST_UPGRADE_MANAGER_PACKAGE
-    $invocation = $null
-    $candidateProcessId = 0
-    $candidateExecutable = $null
-    $scriptRestored = $false
-    try {
-        $env:CPA_STACK_TEST_UPGRADE_CPA_PACKAGE = $cpaPackage
-        $env:CPA_STACK_TEST_UPGRADE_MANAGER_PACKAGE = $managerPackage
-        Write-Utf8Text -Path $upgradeScript -Value $patchedScript
-
-        $formalCpa = Get-CpaStackListener -Port $fixture.CpaPort
-        $formalManager = Get-CpaStackListener -Port $fixture.ManagerPort
-        Assert-True ($null -ne $formalCpa) 'Canonical CPA is listening before the interrupted upgrade'
-        Assert-True ($null -ne $formalManager) 'Canonical Manager is listening before the interrupted upgrade'
-        $formalCpaProcessId = [int]$formalCpa.ProcessId
-        $formalManagerProcessId = [int]$formalManager.ProcessId
-
-        $invocation = Start-IsolatedInterruptedScript `
-            -TargetScript $upgradeScript `
-            -Parameters ([ordered]@{
-                ControlRoot = $fixture.Root
-                AllowUnknownVersionReplacement = $true
-            })
-
-        $startDeadline = (Get-Date).AddSeconds(90)
-        while (-not (Test-Path -LiteralPath $candidateRecordPath -PathType Leaf) -and
-            -not $invocation.Process.HasExited -and (Get-Date) -lt $startDeadline) {
-            Start-Sleep -Milliseconds 50
-        }
-        $updaterError = ''
-        if (-not (Test-Path -LiteralPath $candidateRecordPath -PathType Leaf) -and $invocation.Process.HasExited) {
-            [void]$invocation.Process.WaitForExit()
-            if (Test-Path -LiteralPath $invocation.StderrPath -PathType Leaf) {
-                $updaterError = [System.IO.File]::ReadAllText($invocation.StderrPath)
-            }
-        }
-        Assert-True (Test-Path -LiteralPath $candidateRecordPath -PathType Leaf) "Upgrade starts the bind-delayed candidate before timeout. Error=[$updaterError]"
-        Assert-False $invocation.Process.HasExited 'Upgrade updater is still active while its candidate is waiting before bind'
-
-        $startRecord = [System.IO.File]::ReadAllText($candidateRecordPath).Trim()
-        Assert-True ($startRecord -match '^fixture-new\|(?<pid>\d+)$') 'Bind-delayed upgrade candidate records its process id'
-        $candidateProcessId = [int]$matches['pid']
-        $journalPath = Join-Path $fixture.Root 'state\upgrade.pending.json'
-        $journalPreviousPath = $journalPath + '.previous'
-        Assert-True (Test-Path -LiteralPath $journalPath -PathType Leaf) 'Upgrade writes its journal before starting the candidate'
-        Assert-True (Test-Path -LiteralPath $journalPreviousPath -PathType Leaf) 'Upgrade retains the adjacent prepared journal generation'
-        $journal = Read-CpaStackJson -Path $journalPath
-        $journalPrevious = Read-CpaStackJson -Path $journalPreviousPath
-        Assert-Equal 'testing-cpa' ([string]$journal.phase) 'Upgrade journal identifies the interrupted candidate phase'
-        Assert-Equal 'prepared' ([string]$journalPrevious.phase) 'Upgrade previous journal records the legal prepared predecessor'
-        Assert-Equal ([string]$journal.operationId) ([string]$journalPrevious.operationId) 'Upgrade current and previous journals bind the same operationId'
-        $validJournalBytes = [System.IO.File]::ReadAllBytes($journalPath)
-        $validPreviousBytes = [System.IO.File]::ReadAllBytes($journalPreviousPath)
-        $validJournalHash = Get-CpaStackFileHash -Path $journalPath
-        $validPreviousHash = Get-CpaStackFileHash -Path $journalPreviousPath
-        $candidateExecutable = [System.IO.Path]::GetFullPath([string]$journal.cpaCandidateExe)
-        Assert-True (Test-Path -LiteralPath $candidateExecutable -PathType Leaf) 'Upgrade journal binds the exact candidate executable'
-        [void](Assert-CpaStackTestIsolation `
-            -Guard $productionGuard `
-            -TestRoot $fixture.Root `
-            -TestStateHome $isolatedLocalAppData `
-            -TestPort @([int]$journal.cpaCandidatePort, [int]$journal.managerCandidatePort) `
-            -TestProcessId @($candidateProcessId))
-        $candidateProcess = Get-Process -Id $candidateProcessId -ErrorAction Stop
-        try {
-            Assert-Equal $candidateExecutable ([System.IO.Path]::GetFullPath([string]$candidateProcess.MainModule.FileName)) 'Recorded orphan PID executes the journal-bound candidate path'
-        } finally {
-            $candidateProcess.Dispose()
-        }
-        Assert-True ($null -eq (Get-CpaStackListener -Port ([int]$journal.cpaCandidatePort))) 'Candidate has not bound its temporary port at the interruption point'
-
-        $invocation.Process.Kill()
-        Assert-True ($invocation.Process.WaitForExit(10000)) 'Hard termination stops the updater process'
-        Start-Sleep -Milliseconds 250
-        Assert-True ($null -ne (Get-Process -Id $candidateProcessId -ErrorAction SilentlyContinue)) 'Hard termination leaves the bind-delayed candidate orphan alive'
-        Assert-True ($null -eq (Get-CpaStackListener -Port ([int]$journal.cpaCandidatePort))) 'The orphan remains invisible to listener-only cleanup'
-
-        Write-Utf8Text -Path $upgradeScript -Value $originalScript
-        $scriptRestored = $true
-        $env:CPA_STACK_TEST_UPGRADE_CPA_PACKAGE = $previousCpaPackage
-        $env:CPA_STACK_TEST_UPGRADE_MANAGER_PACKAGE = $previousManagerPackage
-
-        Remove-Item -LiteralPath $journalPath -Force
-        $orphanPreviousRecovery = Invoke-IsolatedLanCommand -ControlRoot $fixture.Root -Command recover
-        Assert-True ($orphanPreviousRecovery.ExitCode -ne 0) 'Orphan upgrade previous generation returns a nonzero exit code'
-        Assert-Equal 'ManualRecoveryRequired' ([string]$orphanPreviousRecovery.Result.outcome) "Orphan upgrade previous requires manual recovery. Output=[$($orphanPreviousRecovery.Output)] Error=[$($orphanPreviousRecovery.ErrorOutput)]"
-        Assert-Equal $validPreviousHash (Get-CpaStackFileHash -Path $journalPreviousPath) 'Orphan previous evidence remains unchanged'
-        Assert-True ($null -ne (Get-Process -Id $candidateProcessId -ErrorAction SilentlyContinue)) 'Orphan previous rejection does not stop the candidate process'
-        [System.IO.File]::WriteAllBytes($journalPath, $validJournalBytes)
-        Protect-CpaStackSecretFile -Path $journalPath
-        Assert-Equal $validJournalHash (Get-CpaStackFileHash -Path $journalPath) 'Raw current journal restore reinstates the valid bytes'
-
-        $foreignPrevious = Read-CpaStackJson -Path $journalPreviousPath
-        $foreignPrevious.operationId = [guid]::NewGuid().ToString('N')
-        Write-Utf8Text -Path $journalPreviousPath -Value ($foreignPrevious | ConvertTo-Json -Depth 12)
-        Protect-CpaStackSecretFile -Path $journalPreviousPath
-        $foreignPreviousHash = Get-CpaStackFileHash -Path $journalPreviousPath
-        $foreignPreviousRecovery = Invoke-IsolatedLanCommand -ControlRoot $fixture.Root -Command recover
-        Assert-True ($foreignPreviousRecovery.ExitCode -ne 0) 'Foreign upgrade previous generation returns a nonzero exit code'
-        Assert-Equal 'ManualRecoveryRequired' ([string]$foreignPreviousRecovery.Result.outcome) "Foreign upgrade previous requires manual recovery. Output=[$($foreignPreviousRecovery.Output)] Error=[$($foreignPreviousRecovery.ErrorOutput)]"
-        Assert-Equal $validJournalHash (Get-CpaStackFileHash -Path $journalPath) 'Foreign previous rejection preserves the current upgrade journal'
-        Assert-Equal $foreignPreviousHash (Get-CpaStackFileHash -Path $journalPreviousPath) 'Foreign previous rejection preserves the previous evidence'
-        Assert-True ($null -ne (Get-Process -Id $candidateProcessId -ErrorAction SilentlyContinue)) 'Foreign previous rejection does not stop the candidate process'
-        [System.IO.File]::WriteAllBytes($journalPreviousPath, $validPreviousBytes)
-        Protect-CpaStackSecretFile -Path $journalPreviousPath
-        Assert-Equal $validPreviousHash (Get-CpaStackFileHash -Path $journalPreviousPath) 'Raw previous restore reinstates the valid adjacent generation'
-
-        $recovery = Invoke-IsolatedLanCommand -ControlRoot $fixture.Root -Command recover
-        Assert-Equal 0 $recovery.ExitCode "Public recover succeeds after upgrade candidate hard interruption. Output=[$($recovery.Output)] Error=[$($recovery.ErrorOutput)]"
-        Assert-True ([bool]$recovery.Result.success) 'Upgrade candidate recovery reports success'
-        Assert-Equal 'Changed' $recovery.Result.outcome 'Upgrade candidate recovery reports a recovered change'
-        Assert-True ([bool]$recovery.Result.recovered) 'Upgrade candidate recovery sets recovered=true'
-        Assert-Equal 'upgrade' $recovery.Result.recoveryKind 'Public recovery routes the upgrade journal to its transaction recovery'
-        Assert-True ($null -eq (Get-Process -Id $candidateProcessId -ErrorAction SilentlyContinue)) 'Public recovery kills the exact bind-delayed candidate process'
-        Assert-False (Test-Path -LiteralPath $journalPath) 'Public recovery removes the upgrade journal after verified cleanup'
-        Assert-False (Test-Path -LiteralPath $journalPreviousPath) 'Public recovery removes the validated previous generation before the current journal'
-        Assert-False (Test-Path -LiteralPath $candidateExecutable) 'Public recovery can remove the candidate work tree after stopping the orphan'
-
-        $recoveredCpa = Get-CpaStackListener -Port $fixture.CpaPort
-        $recoveredManager = Get-CpaStackListener -Port $fixture.ManagerPort
-        Assert-Equal $formalCpaProcessId ([int]$recoveredCpa.ProcessId) 'Candidate recovery does not restart or replace the formal CPA'
-        Assert-Equal $formalManagerProcessId ([int]$recoveredManager.ProcessId) 'Candidate recovery does not restart or replace the formal Manager'
-        Assert-Equal $fixture.StackConfig ([string]$recovery.Result.state.Configuration.StackConfigPath) 'Recovery verification remains bound to the isolated canonical config'
-
-        $secondRecovery = Invoke-IsolatedLanCommand -ControlRoot $fixture.Root -Command recover
-        Assert-Equal 0 $secondRecovery.ExitCode 'A second upgrade recover is idempotent'
-        Assert-Equal 'NoChange' $secondRecovery.Result.outcome 'A second upgrade recover reports NoChange'
-        Assert-False ([bool]$secondRecovery.Result.recovered) 'A second upgrade recover does not invent recovery work'
-    } finally {
-        $env:CPA_STACK_TEST_UPGRADE_CPA_PACKAGE = $previousCpaPackage
-        $env:CPA_STACK_TEST_UPGRADE_MANAGER_PACKAGE = $previousManagerPackage
-        if (-not $scriptRestored) { Write-Utf8Text -Path $upgradeScript -Value $originalScript }
-        Remove-IsolatedInterruptedScript -Invocation $invocation
-        if ($candidateProcessId -gt 0 -and $candidateExecutable) {
-            [void](Stop-CpaStackProcessesByExecutablePath -ExpectedPath $candidateExecutable)
-        }
-        Stop-OwnedFixturePort -Port $fixture.CpaPort -ManagedRoot $fixture.Root
-        Stop-OwnedFixturePort -Port $fixture.ManagerPort -ManagedRoot $fixture.Root
-        foreach ($path in @($candidateRecordPath, $packageRoot)) {
-            if (Test-Path -LiteralPath $path) { Remove-TestPathWithRetry -Path $path }
-        }
-    }
-}
 
 function New-ShortTimeoutTransactionScript {
     param(
@@ -2501,7 +2024,7 @@ function Invoke-TransitionHealthTest {
         if (-not [string]::IsNullOrWhiteSpace($TransitionComponent)) {
             $arguments += @('-PendingSwitchComponent', $TransitionComponent)
         }
-        $output = @(& powershell.exe @arguments 2>&1)
+        $output = @(& pwsh.exe @arguments 2>&1)
         $exitCode = $LASTEXITCODE
         $json = (($output | ForEach-Object { [string]$_ }) -join [Environment]::NewLine) | ConvertFrom-Json
         return [pscustomobject]@{ ExitCode = $exitCode; State = $json }
@@ -2573,7 +2096,7 @@ function Invoke-TransitionHealthTest {
 function Invoke-RecoveryJournalValidationGuardTest {
     param([string]$OldBinary, [string]$NewBinary)
 
-    $fixture = New-LanTransactionFixture -Binary $OldBinary -Name 'recovery-journal-guard'
+    $fixture = New-ManagedStackFixture -Binary $OldBinary -Name 'recovery-journal-guard'
     $root = $fixture.Root
     $cpaRuntime = Join-Path $root 'runtime\cli-proxy-api'
     $managerRuntime = Join-Path $root 'runtime\manager-plus'
@@ -2661,7 +2184,7 @@ function Invoke-RecoveryJournalValidationGuardTest {
         }) -Path $cpaJournalPath
         $cpaJournalHash = Get-CpaStackFileHash -Path $cpaJournalPath
 
-        $cpaRecovery = Invoke-IsolatedLanCommand -ControlRoot $root -Command recover
+        $cpaRecovery = Invoke-IsolatedRecoveryCommand -ControlRoot $root -Command recover
         Assert-True ($cpaRecovery.ExitCode -ne 0) 'Path-poisoned CPA recovery returns a nonzero exit code'
         Assert-False ([bool]$cpaRecovery.Result.success) 'Path-poisoned CPA recovery reports failure'
         Assert-Equal 'ManualRecoveryRequired' ([string]$cpaRecovery.Result.outcome) "Path-poisoned CPA recovery requires manual recovery. Output=[$($cpaRecovery.Output)] Error=[$($cpaRecovery.ErrorOutput)]"
@@ -2707,7 +2230,7 @@ function Invoke-RecoveryJournalValidationGuardTest {
         $preparedJournalHash = Get-CpaStackFileHash -Path $cpaJournalPath
         $foreignPreviousHash = Get-CpaStackFileHash -Path $previousPath
 
-        $foreignPreviousRecovery = Invoke-IsolatedLanCommand -ControlRoot $root -Command recover
+        $foreignPreviousRecovery = Invoke-IsolatedRecoveryCommand -ControlRoot $root -Command recover
         Assert-True ($foreignPreviousRecovery.ExitCode -ne 0) 'Foreign switch previous journal returns a nonzero exit code'
         Assert-Equal 'ManualRecoveryRequired' ([string]$foreignPreviousRecovery.Result.outcome) "Foreign switch previous journal requires manual recovery. Output=[$($foreignPreviousRecovery.Output)] Error=[$($foreignPreviousRecovery.ErrorOutput)]"
         Assert-Equal $preparedJournalHash (Get-CpaStackFileHash -Path $cpaJournalPath) 'Foreign previous validation preserves the current switch journal'
@@ -2731,7 +2254,7 @@ function Invoke-RecoveryJournalValidationGuardTest {
         if (Test-Path -LiteralPath $previousPath) { Remove-Item -LiteralPath $previousPath -Force }
         $invalidPhaseHash = Get-CpaStackFileHash -Path $cpaJournalPath
 
-        $invalidPhaseRecovery = Invoke-IsolatedLanCommand -ControlRoot $root -Command recover
+        $invalidPhaseRecovery = Invoke-IsolatedRecoveryCommand -ControlRoot $root -Command recover
         Assert-True ($invalidPhaseRecovery.ExitCode -ne 0) 'Target-started journal with active old runtime returns a nonzero exit code'
         Assert-Equal 'ManualRecoveryRequired' ([string]$invalidPhaseRecovery.Result.outcome) "Phase-inconsistent switch journal requires manual recovery. Output=[$($invalidPhaseRecovery.Output)] Error=[$($invalidPhaseRecovery.ErrorOutput)]"
         Assert-Equal $invalidPhaseHash (Get-CpaStackFileHash -Path $cpaJournalPath) 'Phase-inconsistent recovery preserves the journal'
@@ -2768,7 +2291,7 @@ function Invoke-RecoveryJournalValidationGuardTest {
         }) -Path $managerJournalPath
         $managerJournalHash = Get-CpaStackFileHash -Path $managerJournalPath
 
-        $managerRecovery = Invoke-IsolatedLanCommand -ControlRoot $root -Command recover
+        $managerRecovery = Invoke-IsolatedRecoveryCommand -ControlRoot $root -Command recover
         Assert-True ($managerRecovery.ExitCode -ne 0) 'Foreign Manager recovery returns a nonzero exit code'
         Assert-False ([bool]$managerRecovery.Result.success) 'Foreign Manager recovery reports failure'
         Assert-Equal 'ManualRecoveryRequired' ([string]$managerRecovery.Result.outcome) "Foreign Manager recovery requires manual recovery. Output=[$($managerRecovery.Output)] Error=[$($managerRecovery.ErrorOutput)]"
@@ -2790,7 +2313,7 @@ function Invoke-RecoveryJournalValidationGuardTest {
         $orphanAcl = Get-CpaStackFileSystemAcl -Path $orphanCanary
         $orphanSddl = $orphanAcl.GetSecurityDescriptorSddlForm($aclSections)
 
-        $orphanRecovery = Invoke-IsolatedLanCommand -ControlRoot $root -Command recover
+        $orphanRecovery = Invoke-IsolatedRecoveryCommand -ControlRoot $root -Command recover
         Assert-True ($orphanRecovery.ExitCode -ne 0) 'Unreferenced rollback artifact returns a nonzero exit code'
         Assert-False ([bool]$orphanRecovery.Result.success) 'Unreferenced rollback artifact reports failure'
         Assert-Equal 'ManualRecoveryRequired' ([string]$orphanRecovery.Result.outcome) "Unreferenced rollback artifact requires manual recovery. Output=[$($orphanRecovery.Output)] Error=[$($orphanRecovery.ErrorOutput)]"
@@ -2826,7 +2349,7 @@ function Invoke-RecoveryJournalValidationGuardTest {
         }) -Path $preparedJournalPath
         Assert-False (Test-Path -LiteralPath $preparedPendingPath) 'Prepared-journal fixture models interruption before the snapshot move'
 
-        $preparedRecovery = Invoke-IsolatedLanCommand -ControlRoot $root -Command recover
+        $preparedRecovery = Invoke-IsolatedRecoveryCommand -ControlRoot $root -Command recover
         Assert-Equal 0 $preparedRecovery.ExitCode "Canonical prepared recovery succeeds before pending snapshot move. Output=[$($preparedRecovery.Output)] Error=[$($preparedRecovery.ErrorOutput)]"
         Assert-True ([bool]$preparedRecovery.Result.success) 'Canonical prepared recovery reports success'
         Assert-Equal 'Changed' ([string]$preparedRecovery.Result.outcome) 'Canonical prepared recovery reports a recovered change'
@@ -2872,7 +2395,7 @@ function Invoke-RecoveryJournalValidationGuardTest {
         Assert-True (Test-Path -LiteralPath ([string]$deferredJournal.pendingPath) -PathType Container) 'Deferred switch retains its rollback backup before recovery'
         Assert-Equal $newHash (Get-CpaStackFileHash -Path $cpaExe) 'Deferred switch activates the new runtime before current state commits'
 
-        $deferredRecovery = Invoke-IsolatedLanCommand -ControlRoot $root -Command recover
+        $deferredRecovery = Invoke-IsolatedRecoveryCommand -ControlRoot $root -Command recover
         Assert-Equal 0 $deferredRecovery.ExitCode "Deferred switch recovery succeeds. Output=[$($deferredRecovery.Output)] Error=[$($deferredRecovery.ErrorOutput)]"
         Assert-True ([bool]$deferredRecovery.Result.success) 'Deferred switch recovery reports success'
         Assert-Equal ([string]$current.cpa.sha256) (Get-CpaStackFileHash -Path $cpaExe) 'Deferred switch recovery restores the recorded old runtime'
@@ -2895,7 +2418,7 @@ function Invoke-RecoveryJournalValidationGuardTest {
 function Invoke-InterruptedCpaRollbackTest {
     param([string]$OldBinary, [string]$NewBinary)
 
-    $fixture = New-LanTransactionFixture -Binary $OldBinary -Name 'interrupted-cpa-rollback'
+    $fixture = New-ManagedStackFixture -Binary $OldBinary -Name 'interrupted-cpa-rollback'
     $root = $fixture.Root
     $runtime = Join-Path $root 'runtime\cli-proxy-api'
     $exe = Join-Path $runtime 'cli-proxy-api.exe'
@@ -2928,7 +2451,7 @@ function Invoke-InterruptedCpaRollbackTest {
         $beforeFailure = Get-CpaStackListener -Port $fixture.CpaPort
 
         [System.IO.File]::AppendAllText($backupExe, 'corrupt-backup')
-        $rejected = Invoke-IsolatedLanCommand -ControlRoot $root -Command recover
+        $rejected = Invoke-IsolatedRecoveryCommand -ControlRoot $root -Command recover
         Assert-False ([bool]$rejected.Result.success) 'Old active executable does not bypass backup validation'
         Assert-Equal 'ManualRecoveryRequired' $rejected.Result.outcome 'Invalid backup remains a manual recovery failure'
         Assert-Equal $journalHash (Get-CpaStackFileHash -Path $journalPath) 'Rejected recovery preserves the journal'
@@ -2936,7 +2459,7 @@ function Invoke-InterruptedCpaRollbackTest {
         Copy-Item -LiteralPath $OldBinary -Destination $backupExe -Force
         Protect-CpaStackSecretFile -Path $backupExe
 
-        $recovered = Invoke-IsolatedLanCommand -ControlRoot $root -Command recover
+        $recovered = Invoke-IsolatedRecoveryCommand -ControlRoot $root -Command recover
         Assert-Equal 0 $recovered.ExitCode "Interrupted CPA rollback resumes. Output=[$($recovered.Output)] Error=[$($recovered.ErrorOutput)]"
         Assert-True ([bool]$recovered.Result.success -and [bool]$recovered.Result.recovered) 'Recovery is verified before reporting success'
         Assert-Equal $oldHash (Get-CpaStackFileHash -Path $exe) 'Recorded old CPA is retained'
@@ -2945,7 +2468,7 @@ function Invoke-InterruptedCpaRollbackTest {
         Assert-False (Test-Path -LiteralPath ($journalPath + '.previous')) 'Completed recovery removes its prior generation'
         Assert-Equal $managerBefore.ProcessId (Get-CpaStackListener -Port $fixture.ManagerPort).ProcessId 'Manager remains running throughout CPA recovery'
         Assert-Equal $oldHash (Get-CpaStackFileHash -Path (Join-Path $root 'rollback\last-known-good\cpa\runtime\cli-proxy-api.exe')) 'Verified backup is retained'
-        $again = Invoke-IsolatedLanCommand -ControlRoot $root -Command recover
+        $again = Invoke-IsolatedRecoveryCommand -ControlRoot $root -Command recover
         Assert-Equal 'NoChange' $again.Result.outcome 'A second recover is idempotent'
     } finally {
         Stop-OwnedFixturePort -Port $fixture.CpaPort -ManagedRoot $root
@@ -2957,11 +2480,11 @@ function Invoke-CpaAvailabilityTest {
     param([string]$OldBinary, [string]$NewBinary)
 
     foreach ($mode in @('commit-new', 'restored-old', 'missing-exe')) {
-        $fixture = New-LanTransactionFixture -Binary $OldBinary -Name ("availability-$mode")
+        $fixture = New-ManagedStackFixture -Binary $OldBinary -Name ("availability-$mode")
         $root = $fixture.Root
         $runtime = Join-Path $root 'runtime\cli-proxy-api'
         $exe = Join-Path $runtime 'cli-proxy-api.exe'
-        $commonPath = Join-Path (Split-Path -Parent $isolatedLanEntry) 'CpaStack.Common.ps1'
+        $commonPath = Join-Path (Split-Path -Parent $isolatedStackEntry) 'CpaStack.Common.ps1'
         $originalCommon = [System.IO.File]::ReadAllText($commonPath)
         try {
             if ($mode -ne 'missing-exe') {
@@ -2989,7 +2512,7 @@ if ([System.IO.Path]::GetFullPath($Root).TrimEnd('\') -ieq '__AUTH__' -and -not 
             $current = Read-CpaStackJson -Path $currentPath
             $oldHash = [string]$current.cpa.sha256
             $newHash = Get-CpaStackFileHash -Path (Join-Path $candidate 'cli-proxy-api.exe')
-            $switchScript = Join-Path (Split-Path -Parent $isolatedLanEntry) 'Switch-CpaRuntime.ps1'
+            $switchScript = Join-Path (Split-Path -Parent $isolatedStackEntry) 'Switch-CpaRuntime.ps1'
             $output = & $switchScript -ControlRoot $root -SourceRuntime $runtime -TargetRuntime $runtime `
                 -CandidatePackageRoot $candidate -SourceConfig $fixture.CpaConfig -ResultPath (Join-Path $root 'state\availability-switch.json') `
                 -ExpectedCandidateHash $newHash -Port $fixture.CpaPort -DeferFinalCommit `
@@ -3013,7 +2536,7 @@ if ([System.IO.Path]::GetFullPath($Root).TrimEnd('\') -ieq '__AUTH__' -and -not 
             }
             $beforeCpa = Get-CpaStackListener -Port $fixture.CpaPort
             $beforeManager = Get-CpaStackListener -Port $fixture.ManagerPort
-            $recovered = Invoke-IsolatedLanCommand -ControlRoot $root -Command recover
+            $recovered = Invoke-IsolatedRecoveryCommand -ControlRoot $root -Command recover
             Assert-Equal 0 $recovered.ExitCode "$mode recovery succeeds. Output=[$($recovered.Output)] Error=[$($recovered.ErrorOutput)]"
             $afterCpa = Get-CpaStackListener -Port $fixture.CpaPort
             Assert-True ($null -ne $afterCpa) "$mode leaves CPA listening"
@@ -3122,7 +2645,7 @@ try {
         -DestinationRepository (Join-Path $testRunRoot 'repository') `
         -LocalAppDataRoot (Join-Path $testRunRoot 'local-app-data')
     $isolatedStartStackScript = Join-Path $transactionFixture.Repository 'skills\cpa-safe-upgrade\scripts\Start-CPA-Stack.ps1'
-    $isolatedLanEntry = Join-Path $transactionFixture.Repository 'skills\cpa-safe-upgrade\scripts\cpa-stack.ps1'
+    $isolatedStackEntry = Join-Path $transactionFixture.Repository 'skills\cpa-safe-upgrade\scripts\cpa-stack.ps1'
     $isolatedLocalAppData = $transactionFixture.LocalAppData
     New-Item -ItemType Directory -Force -Path $compileRoot | Out-Null
     $oldBinary = Join-Path $compileRoot 'fixture-old.exe'
@@ -3166,18 +2689,6 @@ try {
     }
     if ($Case -in @('All', 'Core', 'CpaAvailability')) {
         Invoke-CpaAvailabilityTest -OldBinary $oldBinary -NewBinary $newBinary
-    }
-    if ($Case -in @('All', 'Core', 'LanSuccess')) {
-        Invoke-LanConfigurationSuccessTest -Binary $oldBinary
-    }
-    if ($Case -in @('All', 'Core', 'LanRollback')) {
-        Invoke-LanConfigurationRollbackTest -Binary $oldBinary
-    }
-    if ($Case -in @('All', 'Core', 'LanRecovery')) {
-        Invoke-LanHardInterruptionRecoveryTest -Binary $oldBinary
-    }
-    if ($Case -in @('All', 'Core', 'UpgradeCandidateRecovery')) {
-        Invoke-UpgradeCandidateHardInterruptionRecoveryTest -OldBinary $oldBinary -NewBinary $newBinary
     }
     if ($Case -in @('All', 'Maintenance', 'MaintenanceIdentity')) {
         Invoke-MaintenanceIdentityGateTest -Binary $oldBinary

@@ -17,13 +17,15 @@ CPA `auth`、可选 `plugins` 代码树和 Manager data tree 是递归信任边�
 
 普通非空目录不能被认领。installer 只可对用户明确指定、ACL 已保护且完全为空的 root 写入带 bootstrap hash 的 preinitialized instance marker；此状态只允许固定 launcher，直到一键 `upgrade` 的自动迁移建立同 instance 的 `current.json`。任何额外内容、marker 漂移或 launcher hash/ACL 漂移都会阻断。
 
+日常状态、启动、原地升级和恢复仅检查 `auth/logs` 目录自身的 owner、ACL 和 reparse 属性，不递归检查历史日志；其余凭据仍递归检查。auth 复制排除 `logs`，也不提前遍历被排除日志。此例外不适用于 plugins、Manager 数据或通用完整目录审计。
+
 首次迁移的 legacy 源可以保留普通用户只读/执行权限，但 runtime/config/auth/plugins 及父链不得允许非受信主体修改或替换内容。候选退出后生成包含相对路径、类型、长度与 SHA256 的 target runtime manifest；受保护 journal 固定其 digest、config hash 和 host。non-in-place 正式切换只启动该已测快照，不会再次复制在线 legacy config、auth 或 plugins。
 
-所有目标树、JSON 临时文件和目录交换后缀必须满足 Windows PowerShell 5.1 兼容预算：目录 247 字符、文件 259 字符。初始化和升级在停止正式服务或禁用 collector 前完成预检。
+所有目标树、JSON 临时文件和目录交换后缀必须满足 Windows 路径预算：目录 247 字符、文件 259 字符。初始化和升级在停止正式服务或禁用 collector 前完成预检。
 
 ## 事务边界
 
-有状态命令在同一 Windows 账户下持有跨会话文件锁。破坏性动作前先写不含 secret、且绑定 instanceId 的 pending journal。公开 `recover` 只分派到 recovery-only interface；并发调用即使在等待锁期间 journal 已被另一调用收敛，也不能开始新迁移、联网升级或 LAN 变更。初始化/升级的顶层 journal 可以拥有经底层再次验证的 switch journal 与 `rollback/pending-*` 从属 artifact；多个无关顶层事务仍必须阻断。
+有状态命令在同一 Windows 账户下持有跨会话文件锁。破坏性动作前先写不含 secret、且绑定 instanceId 的 pending journal。公开 `recover` 只分派到 recovery-only interface；并发调用即使在等待锁期间 journal 已被另一调用收敛，也不能开始新迁移、联网升级。初始化/升级的顶层 journal 可以拥有经底层再次验证的 switch journal 与 `rollback/pending-*` 从属 artifact；多个无关顶层事务仍必须阻断。
 
 公开 `upgrade` 在 runtime 事务前先检查 updater。发现新版时只运行安全下载到本地且通过上述校验的 installer，原子提交后用新版 CLI 重执行一次；查询、校验、安装或重执行失败不接触 runtime。源码分支、fork、预发布版和管道执行不受支持。
 
@@ -32,9 +34,8 @@ CPA `auth`、可选 `plugins` 代码树和 Manager data tree 是递归信任边�
 - `recorded=old`：从已验证备份幂等重铺完整旧 runtime；Manager 同时重铺 SQLite 与 `data.key`；
 - `recorded=new` 且 `active=new`：完成 last-known-good 提交。
 
-hash 组合、instanceId 或备份校验出现歧义时必须停止，不能猜测。候选失败不触碰正式服务；正式切换失败必须在返回前恢复旧服务。
+hash 组合、instanceId 或备份校验出现歧义时必须停止，不能猜测。日常升级不预跑候选；首次迁移的候选失败不触碰正式服务。正式切换失败必须恢复该组件旧服务；恢复失败须明确报错并保留事务，不能伪成功。
 
-LAN 变更在写两份配置前记录 canonical root、instance、`current.json` hash、before/target config hash 和受保护备份 hash。新监听和完整健康状态必须在 journal 仍存在时验证，删除 journal 才算 commit。硬中断恢复只覆盖仍等于 before/target 的配置；未知修改不覆盖。即使配置文本已经匹配，`NoChange` 也必须验证真实 listener 与健康状态。
 
 停止候选或正式服务前，先固定已验证 listener 的 `Process` 与 OS handle。即使 listener 在停服函数进入前或等待期间消失，也只终止并等待该固定进程；updater 启动但从未监听的游离候选按其 `Process` 对象清理。固定进程退出、端口释放和 executable 可独占打开必须同时成立；新 PID/path 抢占端口时立即失败且绝不终止新 owner。切换或回滚复制关键文件后，必须在重启前恢复 runtime 父目录、关键文件和 Manager data tree 的 owner 与 ACL。
 
@@ -46,7 +47,7 @@ Manager online backup 必须可生成、可重新打开并通过 `quick_check`�
 
 ## 网络边界
 
-候选端口必须只有 `127.0.0.1` listener。检查端口全部 listener，不能只取第一条。正式服务默认 loopback；LAN 暴露需要用户明确授权。
+候选端口必须只有 `127.0.0.1` listener。检查端口全部 listener，不能只取第一条。新实例默认 loopback；本工具不再提供网络暴露切换功能，不修改已有实例的网络配置。旧版 LAN pending 仅作为阻断条件保留识别，不再分派执行。
 
 候选与正式服务进程使用最小环境变量白名单，只保留 Windows 运行必需项和不含 userinfo/query/fragment 的代理 URL、TLS 路径；带内嵌账号口令的代理变量会被丢弃，也不会继承其他无关会话变量。loopback 只限制入站监听；经官方 release 与 hash 验证的二进制仍可通过当前网络或安全代理出站，它不是 AppContainer 或防火墙沙箱。
 

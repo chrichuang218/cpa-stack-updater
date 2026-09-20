@@ -257,7 +257,7 @@ if (Test-Path -LiteralPath $wshProbeRoot) {
 try {
     New-Item -ItemType Directory -Force -Path $wshProbeRoot | Out-Null
     Set-Content -LiteralPath $wshProbeLauncher -Value '# WSH policy probe' -Encoding ASCII
-    $wshPowerShell = [System.IO.Path]::GetFullPath((Get-Command powershell.exe -ErrorAction Stop).Source)
+    $wshPowerShell = [System.IO.Path]::GetFullPath((Get-Command pwsh.exe -ErrorAction Stop).Source)
     $wshArguments = '-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $wshProbeLauncher
     Write-TestShortcut -Path $wshProbePath -TargetPath $wshPowerShell -Arguments $wshArguments -WorkingDirectory $wshProbeRoot -WindowStyle 7
     Start-Sleep -Milliseconds 250
@@ -399,7 +399,7 @@ try {
     $managedIcon = [System.IO.Path]::GetFullPath((Join-Path $root 'assets\cpa-shortcut.ico'))
     $link = Read-TestShortcut -Path $shortcut
     $preferredPowerShell = Get-Command pwsh.exe -ErrorAction SilentlyContinue
-    if ($null -eq $preferredPowerShell) { $preferredPowerShell = Get-Command powershell.exe -ErrorAction Stop }
+    if ($null -eq $preferredPowerShell) { $preferredPowerShell = Get-Command pwsh.exe -ErrorAction Stop }
     Assert-Equal ([System.IO.Path]::GetFullPath($preferredPowerShell.Source)) ([System.IO.Path]::GetFullPath($link.TargetPath)) 'Managed shortcut prefers PowerShell 7 and falls back to Windows PowerShell'
     Assert-Equal ('-NoLogo -NoProfile -NoExit -ExecutionPolicy Bypass -File "{0}"' -f $launcher) $link.Arguments 'Managed shortcut keeps the visible launcher open for execution status'
     Assert-Equal $ops ([System.IO.Path]::GetFullPath($link.WorkingDirectory).TrimEnd('\')) 'Managed shortcut uses the canonical ops working directory'
@@ -488,7 +488,7 @@ try {
     $adoptOps = [System.IO.Path]::GetFullPath((Join-Path $adoptRoot 'ops')).TrimEnd('\')
     $adoptLegacyIcon = Join-Path $legacyIconDirectory 'adopt-legacy.ico'
     Set-Content -LiteralPath $adoptLegacyIcon -Value 'adopt icon fixture' -Encoding ASCII
-    $powershellPath = [System.IO.Path]::GetFullPath((Get-Command powershell.exe -ErrorAction Stop).Source)
+    $powershellPath = [System.IO.Path]::GetFullPath((Get-Command pwsh.exe -ErrorAction Stop).Source)
     Write-TestShortcut -Path $adoptShortcut -TargetPath $powershellPath -Arguments ('-NoLogo -NoProfile -NoExit -ExecutionPolicy Bypass -File "{0}"' -f $adoptLegacyLauncher) -WorkingDirectory (Split-Path -Parent $adoptLegacyLauncher) -WindowStyle 7 -IconPath $adoptLegacyIcon
 
     $adoptHashBefore = (Get-FileHash -Algorithm SHA256 -LiteralPath $adoptShortcut).Hash

@@ -1,3 +1,4 @@
+#requires -Version 7.0
 [CmdletBinding()]
 param(
     [string]$ControlRoot,
@@ -9,7 +10,6 @@ param(
     [string]$DesktopShortcut,
     [switch]$UpdateDesktopShortcut,
     [string]$SecretsInputPath,
-    [switch]$ExposeToLan,
     [ValidateRange(1, 65535)][int]$CpaPort = 8317,
     [ValidateRange(1, 65535)][int]$ManagerPort = 18317,
     [string]$CpaVersion = "unknown",
@@ -81,7 +81,7 @@ function Invoke-ChildPowerShell {
 function Invoke-ChildPowerShellJson {
     param([string]$Script, [string[]]$Arguments)
 
-    $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
+    $powershell = (Get-Command pwsh.exe -ErrorAction Stop).Source
     $output = @(& $powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $Script @Arguments 2>&1)
     $exitCode = $LASTEXITCODE
     $text = $output -join [Environment]::NewLine
@@ -145,16 +145,14 @@ function Copy-CurrentCpaRuntime {
         Copy-Item -LiteralPath $sourceStatic -Destination (Join-Path $Destination "static") -Recurse -Force
     }
     Copy-Item -LiteralPath $Config -Destination (Join-Path $Destination "config.yaml") -Force
-    if (-not $ExposeToLan) {
-        $targetConfig = Join-Path $Destination 'config.yaml'
-        $content = [System.IO.File]::ReadAllText($targetConfig, [System.Text.UTF8Encoding]::new($false, $true))
-        if ($content -match '(?m)^host:\s*.*$') {
-            $content = [regex]::Replace($content, '(?m)^host:\s*.*$', 'host: "127.0.0.1"', 1)
-        } else {
-            $content = "host: `"127.0.0.1`"`r`n" + $content
-        }
-        [System.IO.File]::WriteAllText($targetConfig, $content, [System.Text.UTF8Encoding]::new($false))
+    $targetConfig = Join-Path $Destination 'config.yaml'
+    $content = [System.IO.File]::ReadAllText($targetConfig, [System.Text.UTF8Encoding]::new($false, $true))
+    if ($content -match '(?m)^host:\s*.*$') {
+        $content = [regex]::Replace($content, '(?m)^host:\s*.*$', 'host: "127.0.0.1"', 1)
+    } else {
+        $content = "host: `"127.0.0.1`"`r`n" + $content
     }
+    [System.IO.File]::WriteAllText($targetConfig, $content, [System.Text.UTF8Encoding]::new($false))
     $targetConfig = Join-Path $Destination 'config.yaml'
     $content = [System.IO.File]::ReadAllText($targetConfig, [System.Text.UTF8Encoding]::new($false, $true))
     $updated = [regex]::Replace($content, '(?m)^port:\s*\d+\s*$', "port: $CpaPort", 1)
@@ -1812,11 +1810,7 @@ try {
             }
         } catch {}
     }
-    if (-not $ExposeToLan) {
-        $sourceManagerBindAddress = '127.0.0.1'
-    } elseif ($sourceManagerBindAddress -eq '127.0.0.1') {
-        $sourceManagerBindAddress = '0.0.0.0'
-    }
+    $sourceManagerBindAddress = '127.0.0.1'
     if ($sourceManagerBindAddress -notmatch '^[A-Za-z0-9.:%\[\]-]+$') { throw "Legacy Manager bind address contains unsupported characters." }
     Assert-LegacyStackState
     $candidatePortPlan = New-CpaStackCandidatePortPlan -FormalPort @($CpaPort, $ManagerPort)
@@ -1900,11 +1894,8 @@ try {
         throw 'CPA candidate did not return a complete post-exit runtime binding.'
     }
     $expectedTargetHost = [string]$cpaCandidate.activeConfigHost
-    if (-not $ExposeToLan -and $expectedTargetHost -ne '127.0.0.1') {
+    if ($expectedTargetHost -ne '127.0.0.1') {
         throw 'Canonical CPA target config did not preserve the required loopback host.'
-    }
-    if ($ExposeToLan -and $expectedTargetHost -ne (Get-CpaStackConfigHost -ConfigPath $SourceCpaConfig)) {
-        throw 'Canonical CPA target config did not preserve the explicitly retained legacy host.'
     }
     $initializeJournal.targetCpaRuntimeManifestSha256 = [string]$cpaCandidate.runtimeManifestSha256
     $initializeJournal.targetCpaConfigSha256 = [string]$cpaCandidate.activeConfigSha256

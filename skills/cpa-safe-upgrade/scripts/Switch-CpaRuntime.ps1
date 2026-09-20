@@ -1,3 +1,4 @@
+#requires -Version 7.0
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$ControlRoot,
@@ -105,7 +106,7 @@ try {
     Assert-CpaStackPath -Path $SourceConfig -PathType Leaf
     Assert-CpaStackPath -Path $candidateExe -PathType Leaf
     if ($sameRuntime) {
-        Assert-CpaStackPrivateTree -Root $sourceAuth -Description 'Preserved CPA auth' -AllowInheritedDescendants
+        Assert-CpaStackPrivateTree -Root $sourceAuth -Description 'Preserved CPA auth' -AllowInheritedDescendants -ShallowDirectoryNames @('logs')
         if (Test-Path -LiteralPath $sourcePlugins) {
             Assert-CpaStackPrivateTree -Root $sourcePlugins -Description 'Preserved CPA plugins'
         }
@@ -247,7 +248,7 @@ try {
         }
         Protect-CpaStackSecretFile -Path $targetExe
         # Descendants were validated before stopping; the switch never modifies them.
-        Assert-CpaStackPrivateTree -Root $targetAuth -Description 'Preserved CPA auth' -AllowInheritedDescendants -RootOnly:$sameRuntime
+        Assert-CpaStackPrivateTree -Root $targetAuth -Description 'Preserved CPA auth' -AllowInheritedDescendants -RootOnly:$sameRuntime -ShallowDirectoryNames @('logs')
         if (Test-Path -LiteralPath $targetPlugins) {
             Assert-CpaStackPrivateTree -Root $targetPlugins -Description 'Preserved CPA plugins' -RootOnly:$sameRuntime
         }

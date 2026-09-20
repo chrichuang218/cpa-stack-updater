@@ -15,7 +15,7 @@ $nonAsciiPowerShell = @($files | Where-Object {
     $_.Extension -eq '.ps1' -and
     @([System.IO.File]::ReadAllBytes($_.FullName) | Where-Object { $_ -gt 127 }).Count -gt 0
 })
-Assert-Equal 0 $nonAsciiPowerShell.Count 'PowerShell sources remain ASCII-safe for Windows PowerShell 5.1'
+Assert-Equal 0 $nonAsciiPowerShell.Count 'PowerShell sources remain ASCII-safe for consistent packaging'
 
 $textFiles = @($files | Where-Object {
     $_.Extension -in @('.ps1', '.psd1', '.md', '.json', '.yaml', '.yml', '.py') -and
@@ -50,7 +50,7 @@ Assert-False ($skill.Contains('& "$PSScriptRoot\scripts\cpa-stack.ps1"')) 'Inter
 Assert-True ($skill.Contains('$skillRoot = Split-Path -Parent')) 'SKILL.md derives an explicit skill root from its own path'
 Assert-True ($skill.Contains('$cpaCli = Join-Path $skillRoot ''scripts\cpa-stack.ps1''')) 'SKILL.md derives one stable public CLI path'
 Assert-True ([regex]::Matches($skill, [regex]::Escape('& $cpaCli')).Count -ge 8) 'Runtime examples use only the stable public CLI'
-Assert-True ($skill.Contains('& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $cpaCli upgrade -Json')) 'Scheduled upgrade passes NonInteractive to the PowerShell host before the CLI script path'
+Assert-True ($skill.Contains('& pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $cpaCli upgrade -Json')) 'Scheduled upgrade passes NonInteractive to the PowerShell host before the CLI script path'
 Assert-False ($skill -match '&\s+\$cpaCli\s+(?:doctor|plan|init|register-root)\b') 'Primary Skill workflow teaches only supported commands'
 Assert-False ($skill -match '-(?:UpdateDesktopShortcut|ExposeToLan|AllowUnknownVersionReplacement|AdoptExisting)\b') 'Primary Skill workflow teaches no removed compatibility switches'
 Assert-True ($skill -match "install\.ps1'\s+-Action\s+Check" -and $skill -match "install\.ps1'\s+-Action\s+Update") 'Skill self-update is limited to explicit local installer Check and Update actions'
@@ -139,7 +139,6 @@ Assert-True ($common -match '\[switch\]\$MinimalEnvironment') 'Candidate process
 Assert-True ($common -match 'PROC_THREAD_ATTRIBUTE_HANDLE_LIST|ProcThreadAttributeHandleList') 'Managed processes inherit only the explicit null-device handle list'
 Assert-True ($common -match 'function Test-CpaStackFileReadyForReplacement') 'Port shutdown verifies that the executable can be replaced'
 Assert-True ($common -match '\$ownedProcess\.HasExited') 'Port shutdown waits for the exact process after the listener disappears'
-Assert-True ($common -match 'function Get-CpaStackWindowsPowerShellModulePath') 'Windows PowerShell child processes use deterministic compatible module paths'
 Assert-True ($common -match '\$proxyUri\.UserInfo') 'Managed process proxy URLs reject embedded credentials'
 Assert-True ($common -match 'function Protect-CpaStackPrivateTree') 'CPA auth trees receive recursive ACL and reparse protection'
 Assert-True ($common -match 'function Assert-CpaStackPrivateTree') 'Executable plugin trees receive recursive owner and ACL validation'
@@ -215,15 +214,11 @@ Assert-True ($upgrade -match 'DeferFinalCommit') 'Upgrade defers switch journal 
 $publicCli = [System.IO.File]::ReadAllText((Join-Path $skillRoot 'scripts\cpa-stack.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
 Assert-True ($publicCli -match 'AllowUnknownVersionReplacement:\$true') 'Public upgrade always permits verified stable replacement of unknown versions'
 Assert-True ($upgrade -match 'if\s*\(-not\s+\$RecoverOnly\)\s*\{\s*Assert-CpaStackFreeSpace') 'Recovery-only bypasses the normal 1 GiB upgrade capacity gate'
-Assert-True ($upgrade.IndexOf('Set-UpgradeJournalPhase -Phase "testing-manager"', [System.StringComparison]::Ordinal) -lt $upgrade.IndexOf('Set-UpgradeJournalPhase -Phase "switching-cpa"', [System.StringComparison]::Ordinal)) 'Both component candidates are tested before the first formal switch'
-Assert-True ($upgrade.IndexOf('Assert-SwitchedServicesHealthy -PendingSwitchComponent cpa', [System.StringComparison]::Ordinal) -lt $upgrade.IndexOf('Set-CurrentComponentState -Component cpa', [System.StringComparison]::Ordinal)) 'CPA transition health is verified before current state commits the new hash'
-Assert-True ($upgrade.IndexOf('Assert-SwitchedServicesHealthy -PendingSwitchComponent manager', [System.StringComparison]::Ordinal) -lt $upgrade.IndexOf('Set-CurrentComponentState -Component manager', [System.StringComparison]::Ordinal)) 'Manager transition health is verified before current state commits the new hash'
 Assert-False ($publicCli -match 'PendingSwitchComponent') 'The public CLI does not expose the internal transition health mode'
 Assert-True ($upgrade -match 'Immediate switch recovery failed') 'Outer switch failures attempt immediate in-process recovery before returning'
 Assert-True ($upgrade -match 'Protect-CpaStackSecretFile\s+-Path\s+\(Join-Path\s+\$ControlRoot\s+''config\\stack\.psd1''\)') 'Interrupted recovery repairs the canonical stack config owner before restart'
 Assert-True ($upgrade -match 'function Remove-CommittedOrphanSwitchPrevious') 'Recovery can remove a result-bound committed orphan switch previous journal'
 Assert-True ($upgrade -match 'matching successful switch result') 'Orphan switch previous cleanup requires a matching successful switch result'
-Assert-True ($upgrade -match 'Copy-CpaStackPluginTree\s+-Source\s+\$plugins') 'CPA candidate preparation copies plugins through the protected-tree helper'
 Assert-True ($upgrade -match 'Assert-CpaStackPrivateTree\s+-Root\s+\$activePlugins') 'Top-level upgrade fails closed on an unsafe preserved plugins tree'
 Assert-False ($upgrade -match 'Protect-CpaStackPrivateTree\s+-Root\s+\$activePlugins') 'Top-level upgrade does not erase evidence of an unsafe plugins ACL'
 Assert-True ($upgrade -match 'Repair-CpaStackRecordedExecutableAcl') 'Upgrade repairs only hash-bound active executable ACL drift before trusted preflight'
@@ -232,7 +227,7 @@ Assert-True ($upgrade.IndexOf('Assert-UpgradeSwitchPathBudget', $upgrade.IndexOf
 
 $testAll = [System.IO.File]::ReadAllText((Join-Path $repo 'tools\Test-All.ps1'), [System.Text.UTF8Encoding]::new($false, $true))
 Assert-True ($testAll -match "TransactionIntegration\.Core\.Tests\.ps1" -and $testAll -match "MaintenanceTransaction\.Tests\.ps1") 'Full regression shards core and maintenance transactions without dropping scenarios'
-Assert-True ($testAll -match "PSEdition\s+-eq\s+'Core'\)\s*\{\s*5400\s*\}\s*else\s*\{\s*2700") 'PS7 keeps both transaction shards with a larger bounded timeout'
+Assert-True ($testAll -match '\[switch\]\$Extended' -and $testAll -match 'Test-Quick.ps1') 'Long transaction shards require explicit Extended mode'
 Assert-Equal 2 ([regex]::Matches($testAll, 'ValidateRange\(1, 5400\)').Count) 'Both guarded test seams accept the PS7 transaction timeout'
 Assert-True ($initialize.IndexOf('Assert-InitializationSwitchPathBudget', $initialize.IndexOf('try {', [System.StringComparison]::Ordinal), [System.StringComparison]::Ordinal) -lt $initialize.IndexOf('Set-InitializeJournalPhase -Phase "switching"', [System.StringComparison]::Ordinal)) 'Initialization budgets both components before the first formal switch'
 Assert-True ($upgrade.LastIndexOf('$result | ConvertTo-Json', [System.StringComparison]::Ordinal) -lt $upgrade.LastIndexOf('if (-not $result.success)', [System.StringComparison]::Ordinal)) 'Upgrade emits its structured result before a non-zero exit'
@@ -284,7 +279,6 @@ foreach ($fixtureBoundTest in @(
     'InitializeRecoverySafety.Tests.ps1',
     'Install.Tests.ps1',
     'InstallV2.Tests.ps1',
-    'LanConfiguration.Tests.ps1',
     'PathSafety.Tests.ps1',
     'TransactionIntegration.Tests.ps1'
 )) {

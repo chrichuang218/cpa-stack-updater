@@ -7,7 +7,7 @@ $skillRoot = Join-Path $temp 'skill'
 $scripts = Join-Path $skillRoot 'scripts'
 $modules = Join-Path $skillRoot 'modules'
 $managedRoot = Join-Path $temp 'managed root'
-$engineName = if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' }
+$engineName = 'pwsh.exe'
 $powershell = (Get-Command $engineName -ErrorAction Stop).Source
 
 function Invoke-TestCli {
@@ -95,10 +95,10 @@ Set-Content -LiteralPath (Join-Path `$ControlRoot '$name.called') -Value 'called
     Assert-False ([bool]$status.Json.changed) 'Status is strictly read-only'
 
     foreach ($invalidInvocation in @(
-        [pscustomobject]@{ Command = 'status'; Arguments = @('-Mode', 'Lan'); Operation = 'status' },
-        [pscustomobject]@{ Command = 'migrate'; Arguments = @('-Mode', 'Lan'); Operation = 'migrate' },
-        [pscustomobject]@{ Command = 'upgrade'; Arguments = @('-Mode', 'Lan'); Operation = 'upgrade' },
-        [pscustomobject]@{ Command = 'maintenance'; Arguments = @('-Mode', 'Lan'); Operation = 'maintenance' }
+        [pscustomobject]@{ Command = 'status'; Arguments = @('-NoBrowser'); Operation = 'status' },
+        [pscustomobject]@{ Command = 'migrate'; Arguments = @('-NoBrowser'); Operation = 'migrate' },
+        [pscustomobject]@{ Command = 'upgrade'; Arguments = @('-NoBrowser'); Operation = 'upgrade' },
+        [pscustomobject]@{ Command = 'maintenance'; Arguments = @('-NoBrowser'); Operation = 'maintenance' }
     )) {
         $invalidArguments = @([string]$invalidInvocation.Command, '-Root', $managedRoot) + @($invalidInvocation.Arguments) + @('-Json')
         $invalid = Invoke-TestCli @invalidArguments
@@ -268,22 +268,6 @@ param([string]$ControlRoot, [ValidateSet('CleanupDerived')][string]$Action)
     Assert-Equal 'Changed' $maintenance.Json.outcome 'Successful offline cleanup reports Changed'
     Assert-Equal 'CleanupDerived' $maintenance.Json.maintenance.action 'Maintenance passes the requested action as one argument'
 
-    @'
-param([string]$ControlRoot, [ValidateSet('Loopback', 'Lan')][string]$Mode)
-[pscustomobject]@{
-    success = $true
-    changed = $true
-    rolledBack = $false
-    mode = $Mode
-} | ConvertTo-Json -Compress
-'@ | Set-Content -LiteralPath (Join-Path $scripts 'Set-CpaStackLan.ps1') -Encoding UTF8
-
-    $lan = Invoke-TestCli lan -Action Set -Mode Lan -Root $managedRoot -Json
-    Assert-Equal 0 $lan.ExitCode ('LAN operation exits successfully. Output=' + ($lan.Output -join ' | '))
-    Assert-Equal 2 $lan.Json.schemaVersion 'LAN uses the v2 result envelope'
-    Assert-Equal 'lan' $lan.Json.operation 'LAN identifies the operation'
-    Assert-Equal 'Changed' $lan.Json.outcome 'Applied LAN configuration reports Changed'
-    Assert-Equal 'Lan' $lan.Json.lan.mode 'LAN result retains the explicit requested mode'
 
     @'
 param([string]$ControlRoot)

@@ -89,28 +89,6 @@ Assert-False (($http502 | ConvertTo-Json).Contains($sentinel)) 'HTTP diagnostics
 }
 
 & {
-    # Exercise the actual post-switch logging and failure branch, not a copy of its predicate.
-    $definitions = Import-TestFunctions -Path (Join-Path $scripts 'Invoke-CpaStackUpgrade.ps1') -Names @('Add-UpgradeDiagnostic', 'Assert-SwitchedServicesHealthy')
-    . ([scriptblock]::Create($definitions -join "`n"))
-    $result = [ordered]@{ diagnostics = @() }
-    function Join-Path { return 'fixture-script.ps1' }
-    function Invoke-ChildPowerShellJson { return $state }
-    $ControlRoot = 'C:\unused-fixture'
-    Assert-ThrowsMatch { Assert-SwitchedServicesHealthy -PendingSwitchComponent manager } 'did not preserve' 'A failed health check still stops the transaction'
-    $state.Manager.Healthy = $true
-    $state.Manager.Checks.CollectorRunning = $true
-    $state.OverallHealthy = $true
-    Assert-SwitchedServicesHealthy -PendingSwitchComponent manager
-    Assert-Equal 2 $result.diagnostics.Count 'Recovery appends a second event rather than overwriting the first'
-    Assert-True ('Manager.Checks.CollectorRunning' -in $result.diagnostics[0].failedChecks) 'First failure survives later state mutation'
-    Assert-Equal 0 $result.diagnostics[1].failedChecks.Count 'Later successful checks are recorded separately'
-    $state.OverallHealthy = $false
-    $pending = New-CpaStackHealthDiagnostic -Stage 'recovery-health' -State $state
-    Assert-False $pending.overallHealthy 'Overall state remains visible while a switch is pending'
-    Assert-Equal 0 $pending.failedChecks.Count 'A pending transaction alone must not be mislabeled as a failed component check'
-}
-
-& {
     # The status gate and its diagnostic booleans share the production check map.
     $definitions = Import-TestFunctions -Path (Join-Path $scripts 'Get-CpaStackState.ps1') -Names @('Get-JsonPropertyValue', 'New-UnattemptedProbe', 'Get-ManagerStatus')
     . ([scriptblock]::Create($definitions -join "`n"))

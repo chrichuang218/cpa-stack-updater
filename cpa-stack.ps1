@@ -1,4 +1,4 @@
-#requires -Version 5.1
+#requires -Version 7.0
 
 $entry = Join-Path $PSScriptRoot 'skills\cpa-safe-upgrade\scripts\cpa-stack.ps1'
 if (-not (Test-Path -LiteralPath $entry -PathType Leaf)) {

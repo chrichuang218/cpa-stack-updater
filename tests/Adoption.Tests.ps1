@@ -54,7 +54,7 @@ if (`$recoverOnly) { `$arguments += '-RecoverOnly' }
 `$savedErrorAction = `$ErrorActionPreference
 try {
     `$ErrorActionPreference = 'Continue'
-    `$output = @(& (Get-Command powershell.exe -ErrorAction Stop).Source @arguments 2>&1)
+    `$output = @(& (Get-Command pwsh.exe -ErrorAction Stop).Source @arguments 2>&1)
     `$exitCode = `$LASTEXITCODE
 } finally {
     `$ErrorActionPreference = `$savedErrorAction
@@ -65,7 +65,7 @@ exit `$exitCode
 "@
     $encodedWrapper = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($wrapper))
     $process = Start-Process `
-        -FilePath (Get-Command powershell.exe -ErrorAction Stop).Source `
+        -FilePath (Get-Command pwsh.exe -ErrorAction Stop).Source `
         -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encodedWrapper) `
         -WindowStyle Hidden `
         -RedirectStandardOutput $stdoutPath `

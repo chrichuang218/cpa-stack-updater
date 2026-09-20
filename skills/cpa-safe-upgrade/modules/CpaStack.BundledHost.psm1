@@ -1,10 +1,11 @@
+#requires -Version 7.0
 Set-StrictMode -Version Latest
 
 function New-CpaStackBundledHost {
     param([Parameter(Mandatory = $true)][string]$ScriptsRoot)
 
     $root = [System.IO.Path]::GetFullPath($ScriptsRoot).TrimEnd('\')
-    $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
+    $powershell = (Get-Command pwsh.exe -ErrorAction Stop).Source
     $invoke = {
         param(
             [Parameter(Mandatory = $true)][string]$Name,
@@ -24,15 +25,13 @@ function New-CpaStackBundledHost {
             $commonModulePath = & {
                 $paths = @($env:PSModulePath -split [System.IO.Path]::PathSeparator | Where-Object {
                     -not [string]::IsNullOrWhiteSpace($_) -and
-                    -not $_.StartsWith((Join-Path $HOME 'Documents\PowerShell'), [System.StringComparison]::OrdinalIgnoreCase) -and
-                    -not $_.StartsWith((Join-Path $HOME 'Documents\WindowsPowerShell'), [System.StringComparison]::OrdinalIgnoreCase)
+                    -not $_.StartsWith((Join-Path $HOME 'Documents\PowerShell'), [System.StringComparison]::OrdinalIgnoreCase)
                 })
                 return ($paths -join [System.IO.Path]::PathSeparator)
             }
             $env:PSModulePath = $commonModulePath
             # A bundled script's nonzero result is data for the transaction module to classify.
-            # Windows PowerShell surfaces redirected native stderr as an ErrorRecord, so keep it
-            # non-terminating here and parse the script's JSON result below.
+            # Keep native stderr non-terminating and classify the JSON result below.
             $ErrorActionPreference = 'Continue'
             $output = @(& $powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $script @Arguments 2>&1)
             $exitCode = $LASTEXITCODE
