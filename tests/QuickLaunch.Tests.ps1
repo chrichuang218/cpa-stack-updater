@@ -13,12 +13,14 @@ $initialize = [System.IO.File]::ReadAllText((Join-Path $repo 'skills\cpa-safe-up
 
 Assert-True ($bootstrap -match 'Start-CPA-Stack\.ps1') 'Quick launch delegates directly to the bundled starter instead of the full transaction CLI'
 Assert-True ($bootstrap -match '(?s)\$starterParameters\s*=\s*@\{.+Fast\s*=\s*\$true.+ReturnResult\s*=\s*\$true') 'Quick launch explicitly selects the direct fast-start contract'
+Assert-True ($bootstrap -match 'Restart\s*=\s*\$true') 'Quick launch restarts configured services instead of reusing them'
 Assert-True ($bootstrap -match '&\s+\$starter\s+@starterParameters') 'Quick launch invokes the bundled starter with named parameter splatting'
 Assert-True ($bootstrap -match 'InteractiveProgress\s*=\s*\$interactiveConsole') 'Interactive quick launch streams stage output from the same visible PowerShell process'
 Assert-False ($bootstrap -match '\b(?:Start-Job|Start-Process)\b') 'Quick launch does not create a second PowerShell host'
 Assert-False ($bootstrap -match 'scripts\\cpa-stack\.ps1') 'Quick launch bypasses full cpa-stack start preflight'
 Assert-True ($starter -match 'function Write-CpaStackStartProgress') 'Bundled starter emits progress through a protocol-safe file channel'
 Assert-True ($starter -match '\[switch\]\$Fast') 'Bundled starter exposes an explicit fast mode'
+Assert-True ($starter -match '\[switch\]\$Restart') 'Bundled starter exposes an explicit quick-launch restart mode'
 Assert-True ($common -match 'function Get-CpaStackCanonicalBootstrapBytes') 'Runtime launcher synchronization renders the fast bootstrap contract'
 Assert-True ($common -match "installer\\Start-CPA-Stack\.bootstrap\.ps1") 'Runtime launcher synchronization uses the canonical bootstrap template'
 Assert-False ($upgrade -match "Sync-CpaStackCanonicalLauncher.+Start-CPA-Stack\.ps1") 'Runtime upgrades do not replace the bootstrap with the full starter'
@@ -26,5 +28,14 @@ Assert-True ($initialize -match 'WriteAllBytes\(\$newStartScript, \(Get-CpaStack
 foreach ($stage in @('Validating stack configuration', 'Checking CPA API', 'Checking Manager')) {
     Assert-True ($starter.Contains($stage)) "Bundled starter reports the '$stage' stage"
 }
+foreach ($stage in @('Stopping CPA API (PID', 'Stopping Manager (PID', 'Opening management page...')) {
+    Assert-True ($starter.Contains($stage)) "Bundled starter reports the '$stage' stage"
+}
+Assert-True ($starter -match 'PreviousProcessId') 'Fast restart results preserve the old process identity'
+Assert-False ($bootstrap.Contains('Old CPA API')) 'Quick launch does not duplicate the previous CPA identity in the summary'
+foreach ($stage in @('Starting CPA API', 'Starting Manager')) {
+    Assert-True ($starter.Contains($stage)) "Bundled starter reports the '$stage' stage"
+}
+Assert-True ($bootstrap.Contains('Restarting CPA + Manager...')) 'Quick launch states the restart intent once'
 
 'Quick launch tests passed.'

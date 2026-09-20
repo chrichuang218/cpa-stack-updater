@@ -99,7 +99,7 @@ Windows 定时任务应使用 `pwsh.exe -NoLogo -NoProfile -NonInteractive -Exec
 
 `Check` 严格零写入，状态包括 `Absent`、`Matching`、`Drifted`、`Adoptable`、`Conflict`。`Ensure` 使用 staging、复读和原子提交，自动备份并接管可识别的旧 CPA 快捷方式；未知冲突不会覆盖。`upgrade` 成功后自动对默认路径执行一次 Ensure，失败只追加 warning，不回滚已成功的运行时升级。
 
-未传 `-ShortcutPath` 时使用当前用户桌面的 `CPA 本地启动.lnk`。快捷方式仅使用 PowerShell 7 (`pwsh.exe`)，未安装时明确报错，只保留一个可见窗口。canonical bootstrap 直接调用 bundled starter 的 Fast 模式，不执行 CLI `start` 的 ACL、hash、state、端口健康或 Manager readiness 预检；进程存在时立即复用，缺失时直接启动。旧的 `CPA 本地启动（新版）.lnk` 在新名称成功建立后自动清理。
+未传 `-ShortcutPath` 时使用当前用户桌面的 `CPA 本地启动.lnk`。快捷方式仅使用 PowerShell 7 (`pwsh.exe`)，未安装时明确报错，只保留一个可见窗口。canonical bootstrap 直接调用 bundled starter 的 Fast + Restart 模式，不执行 CLI `start` 的 ACL、hash、state、端口健康或 Manager readiness 预检；同路径 CPA/Manager 进程会先停止再重新启动。旧的 `CPA 本地启动（新版）.lnk` 在新名称成功建立后自动清理。
 
 ## installer
 

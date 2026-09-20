@@ -154,7 +154,7 @@ pwsh.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli shortcut `
   -Action Ensure -Root $root -Json
 ```
 
-The shortcut uses the bundled icon and keeps one visible PowerShell 7 (`pwsh.exe`) window. Missing PS7 is an error; there is no PS5 fallback. The desktop entry runs the Fast starter directly: no ACL, hash, state, port-health, or Manager-readiness preflight is performed. Configured processes are reused immediately; missing processes are launched directly before the management page opens. Full checks remain in CLI `start` and update transactions. Recognizable legacy CPA shortcuts are backed up and adopted automatically; unknown unrelated conflicts are never overwritten.
+The shortcut uses the bundled icon and keeps one visible PowerShell 7 (`pwsh.exe`) window. Missing PS7 is an error; there is no PS5 fallback. The desktop entry runs the Fast starter directly: no ACL, hash, state, port-health, or Manager-readiness preflight is performed. Processes launched from the configured CPA and Manager executables are stopped and restarted before the management page opens. Full checks remain in CLI `start` and update transactions. Recognizable legacy CPA shortcuts are backed up and adopted automatically; unknown unrelated conflicts are never overwritten.
 
 ## Structured result (developer reference)
 

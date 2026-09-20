@@ -179,7 +179,7 @@ pwsh.exe -NoProfile -ExecutionPolicy Bypass -File $cpaCli shortcut `
   -Action Ensure -Root $root -Json
 ```
 
-快捷方式使用内置图标，只保留一个可见的 PowerShell 窗口，仅使用 PowerShell 7 (`pwsh.exe`)，未安装时明确报错。桌面入口直接运行 Fast starter：不执行 ACL、hash、状态、端口健康或 Manager readiness 预检；已配置进程存在时立即复用，缺失时直接拉起并打开管理页面。完整检查只保留在 CLI `start` 与更新事务中。可识别的旧 CPA 快捷方式会先备份再自动接管；未知无关冲突不会被覆盖。
+快捷方式使用内置图标，只保留一个可见的 PowerShell 窗口，仅使用 PowerShell 7 (`pwsh.exe`)，未安装时明确报错。桌面入口直接运行 Fast starter：不执行 ACL、hash、状态、端口健康或 Manager readiness 预检；同路径 CPA/Manager 进程会先停止再重新拉起并打开管理页面。完整检查只保留在 CLI `start` 与更新事务中。可识别的旧 CPA 快捷方式会先备份再自动接管；未知无关冲突不会被覆盖。
 
 ## 结构化返回格式（开发者）
 

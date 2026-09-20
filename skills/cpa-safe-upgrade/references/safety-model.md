@@ -51,7 +51,7 @@ Manager online backup 必须可生成、可重新打开并通过 `quick_check`�
 
 候选与正式服务进程使用最小环境变量白名单，只保留 Windows 运行必需项和不含 userinfo/query/fragment 的代理 URL、TLS 路径；带内嵌账号口令的代理变量会被丢弃，也不会继承其他无关会话变量。loopback 只限制入站监听；经官方 release 与 hash 验证的二进制仍可通过当前网络或安全代理出站，它不是 AppContainer 或防火墙沙箱。
 
-长驻进程通过 Windows handle-list 白名单以无控制台窗口方式启动，只继承三个指向 `NUL` 的 stdin/stdout/stderr。父 PowerShell 的输出管道、文件和 secret 句柄不得传入服务，CLI 返回也不得依赖长驻服务退出。canonical 快捷方式只保留一个可见且 `-NoExit` 的 PowerShell，并在同一进程直接运行 Fast starter；Fast 不执行事务级 ACL、hash、state 或健康门禁，完整检查保留在 CLI `start`、迁移、恢复与升级路径。
+长驻进程通过 Windows handle-list 白名单以无控制台窗口方式启动，只继承三个指向 `NUL` 的 stdin/stdout/stderr。父 PowerShell 的输出管道、文件和 secret 句柄不得传入服务，CLI 返回也不得依赖长驻服务退出。canonical 快捷方式只保留一个可见且 `-NoExit` 的 PowerShell，并在同一进程直接运行 Fast starter；桌面 Fast + Restart 按配置路径停止并重新拉起进程，不执行事务级 ACL、hash、state 或健康门禁，完整检查保留在 CLI `start`、迁移、恢复与升级路径。
 
 ## Secret 边界
 

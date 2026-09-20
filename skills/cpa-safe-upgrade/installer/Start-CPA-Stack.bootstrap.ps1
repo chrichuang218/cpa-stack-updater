@@ -39,12 +39,13 @@ if ($interactiveConsole) {
     Write-Host ''
     Write-Host '  CPA STACK' -ForegroundColor Cyan
     Write-Host '  ----------------------------------------' -ForegroundColor DarkCyan
-    Write-Host '  Checking and starting CPA + Manager...' -ForegroundColor Gray
+    Write-Host '  Restarting CPA + Manager...' -ForegroundColor Gray
     Write-Host ''
 }
 
 $starterParameters = @{
     Fast = $true
+    Restart = $true
     ReturnResult = $true
     ConfigPath = Join-Path $stackRoot 'config\stack.psd1'
     NoBrowser = [bool]$NoBrowser
@@ -62,14 +63,15 @@ if (-not $interactiveConsole) {
 if ($exitCode -eq 0) {
     $start = if ($null -ne $document.PSObject.Properties['start']) { $document.start } else { $document }
     if ($null -ne $start) {
-        Write-Host ("  CPA API  : {0} (port {1})" -f $start.Cpa.Action, $start.Cpa.Port) -ForegroundColor Green
-        Write-Host ("  Manager  : {0} (port {1})" -f $start.Manager.Action, $start.Manager.Port) -ForegroundColor Green
+        Write-Host ''
+        Write-Host ("  CPA API  : {0} (PID {1}, port {2})" -f $start.Cpa.Action, $start.Cpa.ProcessId, $start.Cpa.Port) -ForegroundColor Green
+        Write-Host ("  Manager  : {0} (PID {1}, port {2})" -f $start.Manager.Action, $start.Manager.ProcessId, $start.Manager.Port) -ForegroundColor Green
         Write-Host ("  Browser  : {0}" -f $start.Browser) -ForegroundColor DarkGray
     }
     try { $Host.UI.RawUI.WindowTitle = 'CPA Stack - Running' } catch {}
     Write-Host ''
     Write-Host '  [OK] CPA Stack is ready' -ForegroundColor Green
-    Write-Host '  You may close this window; services will keep running.' -ForegroundColor DarkGray
+    Write-Host '  You can close this window; services keep running.' -ForegroundColor DarkGray
     Write-Host ''
 } else {
     $message = if ($null -ne $document -and $null -ne $document.Error) { [string]$document.Error.Message } else { (($output | ForEach-Object { [string]$_ }) -join ' ') }

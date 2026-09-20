@@ -57,6 +57,7 @@ param(
     [scriptblock]$StartedProcessRegistration,
     [switch]$InProcess,
     [switch]$Fast,
+    [switch]$Restart,
     [switch]$InteractiveProgress,
     [switch]$ReturnResult
 )
@@ -72,7 +73,11 @@ function Write-CpaStackStartProgress {
     param([Parameter(Mandatory = $true)][string]$Message)
 
     if ($InteractiveProgress) {
-        $color = if ($Message -match '^ERROR:') { 'Red' } elseif ($Message -match 'ready:|opened\.$') { 'Green' } else { 'Gray' }
+        $color = if ($Message -match '^ERROR:') { 'Red' }
+        elseif ($Message -match '^Stopping ') { 'Yellow' }
+        elseif ($Message -match '^Starting ') { 'Cyan' }
+        elseif ($Message -match '^Opening ') { 'Gray' }
+        else { 'DarkGray' }
         Write-Host ('  ' + $Message) -ForegroundColor $color
     }
 }
@@ -1054,46 +1059,95 @@ function Get-CpaStackFastExpectedProcess {
     param([Parameter(Mandatory = $true)][string]$ExecutablePath)
 
     $name = [System.IO.Path]::GetFileNameWithoutExtension($ExecutablePath)
+    $matching = @()
     foreach ($process in @(Get-Process -Name $name -ErrorAction SilentlyContinue)) {
         try {
             if ([string]::Equals([System.IO.Path]::GetFullPath($process.Path), [System.IO.Path]::GetFullPath($ExecutablePath), [System.StringComparison]::OrdinalIgnoreCase)) {
-                return $process
+                $matching += $process
             }
         } catch {}
     }
-    return $null
+    return $matching
+}
+
+function Stop-CpaStackFastProcesses {
+    param(
+        [Parameter(Mandatory = $true)][System.Diagnostics.Process[]]$Processes,
+        [Parameter(Mandatory = $true)][string]$ExecutablePath
+    )
+
+    $expectedPath = [System.IO.Path]::GetFullPath($ExecutablePath)
+    foreach ($process in $Processes) {
+        $actualPath = [System.IO.Path]::GetFullPath($process.Path)
+        if (-not [string]::Equals($actualPath, $expectedPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw 'A process selected for quick-launch restart changed identity.'
+        }
+        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+    }
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    do {
+        $remaining = Get-CpaStackFastExpectedProcess -ExecutablePath $ExecutablePath
+        if (@($remaining).Count -eq 0) { return }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "The existing service did not exit within 10 seconds: $ExecutablePath"
 }
 
 function Ensure-CpaServiceFast {
-    param([Parameter(Mandatory = $true)]$Settings)
+    param(
+        [Parameter(Mandatory = $true)]$Settings,
+        [switch]$Restart
+    )
 
-    $existing = Get-CpaStackFastExpectedProcess -ExecutablePath $Settings.Cpa.Executable
-    if ($null -ne $existing) {
-        return [pscustomobject]@{ Action = 'Reused'; ProcessId = $existing.Id }
+    $existing = @(Get-CpaStackFastExpectedProcess -ExecutablePath $Settings.Cpa.Executable)
+    if ($existing.Count -gt 0 -and -not $Restart) {
+        return [pscustomobject]@{ Action = 'Reused'; ProcessId = $existing[0].Id }
     }
+    if ($existing.Count -gt 0) {
+        Write-CpaStackStartProgress -Message ("Stopping CPA API (PID {0}, port {1})..." -f (($existing | ForEach-Object { $_.Id }) -join ', '), $Settings.Cpa.Port)
+        Stop-CpaStackFastProcesses -Processes $existing -ExecutablePath $Settings.Cpa.Executable
+    }
+    Write-CpaStackStartProgress -Message 'Starting CPA API...'
     $arguments = '-config "{0}"' -f $Settings.Cpa.Config
     $process = Start-ManagedProcess -FilePath $Settings.Cpa.Executable -Arguments $arguments `
         -WorkingDirectory $Settings.Cpa.WorkingDirectory -ProcessRegistration $StartedProcessRegistration
-    return [pscustomobject]@{ Action = 'Started'; ProcessId = $process.Id }
+    return [pscustomobject]@{
+        Action = $(if ($existing.Count -gt 0) { 'Restarted' } else { 'Started' })
+        ProcessId = $process.Id
+        PreviousProcessId = $(if ($existing.Count -gt 0) { ($existing | ForEach-Object { $_.Id }) -join ',' } else { $null })
+    }
 }
 
 function Ensure-ManagerServiceFast {
     param(
         [Parameter(Mandatory = $true)]$Settings,
-        [Parameter(Mandatory = $true)][string]$SecretsPath
+        [Parameter(Mandatory = $true)][string]$SecretsPath,
+        [switch]$Restart
     )
 
-    $existing = Get-CpaStackFastExpectedProcess -ExecutablePath $Settings.Manager.Executable
-    if ($null -ne $existing) {
-        return [pscustomobject]@{ Action = 'Reused'; ProcessId = $existing.Id }
+    $existing = @(Get-CpaStackFastExpectedProcess -ExecutablePath $Settings.Manager.Executable)
+    if ($existing.Count -gt 0 -and -not $Restart) {
+        return [pscustomobject]@{ Action = 'Reused'; ProcessId = $existing[0].Id }
     }
+    if ($existing.Count -gt 0) {
+        Write-CpaStackStartProgress -Message ("Stopping Manager (PID {0}, port {1})..." -f (($existing | ForEach-Object { $_.Id }) -join ', '), $Settings.Manager.Port)
+        Stop-CpaStackFastProcesses -Processes $existing -ExecutablePath $Settings.Manager.Executable
+    }
+    Write-CpaStackStartProgress -Message 'Starting Manager...'
     $secrets = Import-ProtectedSecrets -Path $SecretsPath
     $process = Start-ManagerProcess -Settings $Settings -AdminKey $secrets.managerAdminKey
-    return [pscustomobject]@{ Action = 'Started'; ProcessId = $process.Id }
+    return [pscustomobject]@{
+        Action = $(if ($existing.Count -gt 0) { 'Restarted' } else { 'Started' })
+        ProcessId = $process.Id
+        PreviousProcessId = $(if ($existing.Count -gt 0) { ($existing | ForEach-Object { $_.Id }) -join ',' } else { $null })
+    }
 }
 
 try {
     $recoveryAuthorized = $false
+    if ($Restart -and -not $Fast) {
+        throw '-Restart requires -Fast.'
+    }
     if ($null -ne $StartedProcessRegistration -and -not $InProcess) {
         throw '-StartedProcessRegistration is reserved for in-process callers.'
     }
@@ -1136,27 +1190,28 @@ try {
     }
     $SecretsPath = [System.IO.Path]::GetFullPath($SecretsPath)
 
-    Write-CpaStackStartProgress -Message $(if ($Fast) { 'Starting CPA API...' } else { 'Checking CPA API...' })
+    if (-not $Fast) {
+        Write-CpaStackStartProgress -Message 'Checking CPA API...'
+    }
     if ($Fast) {
-        $cpaResult = Ensure-CpaServiceFast -Settings $settings
+        $cpaResult = Ensure-CpaServiceFast -Settings $settings -Restart:$Restart
     } else {
         $secrets = Import-ProtectedSecrets -Path $SecretsPath
         $cpaResult = Ensure-CpaService -Settings $settings -ApiKey $secrets.cpaClientApiKey
     }
-    Write-CpaStackStartProgress -Message ("CPA API ready: {0} (port {1})" -f $cpaResult.Action, $settings.Cpa.Port)
-    Write-CpaStackStartProgress -Message $(if ($Fast) { 'Starting Manager...' } else { 'Checking Manager...' })
     if ($Fast) {
-        $managerResult = Ensure-ManagerServiceFast -Settings $settings -SecretsPath $SecretsPath
+        $managerResult = Ensure-ManagerServiceFast -Settings $settings -SecretsPath $SecretsPath -Restart:$Restart
     } else {
         $managerResult = Ensure-ManagerService -Settings $settings -Secrets $secrets
     }
-    Write-CpaStackStartProgress -Message ("Manager ready: {0} (port {1})" -f $managerResult.Action, $settings.Manager.Port)
-
+    if (-not $Fast) {
+        Write-CpaStackStartProgress -Message 'Checking Manager...'
+    }
     $browserAction = 'Skipped'
     if (-not $NoBrowser) {
         Open-ManagerBrowser -Settings $settings
         $browserAction = 'Opened'
-        Write-CpaStackStartProgress -Message 'Management page opened.'
+        Write-CpaStackStartProgress -Message 'Opening management page...'
     }
 
     $modelCount = if ($Fast) { $null } else { $cpaResult.Health.ModelCount }
@@ -1167,6 +1222,7 @@ try {
         Cpa = [pscustomobject]@{
             Action = $cpaResult.Action
             ProcessId = $cpaResult.ProcessId
+            PreviousProcessId = $cpaResult.PreviousProcessId
             Port = $settings.Cpa.Port
             Executable = $settings.Cpa.Executable
             ModelCount = $modelCount
@@ -1174,6 +1230,7 @@ try {
         Manager = [pscustomobject]@{
             Action = $managerResult.Action
             ProcessId = $managerResult.ProcessId
+            PreviousProcessId = $managerResult.PreviousProcessId
             Port = $settings.Manager.Port
             Executable = $settings.Manager.Executable
             DataDirectory = $settings.Manager.DataDirectory

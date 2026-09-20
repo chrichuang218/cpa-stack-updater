@@ -95,7 +95,7 @@ managed root 优先使用用户明确给出的 `-Root`，否则让 CLI 按 `CPA_
 & $cpaCli shortcut -Action Ensure -Root '<managed root>' -Json
 ```
 
-默认路径是当前用户桌面的 `CPA 本地启动.lnk`。Ensure 自动创建、修复 drift，或备份并接管可识别的旧 CPA 启动方式；旧的 `CPA 本地启动（新版）.lnk` 在新名称成功建立后自动清理，完全无关的未知冲突仍明确失败且不覆盖。生成的快捷方式仅使用 PowerShell 7 (`pwsh.exe`)，未安装时明确报错，只保留一个可见窗口。canonical bootstrap 直接调用 bundled starter 的 Fast 模式，不执行 `cpa-stack status/start`、ACL、hash、端口健康或 Manager readiness 预检；进程存在时立即复用，缺失时直接启动并打开页面。完整检查只在 CLI `start` 和更新事务中执行。
+默认路径是当前用户桌面的 `CPA 本地启动.lnk`。Ensure 自动创建、修复 drift，或备份并接管可识别的旧 CPA 启动方式；旧的 `CPA 本地启动（新版）.lnk` 在新名称成功建立后自动清理，完全无关的未知冲突仍明确失败且不覆盖。生成的快捷方式仅使用 PowerShell 7 (`pwsh.exe`)，未安装时明确报错，只保留一个可见窗口。canonical bootstrap 直接调用 bundled starter 的 Fast + Restart 模式，不执行 `cpa-stack status/start`、ACL、hash、端口健康或 Manager readiness 预检；同路径 CPA/Manager 进程会先停止再启动并打开页面。完整检查只在 CLI `start` 和更新事务中执行。
 
 只有用户明确要求只读审计快捷方式时才执行：
 
