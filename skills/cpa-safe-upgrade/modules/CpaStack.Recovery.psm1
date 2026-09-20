@@ -183,13 +183,15 @@ function Invoke-CpaStackRecovery {
         default { throw "Unexpected recovery kind: $($plan.Kind)" }
     }
     $run = Invoke-CpaStackBundled -HostAdapter $HostAdapter -Name $script -Arguments $arguments
+    $warnings = @()
+    if ((Get-CpaStackValue -Object $run.Json -Name 'checkpointWarning') -eq 'CheckpointWriteFailed') { $warnings += 'Recovery progress could not be persisted.' }
     if ($null -eq $run.Json -or $run.ExitCode -ne 0 -or -not [bool](Get-CpaStackValue -Object $run.Json -Name 'success' -Default $false)) {
         $innerError = if ($null -eq $run.Json) { $null } else { Get-CpaStackValue -Object $run.Json -Name 'error' }
         $failureError = ConvertTo-CpaStackError -InputObject $innerError -Run $run -DefaultCode 'RecoveryFailed' `
             -DefaultMessage 'Recovery failed.' -DefaultPhase 'recovery'
         if ($null -ne $run.Json) { Set-CpaStackValue -Object $run.Json -Name 'error' -Value $failureError }
         return New-CpaStackResult -Operation recover -Success $false -Outcome ManualRecoveryRequired -Changed $false -Root $Root `
-            -Error $failureError `
+            -Error $failureError -Warnings $warnings `
             -Extensions ([ordered]@{ recovery = $run.Json; recoveryKind = $plan.Kind; pendingArtifacts = @($plan.Artifacts) })
     }
 
@@ -208,11 +210,12 @@ function Invoke-CpaStackRecovery {
                 -Message 'Recovery returned but the stack is unhealthy or still has pending artifacts.' -Phase 'verification'
         }
         return New-CpaStackResult -Operation recover -Success $false -Outcome ManualRecoveryRequired -Changed $true -Root $Root -Recovered $false `
-            -Error $failureError `
+            -Error $failureError -Warnings $warnings `
             -Extensions ([ordered]@{ recovery = $run.Json; recoveryKind = $plan.Kind; state = $verifiedState; pendingArtifacts = @($remaining) })
     }
     $recoveryRolledBack = [bool](Get-CpaStackValue -Object $run.Json -Name 'rolledBack' -Default $false)
     return New-CpaStackResult -Operation recover -Success $true -Outcome Changed -Changed $true -Root $Root -Recovered $true -RolledBack $recoveryRolledBack `
+        -Warnings $warnings `
         -Extensions ([ordered]@{ recovery = $run.Json; recoveryKind = $plan.Kind; state = $verifiedState })
 }
 

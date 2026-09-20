@@ -36,6 +36,7 @@ $result = [ordered]@{
     journalCleanupWarning = $null
     cleanupWarning = $null
     diagnostics = @()
+    setupRetries = [System.Collections.Generic.List[object]]::new()
     error = $null
 }
 $operationMutex = $null
@@ -50,6 +51,17 @@ function Add-UpgradeDiagnostic {
 
     # Append instead of replacing: a successful recovery must not erase the failed probe.
     $result.diagnostics += $Diagnostic
+}
+
+function Write-UpgradeCheckpoint {
+    param([string]$Phase)
+
+    # Checkpoints never replace validation: invalid/foreign recovery artifacts must
+    # remain untouched. Once validated, persist progress before destructive work.
+    if ($suppressResultPersistence -or $null -eq $operationMutex -or $null -eq $instanceMarker) { return }
+    $result['phase'] = $Phase
+    try { Write-CpaStackJson -Value $result -Path $resultPath }
+    catch { $result['checkpointWarning'] = 'CheckpointWriteFailed' }
 }
 
 function Invoke-ChildPowerShellJson {
@@ -285,6 +297,7 @@ function Set-UpgradeJournalPhase {
     $script:upgradeJournal.phase = $Phase
     $script:upgradeJournal.updatedAt = (Get-Date).ToString("o")
     Write-CpaStackJson -Value $script:upgradeJournal -Path $upgradeJournalPath
+    Write-UpgradeCheckpoint -Phase $Phase
 }
 
 function Read-StableUpgradeJournalFile {
@@ -592,7 +605,7 @@ function Recover-UpgradePreparationState {
     $trustedManager = Assert-TrustedCanonicalManagerListener -ManagerRuntime $ManagerRuntime
     $secrets = Get-CpaStackSecrets -ControlRoot $ControlRoot
     $baseline = $journal.managerBaseline
-    [void](Set-CpaStackManagerCollector -ManagerPort $trustedManager.Port -CpaPort ([int]$trustedManager.Stack.Cpa.Port) -ManagerAdminKey $secrets.managerAdminKey -CpaManagementKey $secrets.cpaManagementKey -Enabled ([bool]$baseline.collectorEnabled) -Baseline $baseline)
+    [void](Set-CpaStackManagerCollector -ManagerPort $trustedManager.Port -CpaPort ([int]$trustedManager.Stack.Cpa.Port) -ManagerAdminKey $secrets.managerAdminKey -CpaManagementKey $secrets.cpaManagementKey -Enabled ([bool]$baseline.collectorEnabled) -Baseline $baseline -RetryDiagnostics $result.setupRetries)
     [void](Assert-CpaStackManagerSetupBaseline -ManagerPort $trustedManager.Port -ManagerAdminKey $secrets.managerAdminKey -Expected $baseline)
     [void](Wait-CpaStackTrustedListener -Port $trustedManager.Port -ExpectedPath $trustedManager.Exe -ExpectedProcessId $trustedManager.Listener.ProcessId -ExpectedHash $trustedManager.Hash -AllowedAddresses @([string]$trustedManager.Stack.Manager.BindAddress) -Seconds 2)
     Assert-ValidatedUpgradeJournalDescriptors -Validated $validatedJournal
@@ -850,7 +863,7 @@ function Restore-CanonicalInterruptedState {
         )
 
         $recorded = $RecordedHash.ToUpperInvariant()
-        $active = $ActiveHash.ToUpperInvariant()
+        $active = ([string]$ActiveHash).ToUpperInvariant()
         $old = $OldHash.ToUpperInvariant()
         $new = $NewHash.ToUpperInvariant()
         $targetProcessValue = Get-RequiredJournalProperty -Journal $Journal -Name 'targetProcessId' -JournalPath $JournalPath
@@ -875,12 +888,23 @@ function Restore-CanonicalInterruptedState {
                 }
             }
             'source-stopped' {
-                if ($recorded -ne $old -or $active -notin @($old, $new) -or $targetProcessId -ne 0) {
+                $missingCpa = ($Component -eq 'cpa' -and $active -eq '')
+                if ($recorded -ne $old -or ($active -notin @($old, $new) -and -not $missingCpa) -or $targetProcessId -ne 0) {
                     throw "$Component source-stopped recovery phase is inconsistent with the recorded runtime."
                 }
             }
+            'rolling-back' {
+                if ($Component -ne 'cpa' -or $recorded -ne $old -or $active -notin @('', $old, $new) -or
+                    [string]::IsNullOrWhiteSpace($PendingPath) -or $targetProcessId -lt 0) {
+                    throw 'CPA rollback phase is not bound to the recorded old runtime and backup.'
+                }
+            }
             { $_ -in @('target-started', 'runtime-verified') } {
-                if ($recorded -notin @($old, $new) -or $active -ne $new -or
+                # Rollback may have restored the CPA executable before a crash, while
+                # its late switch journal is still present. Recopy the validated backup;
+                # an old executable alone never proves the whole runtime is restored.
+                $restoredCpa = ($Component -eq 'cpa' -and $recorded -eq $old -and $active -eq $old)
+                if ($recorded -notin @($old, $new) -or ($active -ne $new -and -not $restoredCpa) -or
                     [string]::IsNullOrWhiteSpace($PendingPath) -or $targetProcessId -lt 1) {
                     throw "$Component $Phase recovery phase is not bound to the active new runtime and canonical backup."
                 }
@@ -910,7 +934,7 @@ function Restore-CanonicalInterruptedState {
 
         $phase = [string](Get-RequiredJournalProperty -Journal $journal -Name 'phase' -JournalPath $JournalPath)
         $allowedPhases = if ($ExpectedOperation -eq 'switch-cpa') {
-            @('prepared', 'source-stopped', 'target-started', 'runtime-verified')
+            @('prepared', 'source-stopped', 'target-started', 'runtime-verified', 'rolling-back')
         } else {
             @('prepared', 'collector-disabled', 'source-stopped', 'target-started', 'runtime-verified')
         }
@@ -937,7 +961,9 @@ function Restore-CanonicalInterruptedState {
             throw "Switch recovery journal hashes are invalid in $JournalPath"
         }
         $activeHash = Get-CpaStackFileHash -Path $canonicalExecutable
-        if ($activeHash -notmatch '^[0-9A-Fa-f]{64}$') { throw "Canonical $component executable is missing during recovery validation." }
+        $missingCpaExecutable = ($component -eq 'cpa' -and $phase -in @('source-stopped', 'rolling-back') -and
+            -not (Test-Path -LiteralPath $canonicalExecutable))
+        if ($activeHash -notmatch '^[0-9A-Fa-f]{64}$' -and -not $missingCpaExecutable) { throw "Canonical $component executable is missing during recovery validation." }
 
         if ($ExpectedOperation -eq 'switch-cpa') {
             Assert-RecoveryPathEquals `
@@ -1050,7 +1076,7 @@ function Restore-CanonicalInterruptedState {
                 }
             }
             $phaseOrder = if ($component -eq 'cpa') {
-                @('prepared', 'source-stopped', 'target-started', 'runtime-verified')
+                @('prepared', 'source-stopped', 'target-started', 'runtime-verified', 'rolling-back')
             } else {
                 @('prepared', 'collector-disabled', 'source-stopped', 'target-started', 'runtime-verified')
             }
@@ -1058,18 +1084,18 @@ function Restore-CanonicalInterruptedState {
             $currentPhaseIndex = [array]::IndexOf($phaseOrder, $phase)
             $previousPhaseIndex = [array]::IndexOf($phaseOrder, $previousPhase)
             if ($previousPhaseIndex -lt 0 -or $previousPhaseIndex -gt $currentPhaseIndex -or
-                ($currentPhaseIndex - $previousPhaseIndex) -gt 1) {
+                (($currentPhaseIndex - $previousPhaseIndex) -gt 1 -and $phase -ne 'rolling-back')) {
                 throw "Previous switch journal phase '$previousPhase' is not a legal predecessor of '$phase'."
             }
         }
 
         Assert-SwitchPhaseState -Component $component -Phase $phase -RecordedHash $recordedHash -ActiveHash $activeHash `
             -OldHash $oldHash -NewHash $newHash -PendingPath $pendingFull -Journal $journal -JournalPath $JournalPath
-        $disposition = Resolve-CpaStackSwitchDisposition `
+        $disposition = if ($missingCpaExecutable) { 'restore-old' } else { Resolve-CpaStackSwitchDisposition `
             -RecordedHash $recordedHash `
             -ActiveHash $activeHash `
             -OldHash $oldHash `
-            -NewHash $newHash
+            -NewHash $newHash }
 
         if (-not $pendingFull) {
             return [pscustomobject]@{
@@ -1097,6 +1123,10 @@ function Restore-CanonicalInterruptedState {
             }
         }
         if (-not $backupPath) {
+            if ($component -eq 'cpa' -and ($missingCpaExecutable -or $phase -eq 'rolling-back' -or
+                ($phase -in @('target-started', 'runtime-verified') -and $recordedHash -ieq $oldHash -and $activeHash -ieq $oldHash))) {
+                throw 'Resuming an interrupted CPA rollback requires its validated canonical backup.'
+            }
             return [pscustomobject]@{
                 Journal = $journal
                 Backup = $null
@@ -1214,14 +1244,42 @@ function Restore-CanonicalInterruptedState {
         return
     }
 
-    if ($cpaRecovery) {
+    $restoreCpaFiles = ($null -ne $cpaRecovery -and $cpaDisposition -eq 'restore-old' -and $null -ne $cpaRecovery.Backup)
+    if ($restoreCpaFiles) {
+        $activePayload = Get-CpaStackTreeManifest -Root $CpaRuntime -ExcludeDirectoryNames @('auth', 'plugins') -ExcludeFileNames @('config.yaml', 'server.log')
+        $backupPayload = Get-CpaStackTreeManifest -Root (Join-Path $cpaRecovery.Backup.FullName 'runtime') -ExcludeFileNames @('server.log')
+        $restoreCpaFiles = ($activePayload.sha256 -cne $backupPayload.sha256)
+    }
+    $cpaNeedsStart = ($restoreCpaFiles -or $null -eq (Get-CpaStackListener -Port $cpaFormalPort))
+    if ($cpaNeedsStart) {
+        Write-UpgradeCheckpoint -Phase 'validating-preserved-cpa-trees'
+        foreach ($path in @($CpaRuntime, $canonicalCpaConfig, (Join-Path $CpaRuntime 'cli-proxy-api.exe'))) {
+            Assert-CpaStackPathNoReparseAncestors -Path $path -Description 'Canonical CPA recovery path'
+        }
+        $portMatch = [regex]::Matches([System.IO.File]::ReadAllText($canonicalCpaConfig, [System.Text.UTF8Encoding]::new($false, $true)), '(?m)^port:\s*(\d+)\s*(?:#.*)?$')
+        if ($portMatch.Count -ne 1 -or [int]$portMatch[0].Groups[1].Value -ne $cpaFormalPort) { throw 'Recovered CPA configuration port does not match the canonical port.' }
+        $bindAddress = Get-CpaStackConfigHost -ConfigPath $canonicalCpaConfig
+        $cpaConfigHash = Get-CpaStackFileHash -Path $canonicalCpaConfig
+        # Preserved trees are not copied or modified by recovery. Validate them while
+        # the old service is still running, then recheck their roots in the outage window.
+        Assert-CpaStackPrivateTree -Root (Join-Path $CpaRuntime 'auth') -Description 'Preserved CPA auth' -AllowInheritedDescendants
+        $plugins = Join-Path $CpaRuntime 'plugins'
+        if (Test-Path -LiteralPath $plugins) { Assert-CpaStackPrivateTree -Root $plugins -Description 'Preserved CPA plugins' }
+    }
+    if ($restoreCpaFiles) {
         if ($cpaRecovery.Backup) {
             Assert-CpaStackProjectedTreePathBudget -Source (Join-Path $cpaRecovery.Backup.FullName 'runtime') -Destination $CpaRuntime
         }
+        if ((Get-CpaStackFileHash -Path $canonicalCpaConfig) -cne $cpaConfigHash) { throw 'CPA configuration changed before recovery could stop the service.' }
         Assert-RecoveryDescriptors -Recovery $cpaRecovery -IncludeBackup
+        $cpaRecovery.Journal.phase = 'rolling-back'
+        Write-CpaStackJson -Value $cpaRecovery.Journal -Path $cpaJournalPath
+        $cpaRecovery = Read-ValidatedPending -JournalPath $cpaJournalPath -ExpectedOperation 'switch-cpa'
+        if ($cpaRecovery.ValidationError -or -not $cpaRecovery.Backup) { throw 'CPA rollback backup changed before stopping the service.' }
+        Write-UpgradeCheckpoint -Phase 'restoring-cpa-runtime'
         [void](Stop-CpaStackProcessesByExecutablePath -ExpectedPath (Join-Path $CpaRuntime 'cli-proxy-api.exe'))
     }
-    if ($managerRecovery) {
+    if ($managerRecovery -and $managerDisposition -eq 'restore-old') {
         if ($managerRecovery.Backup) {
             Assert-CpaStackProjectedTreePathBudget -Source (Join-Path $managerRecovery.Backup.FullName 'runtime') -Destination $ManagerRuntime
             Assert-CpaStackProjectedTreePathBudget -Source (Join-Path $managerRecovery.Backup.FullName 'data') -Destination $ManagerData
@@ -1282,7 +1340,7 @@ function Restore-CanonicalInterruptedState {
         }
     }
 
-    if ($cpaRecovery -and $cpaDisposition -eq 'restore-old') {
+    if ($restoreCpaFiles) {
         if (-not $cpaRecovery.Backup -and (Get-CpaStackFileHash -Path (Join-Path $CpaRuntime 'cli-proxy-api.exe')) -ne [string]$cpaRecovery.Journal.oldHash) {
             throw "CPA must be rolled back, but its validated backup is unavailable. $($cpaRecovery.ValidationError)"
         }
@@ -1311,23 +1369,32 @@ function Restore-CanonicalInterruptedState {
         }
     }
 
-    if ($cpaRecovery) {
+    if ($cpaNeedsStart) {
         Protect-CpaStackPrivateDirectory -Path $CpaRuntime
         Protect-CpaStackSecretFile -Path (Join-Path $CpaRuntime 'cli-proxy-api.exe')
         Protect-CpaStackSecretFile -Path $canonicalCpaConfig
-        Protect-CpaStackPrivateTree -Root (Join-Path $CpaRuntime 'auth')
+        Assert-CpaStackPrivateTree -Root (Join-Path $CpaRuntime 'auth') -AllowInheritedDescendants -RootOnly
         $recoveryPlugins = Join-Path $CpaRuntime 'plugins'
-        if (Test-Path -LiteralPath $recoveryPlugins) { Protect-CpaStackPrivateTree -Root $recoveryPlugins }
-    }
-
-    $recoveryPlugins = Join-Path $CpaRuntime 'plugins'
-    if (Test-Path -LiteralPath $recoveryPlugins) {
-        Assert-CpaStackPrivateTree -Root $recoveryPlugins -Description 'Preserved CPA plugins'
+        if (Test-Path -LiteralPath $recoveryPlugins) { Assert-CpaStackPrivateTree -Root $recoveryPlugins -RootOnly }
+        $cpaExe = Join-Path $CpaRuntime 'cli-proxy-api.exe'
+        $expectedHash = [string]$recordedState.cpa.sha256
+        if ((Get-CpaStackFileHash -Path $cpaExe) -ine $expectedHash) { throw 'Recovered CPA does not match the recorded executable.' }
+        if ((Get-CpaStackFileHash -Path $canonicalCpaConfig) -cne $cpaConfigHash) { throw 'CPA configuration changed during recovery.' }
+        Assert-CpaStackPathNoReparseAncestors -Path $cpaExe -Description 'Restored CPA executable'
+        Write-UpgradeCheckpoint -Phase 'starting-recovered-cpa'
+        $process = Start-CpaStackProcess -FilePath $cpaExe -Arguments "-config `"$canonicalCpaConfig`"" -WorkingDirectory $CpaRuntime -MinimalEnvironment
+        try {
+            [void](Wait-CpaStackTrustedListener -Port $cpaFormalPort -ExpectedPath $cpaExe -ExpectedProcessId $process.Id -ExpectedHash $expectedHash -AllowedAddresses @($bindAddress) -Seconds 35)
+        } catch {
+            Stop-CpaStackStartedProcess -Process $process -ExpectedPath $cpaExe
+            throw
+        } finally { $process.Dispose() }
+        Write-UpgradeCheckpoint -Phase 'recovered-cpa-listening'
     }
 
     Protect-CpaStackSecretFile -Path (Join-Path $ControlRoot 'config\stack.psd1')
     $startScript = Join-Path $PSScriptRoot "Start-CPA-Stack.ps1"
-    $started = $false
+    $started = ($null -ne (Get-CpaStackListener -Port $cpaFormalPort) -and $null -ne (Get-CpaStackListener -Port $managerFormalPort))
     $startError = $null
     for ($attempt = 1; $attempt -le 3 -and -not $started; $attempt++) {
         try {
@@ -1341,17 +1408,19 @@ function Restore-CanonicalInterruptedState {
     }
     if (-not $started) { throw "Canonical interrupted recovery could not restart the stack: $startError" }
 
-    if ($managerRecovery -and $managerRecovery.Journal.managerBaseline) {
+    if ($managerRecovery -and $managerDisposition -eq 'restore-old' -and $managerRecovery.Journal.managerBaseline) {
         $trustedManager = Assert-TrustedCanonicalManagerListener -ManagerRuntime $ManagerRuntime
         $secrets = Get-CpaStackSecrets -ControlRoot $ControlRoot
         $baseline = $managerRecovery.Journal.managerBaseline
-        [void](Set-CpaStackManagerCollector -ManagerPort $trustedManager.Port -CpaPort ([int]$trustedManager.Stack.Cpa.Port) -ManagerAdminKey $secrets.managerAdminKey -CpaManagementKey $secrets.cpaManagementKey -Enabled ([bool]$baseline.collectorEnabled) -Baseline $baseline)
+        [void](Set-CpaStackManagerCollector -ManagerPort $trustedManager.Port -CpaPort ([int]$trustedManager.Stack.Cpa.Port) -ManagerAdminKey $secrets.managerAdminKey -CpaManagementKey $secrets.cpaManagementKey -Enabled ([bool]$baseline.collectorEnabled) -Baseline $baseline -RetryDiagnostics $result.setupRetries)
         [void](Assert-CpaStackManagerSetupBaseline -ManagerPort $trustedManager.Port -ManagerAdminKey $secrets.managerAdminKey -Expected $baseline)
         [void](Wait-CpaStackTrustedListener -Port $trustedManager.Port -ExpectedPath $trustedManager.Exe -ExpectedProcessId $trustedManager.Listener.ProcessId -ExpectedHash $trustedManager.Hash -AllowedAddresses @([string]$trustedManager.Stack.Manager.BindAddress) -Seconds 2)
     }
 
+    Write-UpgradeCheckpoint -Phase 'verifying-recovered-services'
     $recoveredState = Invoke-ChildPowerShellJson -Script (Join-Path $PSScriptRoot "Get-CpaStackState.ps1") -Arguments @("-ControlRoot", $ControlRoot) -AllowNonZero
     Add-UpgradeDiagnostic (New-CpaStackHealthDiagnostic -Stage 'recovery-health' -State $recoveredState)
+    Write-UpgradeCheckpoint -Phase 'recovery-health-checked'
     if (-not $recoveredState.Cpa.Healthy -or -not $recoveredState.Manager.Healthy -or -not $recoveredState.Security.Integrity.Ready) {
         throw "Canonical services restarted but did not pass recovery health checks."
     }
@@ -1685,6 +1754,7 @@ try {
 } catch {
     $result.error = $_.Exception.Message
     Add-UpgradeDiagnostic (New-CpaStackFailureDiagnostic -Stage $diagnosticStage -Failure $_)
+    Write-UpgradeCheckpoint -Phase 'failed-before-recovery'
     $diagnosticStage = 'failure-recovery'
     $switchJournalPresent = (Test-Path -LiteralPath (Join-Path $stateDir "switch-cpa.pending.json") -PathType Leaf) -or (Test-Path -LiteralPath (Join-Path $stateDir "switch-manager.pending.json") -PathType Leaf)
     if ($switchJournalPresent) {
@@ -1713,7 +1783,8 @@ try {
         }
     }
 } finally {
-    if ((Test-Path -LiteralPath $stateDir) -and -not $suppressResultPersistence) {
+    if ($result.success) { $result['phase'] = 'completed' }
+    if ($null -ne $operationMutex -and (Test-Path -LiteralPath $stateDir) -and -not $suppressResultPersistence) {
         Write-CpaStackJson -Value $result -Path $resultPath
     }
     Exit-CpaStackOperationLock -Mutex $operationMutex

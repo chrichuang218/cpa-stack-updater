@@ -246,9 +246,10 @@ try {
             throw "CPA target executable hash does not match the candidate."
         }
         Protect-CpaStackSecretFile -Path $targetExe
-        Assert-CpaStackPrivateTree -Root $targetAuth -Description 'Preserved CPA auth' -AllowInheritedDescendants
+        # Descendants were validated before stopping; the switch never modifies them.
+        Assert-CpaStackPrivateTree -Root $targetAuth -Description 'Preserved CPA auth' -AllowInheritedDescendants -RootOnly:$sameRuntime
         if (Test-Path -LiteralPath $targetPlugins) {
-            Assert-CpaStackPrivateTree -Root $targetPlugins -Description 'Preserved CPA plugins'
+            Assert-CpaStackPrivateTree -Root $targetPlugins -Description 'Preserved CPA plugins' -RootOnly:$sameRuntime
         }
         $targetProcess = Start-CpaFormal -Exe $targetExe -Runtime $TargetRuntime -Config $targetConfig
         $journal.targetProcessId = [int]$targetProcess.Id
@@ -273,6 +274,13 @@ try {
     } catch {
         $result.success = $false
         $switchError = $_.Exception.Message
+        if ($sameRuntime) {
+            $journal.phase = 'rolling-back'
+            Write-CpaStackJson -Value $journal -Path $journalPath
+            $result.error = $switchError
+            try { Write-CpaStackJson -Value $result -Path $ResultPath }
+            catch { $result['checkpointWarning'] = 'CheckpointWriteFailed' }
+        }
         $recovered = $false
         $recoveryError = $null
         for ($attempt = 1; $attempt -le 3 -and -not $recovered; $attempt++) {
@@ -310,8 +318,13 @@ try {
                 Protect-CpaStackPrivateDirectory -Path $SourceRuntime
                 Protect-CpaStackSecretFile -Path $sourceExe
                 Protect-CpaStackSecretFile -Path $SourceConfig
-                Protect-CpaStackPrivateTree -Root $sourceAuth
-                if (Test-Path -LiteralPath $sourcePlugins) { Protect-CpaStackPrivateTree -Root $sourcePlugins }
+                if ($sameRuntime) {
+                    Assert-CpaStackPrivateTree -Root $sourceAuth -Description 'Preserved CPA auth' -AllowInheritedDescendants -RootOnly
+                    if (Test-Path -LiteralPath $sourcePlugins) { Assert-CpaStackPrivateTree -Root $sourcePlugins -RootOnly }
+                } else {
+                    Protect-CpaStackPrivateTree -Root $sourceAuth
+                    if (Test-Path -LiteralPath $sourcePlugins) { Protect-CpaStackPrivateTree -Root $sourcePlugins }
+                }
                 $sourceProcess = Start-CpaFormal -Exe $sourceExe -Runtime $SourceRuntime -Config $SourceConfig
                 [void](Test-CpaFormal -ExpectedExe $sourceExe -Config $SourceConfig -ExpectedProcessId $sourceProcess.Id -ExpectedHash $result.oldHash)
                 $recovered = $true

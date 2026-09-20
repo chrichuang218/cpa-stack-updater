@@ -2,7 +2,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('All', 'Core', 'CpaSuccess', 'CpaRollback', 'CpaHangCleanup', 'ManagerRollback', 'ManagerMigrationRollback', 'ManagerMigrationTamper', 'ManagerRecoveryGate', 'TransitionHealth', 'PendingGate', 'RecoveryJournalGuard', 'LanSuccess', 'LanRollback', 'LanRecovery', 'UpgradeCandidateRecovery', 'Maintenance', 'MaintenanceIdentity', 'MaintenanceResultWarning', 'MaintenanceLifecycle', 'MaintenanceRecovery', 'MaintenanceRollbackFailure', 'MaintenancePendingGuard', 'MaintenanceCommitRecovery')]
+    [ValidateSet('All', 'Core', 'CpaSuccess', 'CpaRollback', 'CpaHangCleanup', 'ManagerRollback', 'ManagerMigrationRollback', 'ManagerMigrationTamper', 'ManagerRecoveryGate', 'TransitionHealth', 'PendingGate', 'RecoveryJournalGuard', 'InterruptedCpaRollback', 'CpaAvailability', 'LanSuccess', 'LanRollback', 'LanRecovery', 'UpgradeCandidateRecovery', 'Maintenance', 'MaintenanceIdentity', 'MaintenanceResultWarning', 'MaintenanceLifecycle', 'MaintenanceRecovery', 'MaintenanceRollbackFailure', 'MaintenancePendingGuard', 'MaintenanceCommitRecovery')]
     [string]$Case = 'All'
 )
 
@@ -2838,7 +2838,7 @@ function Invoke-RecoveryJournalValidationGuardTest {
         $afterPreparedManager = Get-CpaStackListener -Port $fixture.ManagerPort
         Assert-True ($null -ne $afterPreparedCpa) 'Canonical prepared recovery restarts the isolated CPA'
         Assert-True ($null -ne $afterPreparedManager) 'Canonical prepared recovery leaves the isolated Manager healthy'
-        Assert-True ([int]$afterPreparedCpa.ProcessId -ne [int]$beforeCpa.ProcessId) 'Canonical prepared recovery replaces only the interrupted CPA process'
+        Assert-Equal ([int]$beforeCpa.ProcessId) ([int]$afterPreparedCpa.ProcessId) 'Prepared recovery does not restart a healthy unchanged CPA'
         Assert-Equal ([int]$beforeManager.ProcessId) ([int]$afterPreparedManager.ProcessId) 'Canonical prepared recovery preserves the healthy Manager process'
         & $assertFilesUnchanged $beforeFiles 'Canonical prepared recovery without a moved snapshot'
 
@@ -2889,6 +2889,144 @@ function Invoke-RecoveryJournalValidationGuardTest {
         Stop-OwnedFixturePort -Port $fixture.CpaPort -ManagedRoot $root
         Stop-OwnedFixturePort -Port $fixture.ManagerPort -ManagedRoot $root
         if (Test-Path -LiteralPath $poisonRoot) { Remove-TestPathWithRetry -Path $poisonRoot }
+    }
+}
+
+function Invoke-InterruptedCpaRollbackTest {
+    param([string]$OldBinary, [string]$NewBinary)
+
+    $fixture = New-LanTransactionFixture -Binary $OldBinary -Name 'interrupted-cpa-rollback'
+    $root = $fixture.Root
+    $runtime = Join-Path $root 'runtime\cli-proxy-api'
+    $exe = Join-Path $runtime 'cli-proxy-api.exe'
+    $journalPath = Join-Path $root 'state\switch-cpa.pending.json'
+    $candidate = Join-Path $root 'work\rollback-test-candidate'
+    $oldHash = Get-CpaStackFileHash -Path $exe
+    $managerBefore = Get-CpaStackListener -Port $fixture.ManagerPort
+    try {
+        New-Item -ItemType Directory -Path $candidate | Out-Null
+        Copy-Item -LiteralPath $NewBinary -Destination (Join-Path $candidate 'cli-proxy-api.exe')
+        Write-Utf8Text -Path (Join-Path $candidate 'behavior.txt') -Value 'good-new'
+        $output = & $switchCpaScript -ControlRoot $root -SourceRuntime $runtime -TargetRuntime $runtime `
+            -CandidatePackageRoot $candidate -SourceConfig $fixture.CpaConfig `
+            -ResultPath (Join-Path $root 'state\rollback-test-switch.json') `
+            -ExpectedCandidateHash (Get-CpaStackFileHash -Path (Join-Path $candidate 'cli-proxy-api.exe')) `
+            -Port $fixture.CpaPort -DeferFinalCommit -StartedProcessRegistration $startedProcessRegistration -InProcess
+        $switched = ($output | Select-Object -Last 1) | ConvertFrom-Json
+        Assert-True $switched.success 'Fixture reaches a real deferred switch'
+        $journal = Read-CpaStackJson -Path $journalPath
+        $backupExe = Join-Path $journal.pendingPath 'runtime\cli-proxy-api.exe'
+        $journalHash = Get-CpaStackFileHash -Path $journalPath
+
+        # Model a crash halfway through restoring runtime files: old exe, new companion file.
+        Stop-OwnedFixturePort -Port $fixture.CpaPort -ManagedRoot $root
+        Copy-Item -LiteralPath $backupExe -Destination $exe -Force
+        Protect-CpaStackSecretFile -Path $exe
+        [void](Start-CpaFixture -Executable $exe -Runtime $runtime -Config $fixture.CpaConfig -Port $fixture.CpaPort)
+        Assert-Equal $oldHash (Get-CpaStackFileHash -Path $exe) 'Old executable is already restored'
+        Assert-Equal 'good-new' ([System.IO.File]::ReadAllText((Join-Path $runtime 'behavior.txt'))) 'Other runtime files are not restored yet'
+        $beforeFailure = Get-CpaStackListener -Port $fixture.CpaPort
+
+        [System.IO.File]::AppendAllText($backupExe, 'corrupt-backup')
+        $rejected = Invoke-IsolatedLanCommand -ControlRoot $root -Command recover
+        Assert-False ([bool]$rejected.Result.success) 'Old active executable does not bypass backup validation'
+        Assert-Equal 'ManualRecoveryRequired' $rejected.Result.outcome 'Invalid backup remains a manual recovery failure'
+        Assert-Equal $journalHash (Get-CpaStackFileHash -Path $journalPath) 'Rejected recovery preserves the journal'
+        Assert-Equal $beforeFailure.ProcessId (Get-CpaStackListener -Port $fixture.CpaPort).ProcessId 'Rejected recovery does not stop the service'
+        Copy-Item -LiteralPath $OldBinary -Destination $backupExe -Force
+        Protect-CpaStackSecretFile -Path $backupExe
+
+        $recovered = Invoke-IsolatedLanCommand -ControlRoot $root -Command recover
+        Assert-Equal 0 $recovered.ExitCode "Interrupted CPA rollback resumes. Output=[$($recovered.Output)] Error=[$($recovered.ErrorOutput)]"
+        Assert-True ([bool]$recovered.Result.success -and [bool]$recovered.Result.recovered) 'Recovery is verified before reporting success'
+        Assert-Equal $oldHash (Get-CpaStackFileHash -Path $exe) 'Recorded old CPA is retained'
+        Assert-Equal 'good' ([System.IO.File]::ReadAllText((Join-Path $runtime 'behavior.txt'))) 'Recovery recopies all validated runtime files'
+        Assert-False (Test-Path -LiteralPath $journalPath) 'Completed recovery removes the validated transaction'
+        Assert-False (Test-Path -LiteralPath ($journalPath + '.previous')) 'Completed recovery removes its prior generation'
+        Assert-Equal $managerBefore.ProcessId (Get-CpaStackListener -Port $fixture.ManagerPort).ProcessId 'Manager remains running throughout CPA recovery'
+        Assert-Equal $oldHash (Get-CpaStackFileHash -Path (Join-Path $root 'rollback\last-known-good\cpa\runtime\cli-proxy-api.exe')) 'Verified backup is retained'
+        $again = Invoke-IsolatedLanCommand -ControlRoot $root -Command recover
+        Assert-Equal 'NoChange' $again.Result.outcome 'A second recover is idempotent'
+    } finally {
+        Stop-OwnedFixturePort -Port $fixture.CpaPort -ManagedRoot $root
+        Stop-OwnedFixturePort -Port $fixture.ManagerPort -ManagedRoot $root
+    }
+}
+
+function Invoke-CpaAvailabilityTest {
+    param([string]$OldBinary, [string]$NewBinary)
+
+    foreach ($mode in @('commit-new', 'restored-old', 'missing-exe')) {
+        $fixture = New-LanTransactionFixture -Binary $OldBinary -Name ("availability-$mode")
+        $root = $fixture.Root
+        $runtime = Join-Path $root 'runtime\cli-proxy-api'
+        $exe = Join-Path $runtime 'cli-proxy-api.exe'
+        $commonPath = Join-Path (Split-Path -Parent $isolatedLanEntry) 'CpaStack.Common.ps1'
+        $originalCommon = [System.IO.File]::ReadAllText($commonPath)
+        try {
+            if ($mode -ne 'missing-exe') {
+                # Deterministic outage guard: a whole auth walk must never run after
+                # stopping a previously healthy CPA, regardless of machine speed/tree size.
+                $guard = @'
+if ([System.IO.Path]::GetFullPath($Root).TrimEnd('\') -ieq '__AUTH__' -and -not (Get-CpaStackListener -Port __PORT__)) {
+    throw 'Bulk auth traversal entered the CPA outage window.'
+}
+'@
+                $guard = $guard.Replace('__AUTH__', (Join-Path $runtime 'auth').Replace("'", "''")).Replace('__PORT__', [string]$fixture.CpaPort)
+                $needle = '$items = @(Get-CpaStackTreeItemsNoReparse -Root $Root)'
+                Assert-True ($originalCommon.Contains($needle)) 'Availability fixture intercepts full-tree protection'
+                $guardedCommon = $originalCommon.Replace($needle, ($guard + "`n" + $needle))
+                $needle = '$items = if ($RootOnly)'
+                Assert-True ($originalCommon.Contains($needle)) 'Availability fixture intercepts full-tree validation'
+                $guardedCommon = $guardedCommon.Replace($needle, ('if (-not $RootOnly) { ' + $guard + "`n}`n" + $needle))
+                [System.IO.File]::WriteAllText($commonPath, $guardedCommon, [System.Text.UTF8Encoding]::new($false))
+            }
+            $candidate = Join-Path $root 'work\availability-candidate'
+            New-Item -ItemType Directory -Path $candidate | Out-Null
+            Copy-Item -LiteralPath $NewBinary -Destination (Join-Path $candidate 'cli-proxy-api.exe')
+            Write-Utf8Text -Path (Join-Path $candidate 'behavior.txt') -Value 'good-new'
+            $currentPath = Join-Path $root 'state\current.json'
+            $current = Read-CpaStackJson -Path $currentPath
+            $oldHash = [string]$current.cpa.sha256
+            $newHash = Get-CpaStackFileHash -Path (Join-Path $candidate 'cli-proxy-api.exe')
+            $switchScript = Join-Path (Split-Path -Parent $isolatedLanEntry) 'Switch-CpaRuntime.ps1'
+            $output = & $switchScript -ControlRoot $root -SourceRuntime $runtime -TargetRuntime $runtime `
+                -CandidatePackageRoot $candidate -SourceConfig $fixture.CpaConfig -ResultPath (Join-Path $root 'state\availability-switch.json') `
+                -ExpectedCandidateHash $newHash -Port $fixture.CpaPort -DeferFinalCommit `
+                -StartedProcessRegistration $startedProcessRegistration -InProcess
+            Assert-True (($output | Select-Object -Last 1 | ConvertFrom-Json).success) 'A real switch succeeds without offline whole-auth work'
+            $journalPath = Join-Path $root 'state\switch-cpa.pending.json'
+            $journal = Read-CpaStackJson -Path $journalPath
+            if ($mode -eq 'commit-new') {
+                $current.cpa.sha256 = $newHash
+                Write-CpaStackJson -Value $current -Path $currentPath
+            } else {
+                Stop-OwnedFixturePort -Port $fixture.CpaPort -ManagedRoot $root
+                if ($mode -eq 'restored-old') {
+                    Copy-CpaStackTree -Source (Join-Path $journal.pendingPath 'runtime') -Destination $runtime
+                    [void](Start-CpaFixture -Executable $exe -Runtime $runtime -Config $fixture.CpaConfig -Port $fixture.CpaPort)
+                } else {
+                    $journal.phase = 'rolling-back'
+                    Write-CpaStackJson -Value $journal -Path $journalPath
+                    Remove-Item -LiteralPath $exe -Force
+                }
+            }
+            $beforeCpa = Get-CpaStackListener -Port $fixture.CpaPort
+            $beforeManager = Get-CpaStackListener -Port $fixture.ManagerPort
+            $recovered = Invoke-IsolatedLanCommand -ControlRoot $root -Command recover
+            Assert-Equal 0 $recovered.ExitCode "$mode recovery succeeds. Output=[$($recovered.Output)] Error=[$($recovered.ErrorOutput)]"
+            $afterCpa = Get-CpaStackListener -Port $fixture.CpaPort
+            Assert-True ($null -ne $afterCpa) "$mode leaves CPA listening"
+            if ($mode -ne 'missing-exe') { Assert-Equal $beforeCpa.ProcessId $afterCpa.ProcessId "$mode must not restart a healthy CPA" }
+            Assert-Equal $beforeManager.ProcessId (Get-CpaStackListener -Port $fixture.ManagerPort).ProcessId "$mode must not restart Manager"
+            Assert-Equal $(if ($mode -eq 'commit-new') { $newHash } else { $oldHash }) (Get-CpaStackFileHash -Path $exe) "$mode selects the bound executable"
+            Assert-False (Test-Path -LiteralPath $journalPath) "$mode completes the validated transaction"
+            Assert-True (Test-Path -LiteralPath (Join-Path $root 'state\last-upgrade.json')) 'Recovery leaves structured progress/results'
+        } finally {
+            [System.IO.File]::WriteAllText($commonPath, $originalCommon, [System.Text.UTF8Encoding]::new($false))
+            Stop-OwnedFixturePort -Port $fixture.CpaPort -ManagedRoot $root
+            Stop-OwnedFixturePort -Port $fixture.ManagerPort -ManagedRoot $root
+        }
     }
 }
 
@@ -3022,6 +3160,12 @@ try {
     }
     if ($Case -in @('All', 'Core', 'RecoveryJournalGuard')) {
         Invoke-RecoveryJournalValidationGuardTest -OldBinary $oldBinary -NewBinary $newBinary
+    }
+    if ($Case -in @('All', 'Core', 'InterruptedCpaRollback')) {
+        Invoke-InterruptedCpaRollbackTest -OldBinary $oldBinary -NewBinary $newBinary
+    }
+    if ($Case -in @('All', 'Core', 'CpaAvailability')) {
+        Invoke-CpaAvailabilityTest -OldBinary $oldBinary -NewBinary $newBinary
     }
     if ($Case -in @('All', 'Core', 'LanSuccess')) {
         Invoke-LanConfigurationSuccessTest -Binary $oldBinary

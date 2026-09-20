@@ -922,12 +922,17 @@ function Protect-CpaStackPrivateDirectory {
 }
 
 function Get-CpaStackTreeItemsNoReparse {
-    param([Parameter(Mandatory = $true)][string]$Root)
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [string[]]$ExcludeDirectoryNames = @(),
+        [string[]]$ExcludeFileNames = @()
+    )
 
     Assert-CpaStackPath -Path $Root
     $queue = New-Object 'System.Collections.Generic.Queue[string]'
     $items = New-Object 'System.Collections.Generic.List[System.IO.FileSystemInfo]'
-    $queue.Enqueue([System.IO.Path]::GetFullPath($Root))
+    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\')
+    $queue.Enqueue($rootFull)
     while ($queue.Count -gt 0) {
         $path = $queue.Dequeue()
         $item = Get-Item -Force -LiteralPath $path
@@ -937,6 +942,9 @@ function Get-CpaStackTreeItemsNoReparse {
         [void]$items.Add($item)
         if ($item.PSIsContainer) {
             foreach ($child in Get-ChildItem -Force -LiteralPath $item.FullName) {
+                # Manifest exclusions must prune traversal, not just filter its output.
+                if ($item.FullName.TrimEnd('\') -ieq $rootFull -and $child.PSIsContainer -and $ExcludeDirectoryNames -contains $child.Name) { continue }
+                if (-not $child.PSIsContainer -and $ExcludeFileNames -contains $child.Name) { continue }
                 $queue.Enqueue($child.FullName)
             }
         }
@@ -1147,7 +1155,7 @@ function Get-CpaStackTreeManifest {
     )
 
     $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\')
-    $items = @(Get-CpaStackTreeItemsNoReparse -Root $rootFull)
+    $items = @(Get-CpaStackTreeItemsNoReparse -Root $rootFull -ExcludeDirectoryNames $ExcludeDirectoryNames -ExcludeFileNames $ExcludeFileNames)
     $entries = New-Object 'System.Collections.Generic.List[object]'
     $canonicalEntries = New-Object 'System.Collections.Generic.List[string]'
     $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
@@ -1155,9 +1163,6 @@ function Get-CpaStackTreeManifest {
         $fullName = [System.IO.Path]::GetFullPath($item.FullName).TrimEnd('\')
         if ($fullName -ieq $rootFull) { continue }
         $relative = $fullName.Substring($rootFull.Length + 1)
-        $topLevelName = ($relative -split '\\', 2)[0]
-        if ($ExcludeDirectoryNames -contains $topLevelName) { continue }
-        if (-not $item.PSIsContainer -and $ExcludeFileNames -contains $item.Name) { continue }
         $encodedPath = [Convert]::ToBase64String($utf8.GetBytes($relative))
         if ($item.PSIsContainer) {
             [void]$entries.Add([pscustomobject][ordered]@{
@@ -1211,13 +1216,17 @@ function Assert-CpaStackPrivateTree {
     param(
         [Parameter(Mandatory = $true)][string]$Root,
         [string]$Description = 'Protected CPA stack tree',
-        [switch]$AllowInheritedDescendants
+        [switch]$AllowInheritedDescendants,
+        [switch]$RootOnly
     )
 
     $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\')
     $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     $allowedSids = @($currentSid, 'S-1-5-18', 'S-1-5-32-544')
-    foreach ($item in @(Get-CpaStackTreeItemsNoReparse -Root $Root)) {
+    $items = if ($RootOnly) { @(Get-Item -LiteralPath $Root -Force -ErrorAction Stop) } else { @(Get-CpaStackTreeItemsNoReparse -Root $Root) }
+    if ($RootOnly -and -not $items[0].PSIsContainer) { throw "$Description root is not a directory." }
+    foreach ($item in $items) {
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw "$Description contains a reparse point." }
         $acl = Get-CpaStackFileSystemAcl -Path $item.FullName
         $itemFull = [System.IO.Path]::GetFullPath($item.FullName).TrimEnd('\')
         $isRoot = [string]::Equals($itemFull, $rootFull, [System.StringComparison]::OrdinalIgnoreCase)
@@ -1908,7 +1917,7 @@ function Get-CpaStackDiagnosticValue {
 function New-CpaStackHttpFailureDiagnostic {
     param([string]$Uri, [string]$Method = 'GET', [System.Management.Automation.ErrorRecord]$Failure)
 
-    # Never retain the authority/port, query, credentials, headers, body or exception message.
+    # Inspect a bounded error body in memory; retain only allowlisted codes, never raw text.
     $parsed = $null
     $endpoint = 'unrecognized'
     if ([Uri]::TryCreate($Uri, [UriKind]::Absolute, [ref]$parsed) -and
@@ -1926,11 +1935,32 @@ function New-CpaStackHttpFailureDiagnostic {
         if ($null -ne $status) { $statusCode = [int]$status; $failureKind = 'HttpError'; break }
         $exception = $exception.InnerException
     }
+    $responseCode = $null
+    $databaseError = $null
+    $errorBody = [string](Get-CpaStackDiagnosticValue -Object $Failure -Path 'ErrorDetails.Message')
+    if ($null -ne $statusCode -and $null -ne $parsed -and $parsed.IsLoopback -and
+        $endpoint -ceq '/setup' -and $Method -ceq 'POST' -and $errorBody.Length -le 8192) {
+        $body = $null
+        try { $body = $errorBody | ConvertFrom-Json -ErrorAction Stop } catch { }
+        $code = Get-CpaStackDiagnosticValue -Object $body -Path 'code'
+        if ($code -is [string] -and $code -cin @('request_failed', 'management_api_validation_failed',
+            'management_api_config_failed', 'enable_cpa_usage_statistics_failed', 'invalid_admin_key',
+            'invalid_management_key', 'invalid_existing_management_key', 'setup_env_managed', 'cpa_connection_required')) {
+            $responseCode = $code
+        }
+        $message = Get-CpaStackDiagnosticValue -Object $body -Path 'error'
+        if ($statusCode -eq 502 -and $responseCode -ceq 'request_failed' -and
+            $message -is [string] -and $message -cmatch '\bSQLITE_BUSY\b') {
+            $databaseError = 'SQLITE_BUSY'
+        }
+    }
     return [ordered]@{
         method = if ($Method -cin @('GET', 'POST')) { $Method } else { 'unknown' }
         endpoint = $endpoint
         statusCode = $statusCode
         failureKind = $failureKind
+        responseCode = $responseCode
+        databaseError = $databaseError
     }
 }
 
@@ -2099,7 +2129,8 @@ function Set-CpaStackManagerCollector {
         [Parameter(Mandatory = $true)][string]$ManagerAdminKey,
         [Parameter(Mandatory = $true)][string]$CpaManagementKey,
         [Parameter(Mandatory = $true)][bool]$Enabled,
-        $Baseline = $null
+        $Baseline = $null,
+        [System.Collections.Generic.List[object]]$RetryDiagnostics = $null
     )
 
     $cpaBaseUrl = if ($null -ne $Baseline -and $Baseline.cpaBaseUrl) { [string]$Baseline.cpaBaseUrl } else { "http://127.0.0.1:$CpaPort" }
@@ -2113,7 +2144,32 @@ function Set-CpaStackManagerCollector {
         pollIntervalMs             = $pollIntervalMs
     } | ConvertTo-Json -Compress
     $headers = @{ Authorization = "Bearer $ManagerAdminKey" }
-    $response = Invoke-CpaStackHttpJson -Uri "http://127.0.0.1:$ManagerPort/setup" -Method POST -Headers $headers -Body $payload -TimeoutSec 20
+    $setupListener = Get-CpaStackListener -Port $ManagerPort
+    if ($null -eq $setupListener) { throw 'Manager setup requires an existing listener.' }
+    $setupHash = Get-CpaStackFileHash -Path $setupListener.ExecutablePath
+    # Repeating the same setup payload is idempotent. Retry only proven database contention;
+    # /health can succeed while Manager's post-listen index maintenance still holds a write lock.
+    for ($attempt = 1; $attempt -le 4; $attempt++) {
+        if ($attempt -gt 1) {
+            [void](Wait-CpaStackTrustedListener -Port $ManagerPort -ExpectedPath $setupListener.ExecutablePath `
+                -ExpectedProcessId $setupListener.ProcessId -ExpectedHash $setupHash -AllowedAddresses $setupListener.LocalAddresses -Seconds 2)
+        }
+        try {
+            $response = Invoke-CpaStackHttpJson -Uri "http://127.0.0.1:$ManagerPort/setup" -Method POST -Headers $headers -Body $payload -TimeoutSec 20
+            break
+        } catch {
+            $http = $_.Exception.Data['CpaStackHttpDiagnostic']
+            $retry = ($attempt -lt 4 -and $null -ne $http -and $http.statusCode -eq 502 -and $http.databaseError -ceq 'SQLITE_BUSY')
+            if ($null -ne $RetryDiagnostics) {
+                $event = New-CpaStackFailureDiagnostic -Stage 'manager-setup' -Failure $_
+                $event['attempt'] = $attempt
+                $event['willRetry'] = $retry
+                $RetryDiagnostics.Add($event)
+            }
+            if (-not $retry) { throw }
+            Start-Sleep -Seconds 1
+        }
+    }
     if (-not $response.ok) {
         throw "Manager setup returned ok=false on port $ManagerPort."
     }

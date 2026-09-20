@@ -40,10 +40,14 @@ managed root 优先使用用户明确给出的 `-Root`，否则让 CLI 按 `CPA_
 
 `upgrade` 自动执行 `updater → recover → migrate → runtime upgrade → shortcut Ensure`：先检查并按上述信任链更新 updater；有单一可恢复 pending 时恢复一次，未建立 canonical stack 时迁移一次，最后升级 runtime。运行时升级成功后自动创建或更新当前用户桌面的 `CPA 本地启动.lnk`，识别到旧 CPA 快捷方式时自动备份并接管，不再询问。快捷方式维护失败只追加 warning，不回滚已经成功的运行时升级。
 
+单实例固定端口原地升级需要一次短暂重启，不承诺零断连。下载、备份与完整凭证树检查应在停服前完成；成功提交仅校验并归档，不得再次停止健康服务。只有运行文件确需恢复时才停止 CPA，保留的 auth/plugins 不在停机窗口内全量重写权限。
+
 只依据最终结构化结果（`schemaVersion=2`）报告：
 
 1. `success=true`：报告结果，不追加无关检查或操作。
 2. `success=false`：停止并报告 `automation.failedStep` 与 `error.code`，不要询问是否绕过真正的安全失败。
+
+“只依据最终结果”不禁止只读诊断。长时间无输出时可读取进程、正式监听和脱敏的 `phase` / `diagnostics`；不得把中间检查点当作事务完成，也不要并发启动第二个有状态命令。恢复日志中的 `restoring-cpa-runtime`、`starting-recovered-cpa`、`recovered-cpa-listening` 用于定位停机窗口。
 
 自动发现不唯一时，读取 [migration-request.md](references/migration-request.md)，生成不含 secret 值的临时 request JSON，再执行：
 

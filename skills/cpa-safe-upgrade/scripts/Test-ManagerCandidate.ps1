@@ -41,6 +41,7 @@ $result = [ordered]@{
     collectorEnabled = $null
     dataKeyPreserved = $false
     diagnostics = @()
+    setupRetries = [System.Collections.Generic.List[object]]::new()
     error = $null
 }
 
@@ -136,7 +137,7 @@ try {
         [void](Wait-CpaStackTrustedListener -Port $TempPort -ExpectedPath $candidateExe -ExpectedProcessId $candidateProcess.Id -ExpectedHash $ExpectedCandidateHash -AllowedAddresses @('127.0.0.1') -Seconds 40)
         [void](Wait-CpaStackHttpJson -Uri "http://127.0.0.1:$TempPort/health" -Seconds 40)
         $formalBaselineRestoreRequired = $true
-        [void](Set-CpaStackManagerCollector -ManagerPort $TempPort -CpaPort $CpaPort -ManagerAdminKey $secrets.managerAdminKey -CpaManagementKey $secrets.cpaManagementKey -Enabled $false -Baseline $formalBaseline)
+        [void](Set-CpaStackManagerCollector -ManagerPort $TempPort -CpaPort $CpaPort -ManagerAdminKey $secrets.managerAdminKey -CpaManagementKey $secrets.cpaManagementKey -Enabled $false -Baseline $formalBaseline -RetryDiagnostics $result.setupRetries)
         [void](Test-ManagerCandidateHttp -ExpectHistorical $false -ExpectedProcessId $candidateProcess.Id)
         Assert-FormalManagerListener
         [void](Assert-CpaStackManagerSetupBaseline -ManagerPort $FormalPort -ManagerAdminKey $secrets.managerAdminKey -Expected $formalBaseline)
@@ -149,7 +150,7 @@ try {
         Stop-ManagerCandidateProcess
         if ($formalBaselineRestoreRequired) {
             Assert-FormalManagerListener
-            [void](Set-CpaStackManagerCollector -ManagerPort $FormalPort -CpaPort $CpaPort -ManagerAdminKey $secrets.managerAdminKey -CpaManagementKey $secrets.cpaManagementKey -Enabled ([bool]$formalBaseline.collectorEnabled) -Baseline $formalBaseline)
+            [void](Set-CpaStackManagerCollector -ManagerPort $FormalPort -CpaPort $CpaPort -ManagerAdminKey $secrets.managerAdminKey -CpaManagementKey $secrets.cpaManagementKey -Enabled ([bool]$formalBaseline.collectorEnabled) -Baseline $formalBaseline -RetryDiagnostics $result.setupRetries)
             [void](Assert-CpaStackManagerSetupBaseline -ManagerPort $FormalPort -ManagerAdminKey $secrets.managerAdminKey -Expected $formalBaseline)
             Assert-FormalManagerListener
             $formalBaselineRestoreRequired = $false
@@ -158,7 +159,7 @@ try {
 
     $formalBaselineRestoreRequired = $true
     Assert-FormalManagerListener
-    [void](Set-CpaStackManagerCollector -ManagerPort $FormalPort -CpaPort $CpaPort -ManagerAdminKey $secrets.managerAdminKey -CpaManagementKey $secrets.cpaManagementKey -Enabled $false -Baseline $formalBaseline)
+    [void](Set-CpaStackManagerCollector -ManagerPort $FormalPort -CpaPort $CpaPort -ManagerAdminKey $secrets.managerAdminKey -CpaManagementKey $secrets.cpaManagementKey -Enabled $false -Baseline $formalBaseline -RetryDiagnostics $result.setupRetries)
     try {
         New-Item -ItemType Directory -Force -Path $snapshotData | Out-Null
         $dataKey = Join-Path $FormalData "data.key"
@@ -171,7 +172,7 @@ try {
         $baseline = Invoke-CpaStackSqliteBackup -Source (Join-Path $FormalData "usage.sqlite") -Destination (Join-Path $snapshotData "usage.sqlite") -ResultPath $baselinePath
     } finally {
         Assert-FormalManagerListener
-        [void](Set-CpaStackManagerCollector -ManagerPort $FormalPort -CpaPort $CpaPort -ManagerAdminKey $secrets.managerAdminKey -CpaManagementKey $secrets.cpaManagementKey -Enabled ([bool]$formalBaseline.collectorEnabled) -Baseline $formalBaseline)
+        [void](Set-CpaStackManagerCollector -ManagerPort $FormalPort -CpaPort $CpaPort -ManagerAdminKey $secrets.managerAdminKey -CpaManagementKey $secrets.cpaManagementKey -Enabled ([bool]$formalBaseline.collectorEnabled) -Baseline $formalBaseline -RetryDiagnostics $result.setupRetries)
         [void](Assert-CpaStackManagerSetupBaseline -ManagerPort $FormalPort -ManagerAdminKey $secrets.managerAdminKey -Expected $formalBaseline)
         Assert-FormalManagerListener
         $formalBaselineRestoreRequired = $false
@@ -238,7 +239,7 @@ try {
     if ($formalBaselineRestoreRequired -and $null -ne $formalBaseline) {
         try {
             Assert-FormalManagerListener
-            [void](Set-CpaStackManagerCollector -ManagerPort $FormalPort -CpaPort $CpaPort -ManagerAdminKey $secrets.managerAdminKey -CpaManagementKey $secrets.cpaManagementKey -Enabled ([bool]$formalBaseline.collectorEnabled) -Baseline $formalBaseline)
+            [void](Set-CpaStackManagerCollector -ManagerPort $FormalPort -CpaPort $CpaPort -ManagerAdminKey $secrets.managerAdminKey -CpaManagementKey $secrets.cpaManagementKey -Enabled ([bool]$formalBaseline.collectorEnabled) -Baseline $formalBaseline -RetryDiagnostics $result.setupRetries)
             [void](Assert-CpaStackManagerSetupBaseline -ManagerPort $FormalPort -ManagerAdminKey $secrets.managerAdminKey -Expected $formalBaseline)
             Assert-FormalManagerListener
             $formalBaselineRestoreRequired = $false
@@ -256,7 +257,7 @@ try {
 if (-not $result.success) {
     if ($InProcess) {
         $failure = [System.Exception]::new($result.error)
-        $failure.Data['CpaStackDiagnostics'] = $result.diagnostics
+        $failure.Data['CpaStackDiagnostics'] = @(@($result.diagnostics) + @($result.setupRetries.ToArray()) | Sort-Object at)
         throw $failure
     }
     Write-Error $result.error

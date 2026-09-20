@@ -40,6 +40,12 @@ CLI 返回 `TargetDriveNotFound` 时，选择真实存在的本地 NTFS/ReFS 盘
 
 `maintenance.pending.json` 属于离线数据库维护事务；重跑 `cpa-stack.ps1 maintenance -Action CleanupDerived -Json`，它会先验证并恢复备份、重启服务，再重新维护。不要用普通 `recover`、手工删除 journal 或直接复制数据库。
 
+CPA 回滚可能在旧程序写回后、事务清理前中断。对于 `target-started` / `runtime-verified` 阶段，若 current 记录和当前 CPA 程序均匹配同一旧版 hash，公开 `recover` 会先完整验证实例、路径、事务和旧版备份，再核对完整运行文件；不会仅凭旧 exe hash 直接删除事务。缺失或损坏备份、未知 hash 仍拒绝，Manager 数据恢复规则不变。
+
+恢复会比较排除 auth/plugins/config 的完整运行文件清单；如果旧运行文件已经完整恢复且服务正在运行，仅完成事务收尾，不重复停服。新版本已提交的 `commit-new` 分支同样不重启健康服务。若确需恢复文件，先写 `rolling-back` 阶段，再停止、恢复并尽快启动 CPA；该阶段或 `source-stopped` 阶段的 exe 缺失可以在完整备份验证后恢复，未知非空 hash 仍拒绝。
+
+完整凭证树检查在停服前完成，未改动的受保护目录在切换窗口只复核根边界。结构化结果文件会保留已验证事务的阶段检查点；检查点写入失败只报告 warning，不阻止恢复服务。中间文件的 `success=false` 不是最终结论，必须等待公开命令最终返回。
+
 ## 无法证明版本单调
 
 公开 `upgrade` 会自动允许用已验证的 latest stable 替换无法可靠识别版本或来源的旧 binary，不需要额外参数或确认。release checksum、候选健康、SQLite 水位和失败回滚仍按原安全门禁执行。
@@ -51,6 +57,8 @@ CLI 返回 `TargetDriveNotFound` 时，选择真实存在的本地 NTFS/ReFS 盘
 新版升级结果中的 `upgrade.diagnostics` 保留按时间排序的脱敏诊断，同一数组也保存在 `state/last-upgrade.json` 的 `diagnostics` 中。先找第一条包含 `failedChecks` 的健康检查，或 `kind=exception` 的记录，再对比后续恢复检查；不要用最后一次成功检查覆盖首次失败证据。`http` 可区分具体接口的 HTTP 状态码与超时/连接失败，异常记录只保留脚本文件名、行号和类型，不包含调用参数或原始响应。
 
 `success=false` 可以同时伴随 `changed=true` 或 `recovered=true`：组件可能已切换、后续恢复也可能成功，但整个升级仍未完成。按错误停止后续运行时操作；需要诊断时使用公开只读 `status` 核对当前服务，不把这些字段当作绕过失败门禁的依据。
+
+Manager 的 `/health` 可能早于启动索引维护完成。共享配置函数仅在本机 `POST /setup` 返回 HTTP 502、JSON `code=request_failed` 且错误明确包含 `SQLITE_BUSY` 时，按原配置最多请求 4 次，间隔 1 秒；每次重试前复核原进程、程序 hash 和监听地址。其他 502、鉴权错误、连接超时及无法识别的正文立即失败。候选与升级结果的 `setupRetries` 保留脱敏的失败次数、是否继续重试和数据库错误类别；耗尽次数仍返回失败，不记录原始响应正文。
 
 候选即使未成功监听，也应由 updater 按已启动的固定 `Process` 清理。不要因候选端口已经消失就假定进程已退出，也不要使用递归结束进程的命令；让事务等待原进程和 executable 文件锁释放。
 

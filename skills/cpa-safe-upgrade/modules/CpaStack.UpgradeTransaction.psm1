@@ -62,10 +62,16 @@ function Invoke-CpaStackUpgradeTransaction {
     $rolledBack = [bool](Get-CpaStackValue -Object $cpa -Name 'rolledBack' -Default $false) -or
         [bool](Get-CpaStackValue -Object $manager -Name 'rolledBack' -Default $false)
     $innerError = Get-CpaStackValue -Object $run.Json -Name 'error'
+    $warnings = @()
+    if ('CheckpointWriteFailed' -in @(
+        (Get-CpaStackValue -Object $run.Json -Name 'checkpointWarning'),
+        (Get-CpaStackValue -Object $cpa -Name 'checkpointWarning'),
+        (Get-CpaStackValue -Object $manager -Name 'checkpointWarning')
+    )) { $warnings += 'Upgrade progress could not be persisted.' }
     if ($success) {
         $outcome = if ($changed) { 'Changed' } else { 'NoChange' }
         return New-CpaStackResult -Operation upgrade -Success $true -Outcome $outcome -Changed $changed -Root $Root `
-            -Recovered $recovered `
+            -Recovered $recovered -Warnings $warnings `
             -Extensions ([ordered]@{ upgrade = $run.Json })
     }
     if ($rolledBack) {
@@ -73,14 +79,14 @@ function Invoke-CpaStackUpgradeTransaction {
             -DefaultMessage 'Upgrade failed and the previous runtime was restored.' -DefaultPhase 'upgrade'
         Set-CpaStackValue -Object $run.Json -Name 'error' -Value $failureError
         return New-CpaStackResult -Operation upgrade -Success $false -Outcome RolledBack -Changed $changed -Root $Root -RolledBack $true -Recovered $recovered `
-            -Error $failureError `
+            -Error $failureError -Warnings $warnings `
             -Extensions ([ordered]@{ upgrade = $run.Json })
     }
     $failureError = ConvertTo-CpaStackError -InputObject $innerError -Run $run -DefaultCode 'UpgradeFailed' `
         -DefaultMessage 'Upgrade failed.' -DefaultPhase 'upgrade'
     Set-CpaStackValue -Object $run.Json -Name 'error' -Value $failureError
     return New-CpaStackResult -Operation upgrade -Success $false -Outcome Blocked -Changed $changed -Root $Root -Recovered $recovered `
-        -Error $failureError `
+        -Error $failureError -Warnings $warnings `
         -Extensions ([ordered]@{ upgrade = $run.Json })
 }
 
