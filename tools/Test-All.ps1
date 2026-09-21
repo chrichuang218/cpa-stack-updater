@@ -397,6 +397,7 @@ try {
         'tests\FixtureStateIsolation.Tests.ps1',
         'tests\BundledHost.Tests.ps1',
         'tests\SharedRuntime.Tests.ps1',
+        'tests\StartupResult.Tests.ps1',
         'tests\ResultContract.Tests.ps1',
         'tests\InitializeRecoverySafety.Tests.ps1',
         'tests\DynamicPorts.Tests.ps1',

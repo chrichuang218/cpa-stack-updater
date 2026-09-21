@@ -1222,7 +1222,7 @@ try {
         Cpa = [pscustomobject]@{
             Action = $cpaResult.Action
             ProcessId = $cpaResult.ProcessId
-            PreviousProcessId = $cpaResult.PreviousProcessId
+            PreviousProcessId = $(if ($Fast) { $cpaResult.PreviousProcessId } else { $null })
             Port = $settings.Cpa.Port
             Executable = $settings.Cpa.Executable
             ModelCount = $modelCount
@@ -1230,7 +1230,7 @@ try {
         Manager = [pscustomobject]@{
             Action = $managerResult.Action
             ProcessId = $managerResult.ProcessId
-            PreviousProcessId = $managerResult.PreviousProcessId
+            PreviousProcessId = $(if ($Fast) { $managerResult.PreviousProcessId } else { $null })
             Port = $settings.Manager.Port
             Executable = $settings.Manager.Executable
             DataDirectory = $settings.Manager.DataDirectory

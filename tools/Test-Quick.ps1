@@ -7,7 +7,7 @@ foreach ($path in @(Get-ChildItem $repo -Recurse -File | Where-Object { $_.Exten
     [void][Management.Automation.Language.Parser]::ParseFile($path.FullName, [ref]$tokens, [ref]$errors)
     if ($errors.Count) { throw "Syntax error in $($path.Name): $($errors[0].Message)" }
 }
-foreach ($test in @('PlatformContract.Tests.ps1', 'SharedRuntime.Tests.ps1', 'AuthLogBoundary.Tests.ps1', 'GitHubAuthentication.Tests.ps1', 'RecoveryPhase.Tests.ps1', 'UpgradeFlow.Tests.ps1', 'ManagerBackupPlacement.Tests.ps1', 'ManagerSetupRetry.Tests.ps1')) {
+foreach ($test in @('PlatformContract.Tests.ps1', 'SharedRuntime.Tests.ps1', 'StartupResult.Tests.ps1', 'AuthLogBoundary.Tests.ps1', 'GitHubAuthentication.Tests.ps1', 'RecoveryPhase.Tests.ps1', 'UpgradeFlow.Tests.ps1', 'ManagerBackupPlacement.Tests.ps1', 'ManagerSetupRetry.Tests.ps1')) {
     & (Join-Path (Join-Path $repo 'tests') $test)
 }
 & python -B -m unittest discover -s (Join-Path $repo 'tests') -p 'test_*.py' -q
