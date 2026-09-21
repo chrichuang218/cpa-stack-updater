@@ -130,6 +130,19 @@ try {
     $failed = Invoke-CpaStackSelfUpdate -StackRoot (Join-Path $temp 'stack') -Installation $installation -HostAdapter $failingHost
     Assert-False ([bool]$failed.success) 'Updater release query failure is explicit'
     Assert-Equal 'UpdaterReleaseCheckFailed' ([string]$failed.error.code) 'Updater release query failure has a stable code'
+    $failingHost.GetRelease = {
+        $error = [System.InvalidOperationException]::new('SYNTHETIC_SECRET_RESPONSE')
+        $error.Data['httpStatus'] = 403
+        $error.Data['rateLimitRemaining'] = 0
+        $error.Data['rateLimitResetEpoch'] = 1790000000
+        $error.Data['Authorization'] = 'SYNTHETIC_SECRET_TOKEN'
+        throw $error
+    }
+    $limited = Invoke-CpaStackSelfUpdate -StackRoot (Join-Path $temp 'stack') -Installation $installation -HostAdapter $failingHost
+    Assert-Equal 403 $limited.error.diagnostics.httpStatus 'HTTP status survives self-update error wrapping'
+    Assert-Equal 0 $limited.error.diagnostics.rateLimitRemaining 'Rate limit remaining is preserved'
+    Assert-Equal 1790000000 $limited.error.diagnostics.rateLimitResetEpoch 'Reset time is preserved'
+    Assert-False (($limited | ConvertTo-Json -Depth 10).Contains('SYNTHETIC_SECRET')) 'Raw errors and credentials never reach diagnostics'
 } finally {
     if (Test-Path -LiteralPath $temp) {
         # Release archives can remain briefly locked while Windows security

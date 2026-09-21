@@ -1841,6 +1841,28 @@ function Copy-CpaStackBoundedStream {
     return $totalBytes
 }
 
+function Set-CpaStackGitHubAuthentication {
+    param([Parameter(Mandatory = $true)][System.Net.HttpWebRequest]$Request)
+
+    # Re-evaluate each redirect hop; credentials must never reach asset hosts.
+    if ($Request.RequestUri.Scheme -cne 'https' -or
+        $Request.RequestUri.Host -ine 'api.github.com' -or
+        $Request.RequestUri.Port -ne 443) { return }
+    $gh = Get-Command gh -CommandType Application -ErrorAction SilentlyContinue
+    if ($null -eq $gh) { return }
+    $token = $null
+    try {
+        $token = (@(& $gh.Source auth token --hostname github.com 2>$null) -join '').Trim()
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($token)) { return }
+        if ($token -cnotmatch '^[A-Za-z0-9_]+$') {
+            throw 'GitHub credential has an invalid format.'
+        }
+        $Request.Headers['Authorization'] = 'Bearer ' + $token
+    } finally {
+        $token = $null
+    }
+}
+
 function Invoke-CpaStackSecureDownload {
     param(
         [Parameter(Mandatory = $true)][string]$Uri,
@@ -1870,6 +1892,7 @@ function Invoke-CpaStackSecureDownload {
             $request.Timeout = 300000
             $request.ReadWriteTimeout = 300000
             $request.MaximumResponseHeadersLength = 64
+            Set-CpaStackGitHubAuthentication -Request $request
 
             $response = $null
             try {
@@ -1920,7 +1943,23 @@ function Invoke-CpaStackSecureDownload {
                 }
                 return
             } catch [System.Net.WebException] {
-                throw 'HTTPS download request failed.'
+                $failedResponse = $_.Exception.Response
+                $failure = [System.InvalidOperationException]::new('HTTPS download request failed.')
+                if ($failedResponse -is [System.Net.HttpWebResponse]) {
+                    $failure.Data['httpStatus'] = [int]$failedResponse.StatusCode
+                    foreach ($pair in @(
+                        @('rateLimitRemaining', 'X-RateLimit-Remaining'),
+                        @('rateLimitResetEpoch', 'X-RateLimit-Reset'),
+                        @('retryAfterSeconds', 'Retry-After')
+                    )) {
+                        [long]$value = 0
+                        if ([long]::TryParse($failedResponse.Headers[$pair[1]], [ref]$value) -and $value -ge 0) {
+                            $failure.Data[$pair[0]] = $value
+                        }
+                    }
+                    $failedResponse.Dispose()
+                }
+                throw $failure
             } finally {
                 if ($null -ne $response) { $response.Dispose() }
             }

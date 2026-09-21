@@ -323,6 +323,14 @@ function Invoke-CpaStackSelfUpdate {
             'install' { 'UpdaterInstallFailed' }
             default { 'UpdaterSelfUpdateFailed' }
         }
+        $diagnostics = @{}
+        $cause = $_.Exception
+        while ($null -ne $cause) {
+            foreach ($name in @('httpStatus', 'rateLimitRemaining', 'rateLimitResetEpoch', 'retryAfterSeconds')) {
+                if ($cause.Data.Contains($name)) { $diagnostics[$name] = [long]$cause.Data[$name] }
+            }
+            $cause = $cause.InnerException
+        }
         return [pscustomobject]@{
             success = $false
             changed = $false
@@ -335,6 +343,7 @@ function Invoke-CpaStackSelfUpdate {
                 message = 'Updater self-update failed before the CPA runtime upgrade.'
                 type = $_.Exception.GetType().FullName
                 phase = $phase
+                diagnostics = [pscustomobject]$diagnostics
             }
         }
     } finally {
