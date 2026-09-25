@@ -3,7 +3,8 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$ControlRoot,
-    [Parameter(Mandatory = $true)][ValidateSet('CleanupDerived')][string]$Action
+    [Parameter(Mandatory = $true)][ValidateSet('CleanupDerived')][string]$Action,
+    [switch]$RecoverOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -379,6 +380,26 @@ function Remove-MaintenanceJournal {
 function Recover-InterruptedMaintenance {
     if (-not (Test-Path -LiteralPath $journalPath -PathType Leaf)) { return $false }
     $journal = Read-CpaStackJson -Path $journalPath
+    if ([string]$journal.operationId -cnotmatch '^[0-9a-f]{32}$' -or
+        [string]$journal.phase -cnotin @('prepared', 'source-stopped', 'cleaned', 'validated', 'committing', 'committed')) {
+        throw 'Maintenance journal has an invalid transaction identity or phase.'
+    }
+    $expectedBackup = Join-Path $ControlRoot ('rollback\pending-maintenance-' + $journal.operationId)
+    $pendingArtifacts = @(Get-ChildItem -LiteralPath (Join-Path $ControlRoot 'state') -File -Filter '*.pending.json*' -Force)
+    $pendingArtifacts += @(Get-ChildItem -LiteralPath (Join-Path $ControlRoot 'rollback') -Directory -Filter 'pending-*' -Force)
+    foreach ($artifact in $pendingArtifacts) {
+        if ($artifact.FullName -notin @($journalPath, $journalPreviousPath, $expectedBackup)) {
+            throw 'Maintenance recovery requires a single bound transaction.'
+        }
+    }
+    if (Test-Path -LiteralPath $journalPreviousPath -PathType Leaf) {
+        $previous = Read-CpaStackJson -Path $journalPreviousPath
+        foreach ($field in @('schemaVersion', 'operation', 'operationId', 'instanceId', 'canonicalRoot')) {
+            if ([string]$previous.$field -cne [string]$journal.$field) {
+                throw 'Previous maintenance journal belongs to a different transaction.'
+            }
+        }
+    }
     $backup = Read-MaintenanceBackup -Journal $journal
     $context = [pscustomobject]@{
         Executable = [System.IO.Path]::GetFullPath([string]$backup.Manifest.executable)
@@ -391,19 +412,23 @@ function Recover-InterruptedMaintenance {
         Port = [int]$backup.Manifest.managerPort
         BindAddress = [string]$backup.Manifest.bindAddress
     }
-    if ([string]$journal.phase -in @('committing', 'committed')) {
+    # A validated database may already be serving new writes after a restart/result failure.
+    # Revalidate and commit it; restoring the old backup here would discard those writes.
+    if ([string]$journal.phase -in @('validated', 'committing', 'committed')) {
         if ((Get-CpaStackFileHash -Path $context.Executable) -cne $context.ExecutableHash -or
             (Get-CpaStackFileHash -Path $context.DataKey) -cne $context.DataKeyHash) {
-            throw 'Committed maintenance runtime or data.key no longer matches its bound transaction.'
+            throw 'Validated maintenance runtime or data.key no longer matches its bound transaction.'
         }
         [void](Test-MaintenanceDatabase -Database $context.Database -BaselinePath $backup.BaselinePath)
         $result.databaseVerified = $true
     } else {
         Restore-MaintenanceDatabase -Context $context -Backup $backup
+        $result.rolledBack = $true
         $result.databaseVerified = $true
     }
     [void](Start-MaintenanceStack)
     Complete-MaintenanceCommit -Backup $backup -Journal $journal -OperationId ([string]$journal.operationId)
+    $result.changed = $true
     $result.recovered = $true
     $result.managerRestarted = $true
     return $true
@@ -427,105 +452,109 @@ try {
             -Phase 'rollback' -Type $_.Exception.GetType().FullName
         throw
     }
-    $state = Get-MaintenanceState
-    $context = Get-MaintenanceContext -State $state
-    $operationId = [guid]::NewGuid().ToString('N')
-    $backup = New-MaintenanceBackup -Context $context -OperationId $operationId
-    $journal = [pscustomobject][ordered]@{
-        schemaVersion = 1
-        operation = 'cleanup-derived'
-        operationId = $operationId
-        instanceId = $instanceId
-        canonicalRoot = $ControlRoot
-        phase = 'prepared'
-        backupPath = $backup.PendingPath
-        retainedPath = $null
-        createdAt = [DateTimeOffset]::Now.ToString('o')
-        updatedAt = [DateTimeOffset]::Now.ToString('o')
-    }
-    Write-MaintenanceJournal -Journal $journal -Phase prepared
-
-    $failureStage = 'stop'
-    try {
-        $result.managerStopped = Stop-MaintenanceManager -Context $context -ExpectedProcessId $context.ProcessId
-        if (-not $result.managerStopped) { throw 'Canonical Manager was not running at maintenance stop.' }
-        Write-MaintenanceJournal -Journal $journal -Phase 'source-stopped'
-
-        $failureStage = 'cleanup'
-        $previousPreference = $ErrorActionPreference
-        Push-Location -LiteralPath $context.WorkingDirectory
-        try {
-            $ErrorActionPreference = 'Continue'
-            $cleanupOutput = @(& $context.Executable cleanup-derived --db-path $context.Database 2>&1)
-            $cleanupExitCode = if ($null -eq $LASTEXITCODE) { if ($?) { 0 } else { 1 } } else { [int]$LASTEXITCODE }
-        } finally {
-            $ErrorActionPreference = $previousPreference
-            Pop-Location
-        }
-        if ($cleanupExitCode -ne 0) {
-            throw "Manager cleanup-derived failed. ExitCode=$cleanupExitCode."
-        }
-        $result.changed = $true
-        Write-MaintenanceJournal -Journal $journal -Phase cleaned
-
-        $failureStage = 'validation'
-        if ((Get-CpaStackFileHash -Path $context.Executable) -cne $context.ExecutableHash -or
-            (Get-CpaStackFileHash -Path $context.DataKey) -cne $context.DataKeyHash) {
-            throw 'Manager executable or data.key changed during offline maintenance.'
-        }
-        [void](Test-MaintenanceDatabase -Database $context.Database -BaselinePath $backup.BaselinePath)
-        $result.databaseVerified = $true
-        Write-MaintenanceJournal -Journal $journal -Phase validated
-
-        $failureStage = 'restart'
-        [void](Start-MaintenanceStack)
-        $result.managerRestarted = $true
-        $failureStage = 'commit'
-        Complete-MaintenanceCommit -Backup $backup -Journal $journal -OperationId $operationId
+    if ($RecoverOnly) {
         $result.success = $true
-    } catch {
-        $maintenanceFailure = $_
-        $maintenanceCode = [string]$maintenanceFailure.FullyQualifiedErrorId
-        if ($maintenanceCode -like 'MaintenanceProcessChanged*') {
+    } else {
+        $state = Get-MaintenanceState
+        $context = Get-MaintenanceContext -State $state
+        $operationId = [guid]::NewGuid().ToString('N')
+        $backup = New-MaintenanceBackup -Context $context -OperationId $operationId
+        $journal = [pscustomobject][ordered]@{
+            schemaVersion = 1
+            operation = 'cleanup-derived'
+            operationId = $operationId
+            instanceId = $instanceId
+            canonicalRoot = $ControlRoot
+            phase = 'prepared'
+            backupPath = $backup.PendingPath
+            retainedPath = $null
+            createdAt = [DateTimeOffset]::Now.ToString('o')
+            updatedAt = [DateTimeOffset]::Now.ToString('o')
+        }
+        Write-MaintenanceJournal -Journal $journal -Phase prepared
+
+        $failureStage = 'stop'
+        try {
+            $result.managerStopped = Stop-MaintenanceManager -Context $context -ExpectedProcessId $context.ProcessId
+            if (-not $result.managerStopped) { throw 'Canonical Manager was not running at maintenance stop.' }
+            Write-MaintenanceJournal -Journal $journal -Phase 'source-stopped'
+
+            $failureStage = 'cleanup'
+            $previousPreference = $ErrorActionPreference
+            Push-Location -LiteralPath $context.WorkingDirectory
             try {
-                $validatedBackup = Read-MaintenanceBackup -Journal $journal
-                Complete-MaintenanceCommit -Backup $validatedBackup -Journal $journal -OperationId $operationId
-                $result.error = New-MaintenanceError -Code 'MaintenanceProcessChanged' `
-                    -Message 'Manager process identity changed after preflight; maintenance stopped without touching the replacement process.' `
-                    -Phase 'stop' -Type $maintenanceFailure.Exception.GetType().FullName
-            } catch {
-                $result.error = New-MaintenanceError -Code 'MaintenanceRollbackFailed' `
-                    -Message 'Manager identity changed and the prepared maintenance transaction could not be closed safely.' `
-                    -Phase 'rollback' -Type $_.Exception.GetType().FullName
+                $ErrorActionPreference = 'Continue'
+                $cleanupOutput = @(& $context.Executable cleanup-derived --db-path $context.Database 2>&1)
+                $cleanupExitCode = if ($null -eq $LASTEXITCODE) { if ($?) { 0 } else { 1 } } else { [int]$LASTEXITCODE }
+            } finally {
+                $ErrorActionPreference = $previousPreference
+                Pop-Location
             }
-        } elseif ($failureStage -ceq 'commit') {
-            $result.error = New-MaintenanceError -Code 'MaintenanceCommitIncomplete' `
-                -Message 'Validated maintenance completed, but its journal commit did not finish; rerun maintenance to converge.' `
-                -Phase 'commit' -Type $maintenanceFailure.Exception.GetType().FullName
-        } else {
-            try {
-                $validatedBackup = Read-MaintenanceBackup -Journal $journal
-                Restore-MaintenanceDatabase -Context $context -Backup $validatedBackup
-                [void](Start-MaintenanceStack)
-                $result.managerRestarted = $true
-                Complete-MaintenanceCommit -Backup $validatedBackup -Journal $journal -OperationId $operationId
-                $result.rolledBack = $true
-                $result.changed = $false
-                $failureCode = switch ($failureStage) {
-                    'stop' { 'MaintenanceStopFailed' }
-                    'cleanup' { 'CleanupDerivedFailed' }
-                    'validation' { 'MaintenanceValidationFailed' }
-                    'restart' { 'MaintenanceRestartFailed' }
-                    default { 'MaintenanceFailed' }
+            if ($cleanupExitCode -ne 0) {
+                throw "Manager cleanup-derived failed. ExitCode=$cleanupExitCode."
+            }
+            $result.changed = $true
+            Write-MaintenanceJournal -Journal $journal -Phase cleaned
+
+            $failureStage = 'validation'
+            if ((Get-CpaStackFileHash -Path $context.Executable) -cne $context.ExecutableHash -or
+                (Get-CpaStackFileHash -Path $context.DataKey) -cne $context.DataKeyHash) {
+                throw 'Manager executable or data.key changed during offline maintenance.'
+            }
+            [void](Test-MaintenanceDatabase -Database $context.Database -BaselinePath $backup.BaselinePath)
+            $result.databaseVerified = $true
+            Write-MaintenanceJournal -Journal $journal -Phase validated
+
+            $failureStage = 'restart'
+            [void](Start-MaintenanceStack)
+            $result.managerRestarted = $true
+            $failureStage = 'commit'
+            Complete-MaintenanceCommit -Backup $backup -Journal $journal -OperationId $operationId
+            $result.success = $true
+        } catch {
+            $maintenanceFailure = $_
+            $maintenanceCode = [string]$maintenanceFailure.FullyQualifiedErrorId
+            if ($maintenanceCode -like 'MaintenanceProcessChanged*') {
+                try {
+                    $validatedBackup = Read-MaintenanceBackup -Journal $journal
+                    Complete-MaintenanceCommit -Backup $validatedBackup -Journal $journal -OperationId $operationId
+                    $result.error = New-MaintenanceError -Code 'MaintenanceProcessChanged' `
+                        -Message 'Manager process identity changed after preflight; maintenance stopped without touching the replacement process.' `
+                        -Phase 'stop' -Type $maintenanceFailure.Exception.GetType().FullName
+                } catch {
+                    $result.error = New-MaintenanceError -Code 'MaintenanceRollbackFailed' `
+                        -Message 'Manager identity changed and the prepared maintenance transaction could not be closed safely.' `
+                        -Phase 'rollback' -Type $_.Exception.GetType().FullName
                 }
-                $result.error = New-MaintenanceError -Code $failureCode `
-                    -Message "Offline maintenance failed during $failureStage and the validated database backup was restored." `
-                    -Phase $failureStage -Type $maintenanceFailure.Exception.GetType().FullName
-            } catch {
-                $result.rolledBack = $false
-                $result.error = New-MaintenanceError -Code 'MaintenanceRollbackFailed' `
-                    -Message 'Offline maintenance failed and automatic database restoration did not complete.' `
-                    -Phase 'rollback' -Type $_.Exception.GetType().FullName
+            } elseif ($failureStage -ceq 'commit') {
+                $result.error = New-MaintenanceError -Code 'MaintenanceCommitIncomplete' `
+                    -Message 'Validated maintenance completed, but its journal commit did not finish; rerun maintenance to converge.' `
+                    -Phase 'commit' -Type $maintenanceFailure.Exception.GetType().FullName
+            } else {
+                try {
+                    $validatedBackup = Read-MaintenanceBackup -Journal $journal
+                    Restore-MaintenanceDatabase -Context $context -Backup $validatedBackup
+                    [void](Start-MaintenanceStack)
+                    $result.managerRestarted = $true
+                    Complete-MaintenanceCommit -Backup $validatedBackup -Journal $journal -OperationId $operationId
+                    $result.rolledBack = $true
+                    $result.changed = $false
+                    $failureCode = switch ($failureStage) {
+                        'stop' { 'MaintenanceStopFailed' }
+                        'cleanup' { 'CleanupDerivedFailed' }
+                        'validation' { 'MaintenanceValidationFailed' }
+                        'restart' { 'MaintenanceRestartFailed' }
+                        default { 'MaintenanceFailed' }
+                    }
+                    $result.error = New-MaintenanceError -Code $failureCode `
+                        -Message "Offline maintenance failed during $failureStage and the validated database backup was restored." `
+                        -Phase $failureStage -Type $maintenanceFailure.Exception.GetType().FullName
+                } catch {
+                    $result.rolledBack = $false
+                    $result.error = New-MaintenanceError -Code 'MaintenanceRollbackFailed' `
+                        -Message 'Offline maintenance failed and automatic database restoration did not complete.' `
+                        -Phase 'rollback' -Type $_.Exception.GetType().FullName
+                }
             }
         }
     }

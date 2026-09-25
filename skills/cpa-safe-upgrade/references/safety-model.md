@@ -29,6 +29,8 @@ CPA `auth`、可选 `plugins` 代码树和 Manager data tree 是递归信任边�
 
 公开 `upgrade` 在 runtime 事务前先检查 updater。发现新版时只运行安全下载到本地且通过上述校验的 installer，原子提交后用新版 CLI 重执行一次；查询、校验、安装或重执行失败不接触 runtime。源码分支、fork、预发布版和管道执行不受支持。
 
+维护事务的主记录、previous 和单一对应备份由维护执行器在锁内再次核对归属，普通恢复只调用其 recovery-only 路径。`validated`、`committing`、`committed` 阶段校验当前程序、data.key 和数据库后完成提交，不以旧备份覆盖当前数据；校验失败保留事务并停止。恢复返回后仍须通过无 pending 和服务健康检查，才能继续升级。
+
 正式切换采用可恢复的两阶段提交：先保留 old 快照并验证 new runtime，再原子写 `current.json`，最后把 old 快照提升为 last-known-good 并删除 journal。硬中断恢复只接受两种确定状态：
 
 - `recorded=old`：从已验证备份幂等重铺完整旧 runtime；Manager 同时重铺 SQLite 与 `data.key`；

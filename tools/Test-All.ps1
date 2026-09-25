@@ -403,6 +403,7 @@ try {
         'tests\DynamicPorts.Tests.ps1',
         'tests\ManagedShortcutV2.Tests.ps1',
         'tests\Maintenance.Tests.ps1',
+        'tests\MaintenanceRecovery.Tests.ps1',
         'tests\SelfUpdate.Tests.ps1',
         'tests\CliV2.Tests.ps1',
         'tests\UpgradeDiagnostics.Tests.ps1',

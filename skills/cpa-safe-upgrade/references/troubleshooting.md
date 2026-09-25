@@ -38,7 +38,7 @@ CLI 返回 `TargetDriveNotFound` 时，选择真实存在的本地 NTFS/ReFS 盘
 
 不要删除 journal 或手工覆盖 runtime。直接针对同一 root 运行 `cpa-stack.ps1 upgrade -Json`；它会自动调用一次受限 recovery-only 流程，验证 instanceId、路径、exe/`data.key` hash、Manager 数据水位与服务状态后继续。若返回 `ManualRecoveryRequired`，保留 journal 和结构化错误并停止。
 
-`maintenance.pending.json` 属于离线数据库维护事务；重跑 `cpa-stack.ps1 maintenance -Action CleanupDerived -Json`，它会先验证并恢复备份、重启服务，再重新维护。不要用普通 `recover`、手工删除 journal 或直接复制数据库。
+维护 pending 属于离线数据库维护事务。`upgrade` 的自动恢复阶段或公开 `recover` 会分派到维护执行器的仅恢复入口，结束旧事务后验证服务健康，不启动新一轮清理；重跑公开 `maintenance -Action CleanupDerived -Json` 则会在恢复后重新维护。已到 `validated` 的事务重新校验当前数据库并提交，避免覆盖随后新增的数据；更早阶段仍走已验证备份恢复。多个无关事务、备份或数据校验失败仍停止。不要手工删除 journal 或直接复制数据库。
 
 CPA 回滚可能在旧程序写回后、事务清理前中断。对于 `target-started` / `runtime-verified` 阶段，若 current 记录和当前 CPA 程序均匹配同一旧版 hash，公开 `recover` 会先完整验证实例、路径、事务和旧版备份，再核对完整运行文件；不会仅凭旧 exe hash 直接删除事务。缺失或损坏备份、未知 hash 仍拒绝，Manager 数据恢复规则不变。
 

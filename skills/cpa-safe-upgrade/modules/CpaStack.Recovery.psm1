@@ -26,10 +26,24 @@ function Get-CpaStackRecoveryPlan {
     $hasInitializePrevious = $false
     $hasUpgradePrevious = $false
     $hasSwitchPrevious = $false
+    $hasMaintenancePrevious = $false
+    $maintenanceBackups = 0
     foreach ($path in $artifacts) {
         $name = [System.IO.Path]::GetFileName($path)
         $parent = [System.IO.Path]::GetDirectoryName($path).TrimEnd('\')
         switch -Regex ($name) {
+            '^maintenance\.pending\.json$' {
+                if ($parent -ine $stateRoot) { $unknown.Add($path) } else { $journalKinds.Add('maintenance') }
+                continue
+            }
+            '^maintenance\.pending\.json\.previous$' {
+                if ($parent -ine $stateRoot) { $unknown.Add($path) } else { $hasMaintenancePrevious = $true }
+                continue
+            }
+            '^pending-maintenance-[0-9a-fA-F]{32}$' {
+                if ($parent -ine $rollbackRoot) { $unknown.Add($path) } else { $maintenanceBackups++ }
+                continue
+            }
             '^adopt\.pending\.json$' {
                 if ($parent -ine $stateRoot) { $unknown.Add($path) } else { $journalKinds.Add('adopt') }
                 continue
@@ -73,6 +87,13 @@ function Get-CpaStackRecoveryPlan {
     if ($primaryKinds.Count -gt 1) {
         return [pscustomobject]@{ Kind = 'ambiguous'; Artifacts = $artifacts; Unknown = @() }
     }
+    if ('maintenance' -in $primaryKinds -or $hasMaintenancePrevious -or $maintenanceBackups -gt 0) {
+        $kind = if ('maintenance' -in $primaryKinds -and $maintenanceBackups -le 1 -and
+            -not ($hasSwitchArtifact -or $hasRollbackArtifact -or $hasInitializePrevious -or $hasUpgradePrevious -or $hasSwitchPrevious)) {
+            'maintenance'
+        } else { 'ambiguous' }
+        return [pscustomobject]@{ Kind = $kind; Artifacts = $artifacts; Unknown = @() }
+    }
     if ($primaryKinds.Count -eq 1) {
         $kind = [string]$primaryKinds[0]
         if ($hasInitializePrevious -and $kind -ne 'initialize') {
@@ -111,6 +132,8 @@ function Get-CpaStackPendingArtifacts {
     }
     $stateRoot = Join-Path $Root 'state'
     foreach ($name in @(
+        'maintenance.pending.json',
+        'maintenance.pending.json.previous',
         'adopt.pending.json',
         'initialize.pending.json',
         'initialize.pending.json.previous',
@@ -164,6 +187,7 @@ function Invoke-CpaStackRecovery {
     $script = $null
     $arguments = @('-ControlRoot', $Root)
     switch ($plan.Kind) {
+        'maintenance' { $script = 'Invoke-CpaStackMaintenance.ps1'; $arguments += @('-Action', 'CleanupDerived', '-RecoverOnly') }
         'adopt' { $script = 'Adopt-CpaStackLegacyCanonical.ps1'; $arguments += '-RecoverOnly' }
         'initialize' { $script = 'Initialize-CpaStack.ps1'; $arguments += '-RecoverOnly' }
         'upgrade' { $script = 'Invoke-CpaStackUpgrade.ps1'; $arguments += '-RecoverOnly' }
